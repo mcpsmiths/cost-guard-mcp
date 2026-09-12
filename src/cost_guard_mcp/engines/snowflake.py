@@ -82,12 +82,16 @@ def explain_estimate(
         estimated_bytes=bytes_assigned,
         estimated_cost_usd=round(estimated_cost_usd, 6),
         caveats=[
-            "This estimate excludes Cortex AI Function ('AI Credits') cost — EXPLAIN's "
-            "bytesAssigned only reflects warehouse compute/scan, not AI-inference calls "
-            "inside the SQL.",
-            f"Cost assumes a {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on a "
-            f"{warehouse_size} warehouse — a rough placeholder, not derived from this "
-            "query's actual expected runtime.",
+            (
+                "This estimate excludes Cortex AI Function ('AI Credits') cost — EXPLAIN's "
+                "bytesAssigned only reflects warehouse compute/scan, not AI-inference calls "
+                "inside the SQL."
+            ),
+            (
+                f"Cost assumes a {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on a "
+                f"{warehouse_size} warehouse — a rough placeholder, not derived from this "
+                "query's actual expected runtime."
+            ),
         ],
     )
 

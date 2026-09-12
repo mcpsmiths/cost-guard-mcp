@@ -43,7 +43,7 @@ def test_dry_run_against_public_dataset():
 def test_run_query_bounded_refuses_when_cap_too_low():
     from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 
-    project = _require_env("BIGQUERY_PROJECT")
+    _require_env("BIGQUERY_PROJECT")
     _require_env("GOOGLE_APPLICATION_CREDENTIALS")
 
     sql = "SELECT * FROM `bigquery-public-data.usa_names.usa_1910_2013`"

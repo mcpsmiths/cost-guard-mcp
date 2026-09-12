@@ -58,7 +58,7 @@ def sanitize_exceptions(engine: str) -> Callable[[Callable[P, T]], Callable[P, T
                 return func(*args, **kwargs)
             except SanitizedEngineError:
                 raise
-            except Exception as exc:
+            except BaseException as exc:  # noqa: BLE001 - intentionally catching all exceptions to sanitize
                 safe_message = _redact(str(exc))
                 raise SanitizedEngineError(f"{engine} client call failed: {safe_message}") from None
 

@@ -1,0 +1,16 @@
+# .github/workflows/tests.yml
+name: tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --all-extras
+      - run: uv run ruff check src tests
+      - run: uv run pytest tests/unit -v --cov=cost_guard_mcp --cov-report=term-missing --cov-fail-under=80
