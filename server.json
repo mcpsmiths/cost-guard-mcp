@@ -1,6 +1,11 @@
 {
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mcpsmiths/cost-guard-mcp",
   "description": "Pre-flight query cost & result-size guardrails for AI agents across BigQuery and Snowflake",
+  "repository": {
+    "url": "https://github.com/mcpsmiths/cost-guard-mcp",
+    "source": "github"
+  },
   "version": "0.1.0",
   "packages": [
     {
