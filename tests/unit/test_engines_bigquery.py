@@ -87,3 +87,20 @@ def test_dry_run_capacity_billed_returns_no_dollar_estimate(mock_bq_module, _moc
     assert estimate.estimated_cost_usd is None
     assert estimate.estimated_bytes == 1024**4
     assert any("capacity" in c.lower() for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_treats_unrecognized_accuracy_value_as_upper_bound(mock_bq_module, _mock_capacity):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(
+        total_bytes_processed=500, accuracy="SOME_FUTURE_VALUE"
+    )
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT * FROM t")
+
+    assert estimate.accuracy_tier == AccuracyTier.UPPER_BOUND
+    assert any("SOME_FUTURE_VALUE" in c for c in estimate.caveats)
