@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 class ConfigError(RuntimeError):
@@ -17,8 +17,8 @@ class SnowflakeConfig:
     user: str
     role: str
     private_key_path: str | None
-    private_key_passphrase: str | None
-    password: str | None
+    private_key_passphrase: str | None = field(repr=False)
+    password: str | None = field(repr=False)
 
 
 def load_bigquery_config() -> BigQueryConfig:

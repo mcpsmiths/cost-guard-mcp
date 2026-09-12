@@ -1,6 +1,11 @@
 import pytest
 
-from cost_guard_mcp.config import ConfigError, load_bigquery_config, load_snowflake_config
+from cost_guard_mcp.config import (
+    ConfigError,
+    SnowflakeConfig,
+    load_bigquery_config,
+    load_snowflake_config,
+)
 
 
 def test_load_bigquery_config_raises_when_missing(monkeypatch):
@@ -52,3 +57,22 @@ def test_load_snowflake_config_succeeds_with_key_pair(monkeypatch):
     assert config.role == "COST_GUARD_READER"
     assert config.private_key_path == "/tmp/rsa_key.p8"
     assert config.password is None
+
+
+def test_snowflake_config_does_not_leak_secrets_in_repr():
+    passphrase_value = "test_passphrase_data_xyz"
+    password_value = "test_password_data_xyz"
+    config = SnowflakeConfig(
+        account="myaccount",
+        user="myuser",
+        role="READER",
+        private_key_path="/path/to/key.p8",
+        private_key_passphrase=passphrase_value,
+        password=password_value,
+    )
+    config_repr = repr(config)
+    assert passphrase_value not in config_repr
+    assert password_value not in config_repr
+    assert "myaccount" in config_repr
+    assert "myuser" in config_repr
+    assert "READER" in config_repr
