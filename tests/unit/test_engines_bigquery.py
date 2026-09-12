@@ -1,6 +1,9 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cost_guard_mcp.engines.bigquery import dry_run, execute_bounded, is_capacity_billed
+from cost_guard_mcp.errors import SanitizedEngineError
 from cost_guard_mcp.types import AccuracyTier
 
 
@@ -20,6 +23,29 @@ def test_is_capacity_billed_false_when_no_assignment(mock_reservation_module):
     mock_reservation_module.ReservationServiceClient.return_value = mock_client
 
     assert is_capacity_billed("my-project") is False
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery_reservation_v1")
+def test_is_capacity_billed_passes_assignee_filter_matching_project(mock_reservation_module):
+    mock_client = MagicMock()
+    mock_client.search_all_assignments.return_value = []
+    mock_reservation_module.ReservationServiceClient.return_value = mock_client
+
+    is_capacity_billed("my-project")
+
+    _, kwargs = mock_client.search_all_assignments.call_args
+    assert kwargs["request"]["query"] == "assignee=projects/my-project"
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery_reservation_v1")
+def test_is_capacity_billed_rejects_invalid_project_id(mock_reservation_module):
+    # is_capacity_billed is wrapped by @sanitize_exceptions, so the ValueError raised by
+    # _validate_project_id surfaces to callers as SanitizedEngineError, not a bare ValueError
+    # — same pattern as _validate_warehouse in engines/snowflake.py.
+    with pytest.raises(SanitizedEngineError, match="Invalid GCP project ID"):
+        is_capacity_billed("my project; DROP TABLE x")
+
+    mock_reservation_module.ReservationServiceClient.assert_not_called()
 
 
 def _mock_query_job(total_bytes_processed: int, accuracy: str = "PRECISE"):
