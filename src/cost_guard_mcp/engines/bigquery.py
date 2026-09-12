@@ -1,8 +1,22 @@
+import re
+
 from google.cloud import bigquery, bigquery_reservation_v1
 
 from cost_guard_mcp.errors import sanitize_exceptions
 from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
 from cost_guard_mcp.types import AccuracyTier, CostEstimate
+
+# GCP project ID format: lowercase letter, then lowercase letters/digits/hyphens, 6-30 chars
+# total, cannot end with a hyphen. `project` is not currently reachable from an MCP tool
+# parameter, but it does flow into a hand-built API filter string below — validate before
+# interpolating, same defense-in-depth reasoning as the Snowflake warehouse-name validator.
+_GCP_PROJECT_ID_RE = re.compile(r"^[a-z][a-z0-9\-]{4,28}[a-z0-9]$")
+
+
+def _validate_project_id(project: str) -> str:
+    if not _GCP_PROJECT_ID_RE.fullmatch(project):
+        raise ValueError(f"Invalid GCP project ID: {project!r}")
+    return project
 
 
 @sanitize_exceptions("bigquery")
@@ -15,6 +29,7 @@ def is_capacity_billed(project: str, location: str = "US") -> bool:
     false-negative (silently applying on-demand pricing logic to a capacity-billed query
     running against a differently-located reservation).
     """
+    project = _validate_project_id(project)
     client = bigquery_reservation_v1.ReservationServiceClient()
     parent = f"projects/{project}/locations/{location}"
     # `query` is not optional in practice: proto3 can't distinguish "omitted" from "empty
