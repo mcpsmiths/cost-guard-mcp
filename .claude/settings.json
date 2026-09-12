@@ -1,7 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Write(tests/unit/test_errors.py)"
-    ]
-  }
-}
