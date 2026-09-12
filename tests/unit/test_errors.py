@@ -1,4 +1,5 @@
 import base64
+
 import pytest
 
 from cost_guard_mcp.errors import SanitizedEngineError, sanitize_exceptions
