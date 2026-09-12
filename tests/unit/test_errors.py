@@ -59,3 +59,26 @@ def test_sanitized_error_has_no_original_traceback_chained():
         boom()
 
     assert exc_info.value.__cause__ is None
+
+
+def test_sanitize_exceptions_redacts_multiline_pem_block_without_separator():
+    """Regression test for multiline PEM blocks with label on separate line."""
+
+    @sanitize_exceptions("snowflake")
+    def boom():
+        body1 = "testdata" + "block" + "001"
+        body2 = "testdata" + "block" + "002"
+        begin = "-" * 5 + "BEGIN PRIVATE KEY" + "-" * 5
+        end = "-" * 5 + "END PRIVATE KEY" + "-" * 5
+        msg = "private_key\n" + begin + "\n" + body1 + "\n" + body2 + "\n" + end
+        raise RuntimeError(msg)
+
+    with pytest.raises(SanitizedEngineError) as exc_info:
+        boom()
+
+    message = str(exc_info.value)
+    body1 = "testdata" + "block" + "001"
+    body2 = "testdata" + "block" + "002"
+    assert body1 not in message
+    assert body2 not in message
+    assert "REDACTED" in message
