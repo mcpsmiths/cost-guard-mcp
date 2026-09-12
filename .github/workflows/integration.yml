@@ -1,0 +1,40 @@
+# .github/workflows/integration.yml
+name: integration
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly, Monday 06:00 UTC
+jobs:
+  bigquery:
+    runs-on: ubuntu-latest
+    environment: live-integration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --all-extras
+      - name: Write BigQuery service-account key
+        run: echo "$BIGQUERY_SA_KEY_JSON" > /tmp/bq-sa.json
+        env:
+          BIGQUERY_SA_KEY_JSON: ${{ secrets.BIGQUERY_SA_KEY_JSON }}
+      - run: uv run pytest tests/integration/test_bigquery_live.py -v
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/bq-sa.json
+          BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT }}
+  snowflake:
+    runs-on: ubuntu-latest
+    environment: live-integration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+      - run: uv sync --all-extras
+      - name: Write Snowflake private key
+        run: echo "$SNOWFLAKE_PRIVATE_KEY" > /tmp/snowflake_key.p8
+        env:
+          SNOWFLAKE_PRIVATE_KEY: ${{ secrets.SNOWFLAKE_PRIVATE_KEY }}
+      - run: uv run pytest tests/integration/test_snowflake_live.py -v
+        env:
+          SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
+          SNOWFLAKE_USER: ${{ secrets.SNOWFLAKE_USER }}
+          SNOWFLAKE_ROLE: ${{ secrets.SNOWFLAKE_ROLE }}
+          SNOWFLAKE_PRIVATE_KEY_PATH: /tmp/snowflake_key.p8
+          SNOWFLAKE_PRIVATE_KEY_PASSPHRASE: ${{ secrets.SNOWFLAKE_PRIVATE_KEY_PASSPHRASE }}
