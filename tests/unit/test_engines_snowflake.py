@@ -1,7 +1,8 @@
 import json
 from unittest.mock import MagicMock, patch
 
-from cost_guard_mcp.engines.snowflake import _connect, explain_estimate
+from cost_guard_mcp.engines.snowflake import _ASSUMED_RUNTIME_HOURS, _connect, explain_estimate
+from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
 from cost_guard_mcp.types import AccuracyTier
 
 
@@ -93,5 +94,26 @@ def test_explain_estimate_cost_math_matches_credit_rate_times_price(mock_connect
         "SELECT 1", warehouse="WH", warehouse_size="XSMALL", edition="standard"
     )
 
-    assert estimate.estimated_cost_usd is not None
-    assert estimate.estimated_cost_usd >= 0
+    expected_cost = round(
+        credits_per_hour("XSMALL") * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
+    )
+    assert estimate.estimated_cost_usd == expected_cost
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_skips_use_warehouse_when_warehouse_is_none(mock_connect):
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    explain_estimate("SELECT 1", warehouse=None)
+
+    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert len(executed_sql) == 1
+    assert not any("USE WAREHOUSE" in stmt for stmt in executed_sql)
+    assert "EXPLAIN USING JSON SELECT 1" in executed_sql[0]
