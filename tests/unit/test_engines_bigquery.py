@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock, patch
 
-from cost_guard_mcp.engines.bigquery import dry_run, is_capacity_billed
+from cost_guard_mcp.engines.bigquery import dry_run, execute_bounded, is_capacity_billed
 from cost_guard_mcp.types import AccuracyTier
 
 
@@ -104,3 +104,61 @@ def test_dry_run_treats_unrecognized_accuracy_value_as_upper_bound(mock_bq_modul
 
     assert estimate.accuracy_tier == AccuracyTier.UPPER_BOUND
     assert any("SOME_FUTURE_VALUE" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_wraps_query_with_limit_when_max_rows_set(mock_bq_module):
+    mock_client = MagicMock()
+    mock_row = {"a": 1}
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter(
+        [mock_row, mock_row, mock_row]
+    )  # 3 rows for max_rows=2 -> capped
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    _rows, row_count, row_cap_hit = execute_bounded(
+        "SELECT * FROM t", max_bytes_billed=None, max_rows=2
+    )
+
+    called_sql = mock_client.query.call_args[0][0]
+    assert "LIMIT 3" in called_sql  # max_rows + 1
+    assert row_count == 2  # truncated back down to max_rows for the caller
+    assert row_cap_hit is True
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_no_cap_hit_when_fewer_rows_than_max(mock_bq_module):
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([{"a": 1}])  # 1 row for max_rows=5 -> not capped
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    _rows, row_count, row_cap_hit = execute_bounded(
+        "SELECT * FROM t", max_bytes_billed=None, max_rows=5
+    )
+
+    assert row_count == 1
+    assert row_cap_hit is False
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_sets_maximum_bytes_billed_on_job_config(mock_bq_module):
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([])
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+
+    execute_bounded("SELECT * FROM t", max_bytes_billed=10_000_000, max_rows=None)
+
+    mock_bq_module.QueryJobConfig.assert_called_once_with(maximum_bytes_billed=10_000_000)
