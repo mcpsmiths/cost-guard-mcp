@@ -1,4 +1,5 @@
 import json
+import re
 
 import snowflake.connector
 
@@ -30,6 +31,17 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
     )
 
 
+_WAREHOUSE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def _validate_warehouse(warehouse: str) -> str:
+    if not _WAREHOUSE_NAME_RE.fullmatch(warehouse):
+        raise ValueError(
+            f"Invalid warehouse name {warehouse!r}: must match [A-Za-z_][A-Za-z0-9_$]*"
+        )
+    return warehouse
+
+
 # EXPLAIN itself doesn't estimate runtime — this is a deliberately conservative, documented
 # placeholder assumption (30 seconds) used only to turn a byte/partition estimate into SOME
 # dollar figure. This is the least-defensible part of the Snowflake estimate; tightening it
@@ -52,7 +64,7 @@ def explain_estimate(
     conn = _connect()
     with conn.cursor() as cur:
         if warehouse:
-            cur.execute(f"USE WAREHOUSE {warehouse}")
+            cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
         cur.execute(f"EXPLAIN USING JSON {sql}")
         row = cur.fetchone()
 

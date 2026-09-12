@@ -1,7 +1,10 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cost_guard_mcp.engines.snowflake import _ASSUMED_RUNTIME_HOURS, _connect, explain_estimate
+from cost_guard_mcp.errors import SanitizedEngineError
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
 from cost_guard_mcp.types import AccuracyTier
 
@@ -117,3 +120,18 @@ def test_explain_estimate_skips_use_warehouse_when_warehouse_is_none(mock_connec
     assert len(executed_sql) == 1
     assert not any("USE WAREHOUSE" in stmt for stmt in executed_sql)
     assert "EXPLAIN USING JSON SELECT 1" in executed_sql[0]
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_rejects_invalid_warehouse_name_before_executing_sql(mock_connect):
+    mock_cursor = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    # explain_estimate is wrapped by @sanitize_exceptions, so the ValueError raised by
+    # _validate_warehouse surfaces to callers as SanitizedEngineError, not a bare ValueError.
+    with pytest.raises(SanitizedEngineError, match="Invalid warehouse name"):
+        explain_estimate("SELECT 1", warehouse="WH1; malicious")
+
+    mock_cursor.execute.assert_not_called()
