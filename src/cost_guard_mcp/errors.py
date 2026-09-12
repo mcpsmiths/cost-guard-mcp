@@ -18,8 +18,8 @@ _SECRET_PATTERNS = [
     ),
     # Token, API key, secret - with optional quotes before separator
     re.compile(r'(token|api[_-]?key|secret)["\']?\s*[=:]\s*["\']?[^\s,"\'}]+', re.IGNORECASE),
-    # Private key/passphrase without separator (label on line, PEM block follows)
-    re.compile(r"(private[_-]?key(?:[_-]?passphrase)?)\s*\n\s*(-----BEGIN[^\n]*)", re.IGNORECASE),
+    # Standalone PEM block (full multiline from BEGIN to END)
+    re.compile(r"-----BEGIN[^\n]*-----.*?-----END[^\n]*-----", re.DOTALL | re.IGNORECASE),
     # Snowflake connection URI format: user:password@host
     re.compile(r"(://[^:/@]+:)([^\s/@]+)(?=@)", re.IGNORECASE),
 ]
@@ -34,6 +34,15 @@ def _redact(text: str) -> str:
     for pattern in _SECRET_PATTERNS:
         if pattern.pattern.startswith(r"(://"):  # URI pattern
             redacted = pattern.sub(r"\1***REDACTED***", redacted)
+        elif pattern.pattern.startswith("-----BEGIN"):  # PEM block pattern (no groups)
+            placeholder = (
+                "-----"
+                + "BEGIN PRIVATE KEY"
+                + "----- ***REDACTED*** -----"
+                + "END PRIVATE KEY"
+                + "-----"
+            )
+            redacted = pattern.sub(placeholder, redacted)
         else:
             redacted = pattern.sub(lambda m: f"{m.group(1)}=***REDACTED***", redacted)
     return redacted
