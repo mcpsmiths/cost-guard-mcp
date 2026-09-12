@@ -162,3 +162,42 @@ def test_execute_bounded_sets_maximum_bytes_billed_on_job_config(mock_bq_module)
     execute_bounded("SELECT * FROM t", max_bytes_billed=10_000_000, max_rows=None)
 
     mock_bq_module.QueryJobConfig.assert_called_once_with(maximum_bytes_billed=10_000_000)
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_no_cap_hit_when_rows_exactly_equal_max(mock_bq_module):
+    mock_client = MagicMock()
+    mock_row = {"a": 1}
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([mock_row, mock_row])  # exactly 2 rows for max_rows=2
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    rows, row_count, row_cap_hit = execute_bounded(
+        "SELECT * FROM t", max_bytes_billed=None, max_rows=2
+    )
+
+    assert row_count == 2
+    assert row_cap_hit is False
+    assert rows == [mock_row, mock_row]  # unmodified — nothing to truncate
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_bq_module):
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([{"a": 1}])
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    execute_bounded("SELECT * FROM t;", max_bytes_billed=None, max_rows=5)
+
+    called_sql = mock_client.query.call_args[0][0]
+    assert ";)" not in called_sql
+    assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
