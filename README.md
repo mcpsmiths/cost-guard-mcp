@@ -1,5 +1,7 @@
 # cost-guard-mcp
 
+<!-- mcp-name: io.github.mcpsmiths/cost-guard-mcp -->
+
 Pre-flight query cost & result-size guardrails for AI agents, across BigQuery and Snowflake — before the query ever runs.
 
 ## Why
