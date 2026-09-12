@@ -17,7 +17,13 @@ def is_capacity_billed(project: str, location: str = "US") -> bool:
     """
     client = bigquery_reservation_v1.ReservationServiceClient()
     parent = f"projects/{project}/locations/{location}"
-    assignments = client.search_all_assignments(request={"parent": parent})
+    # `query` is not optional in practice: proto3 can't distinguish "omitted" from "empty
+    # string" on the wire, and the live API rejects an empty query with a 400 asking for
+    # this exact `assignee=` filter format. Verified against a real project (2026-09-13) —
+    # confirms the gap this project's own plan flagged as an unverified spike.
+    assignments = client.search_all_assignments(
+        request={"parent": parent, "query": f"assignee=projects/{project}"}
+    )
     return any(assignments)
 
 
