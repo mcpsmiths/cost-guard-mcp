@@ -63,7 +63,7 @@ def explain_estimate(
     partitions and bytes scanned")."""
     conn = _connect()
     with conn.cursor() as cur:
-        if warehouse:
+        if warehouse is not None:
             cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
         cur.execute(f"EXPLAIN USING JSON {sql}")
         row = cur.fetchone()
@@ -106,7 +106,7 @@ def execute_bounded(
         wrapped_sql = f"SELECT * FROM ({sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"
 
     with conn.cursor(snowflake.connector.DictCursor) as cur:
-        if warehouse:
+        if warehouse is not None:
             cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
         cur.execute(wrapped_sql)
         rows = cur.fetchall()

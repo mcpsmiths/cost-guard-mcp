@@ -135,3 +135,18 @@ def test_explain_estimate_rejects_invalid_warehouse_name_before_executing_sql(mo
         explain_estimate("SELECT 1", warehouse="WH1; malicious")
 
     mock_cursor.execute.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_rejects_empty_string_warehouse(mock_connect):
+    # Empty string warehouse="" must raise, not silently fallback to current warehouse.
+    # This catches upstream bugs like template substitution errors that leave warehouse empty.
+    mock_cursor = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="Invalid warehouse name"):
+        explain_estimate("SELECT 1", warehouse="")
+
+    mock_cursor.execute.assert_not_called()
