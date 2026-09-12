@@ -31,6 +31,22 @@ def test_refuses_when_byte_cap_exceeded(mock_estimate):
     assert result.reason == RefusalReason.BYTE_CAP_EXCEEDED
 
 
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_refuses_fail_closed_when_cost_cap_requested_but_estimate_unavailable(mock_estimate):
+    mock_estimate.return_value = _estimate(cost=None)
+    result = run_query_bounded("bigquery", "SELECT * FROM t", max_estimated_cost_usd=1.00)
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.COST_CAP_EXCEEDED
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_refuses_fail_closed_when_byte_cap_requested_but_estimate_unavailable(mock_estimate):
+    mock_estimate.return_value = _estimate(bytes_=None)
+    result = run_query_bounded("bigquery", "SELECT * FROM t", max_bytes_billed=1_000_000)
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.BYTE_CAP_EXCEEDED
+
+
 @patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
 @patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
 def test_succeeds_when_under_all_caps(mock_estimate, mock_engine):
