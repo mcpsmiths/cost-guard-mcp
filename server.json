@@ -1,0 +1,15 @@
+{
+  "name": "io.github.<your-github-username-or-org>/cost-guard-mcp",
+  "description": "Pre-flight query cost & result-size guardrails for AI agents across BigQuery and Snowflake",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "cost-guard-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
