@@ -90,3 +90,25 @@ def explain_estimate(
             "query's actual expected runtime.",
         ],
     )
+
+
+@sanitize_exceptions("snowflake")
+def execute_bounded(
+    sql: str, warehouse: str | None, max_rows: int | None
+) -> tuple[list[dict], int, bool]:
+    conn = _connect()
+    wrapped_sql = sql
+    if max_rows is not None:
+        wrapped_sql = f"SELECT * FROM ({sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"
+
+    with conn.cursor(snowflake.connector.DictCursor) as cur:
+        if warehouse:
+            cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
+        cur.execute(wrapped_sql)
+        rows = cur.fetchall()
+
+    row_cap_hit = max_rows is not None and len(rows) > max_rows
+    if row_cap_hit:
+        rows = rows[:max_rows]
+
+    return rows, len(rows), row_cap_hit

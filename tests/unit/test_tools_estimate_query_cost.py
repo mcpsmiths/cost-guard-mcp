@@ -22,3 +22,13 @@ def test_estimate_query_cost_dispatches_to_bigquery(mock_engine):
 def test_estimate_query_cost_rejects_unsupported_engine():
     with pytest.raises(ValueError, match="databricks"):
         estimate_query_cost("databricks", "SELECT 1")
+
+
+@patch("cost_guard_mcp.tools.estimate_query_cost.snowflake_engine")
+def test_estimate_query_cost_dispatches_to_snowflake(mock_engine):
+    mock_engine.explain_estimate.return_value = CostEstimate(
+        engine="snowflake", accuracy_tier=AccuracyTier.UPPER_BOUND, estimated_bytes=100
+    )
+    result = estimate_query_cost("snowflake", "SELECT 1", warehouse="WH")
+    mock_engine.explain_estimate.assert_called_once_with("SELECT 1", "WH")
+    assert result.engine == "snowflake"

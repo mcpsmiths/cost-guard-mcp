@@ -1,4 +1,5 @@
 from cost_guard_mcp.engines import bigquery as bigquery_engine
+from cost_guard_mcp.engines import snowflake as snowflake_engine
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
 
@@ -64,10 +65,6 @@ def run_query_bounded(
             sql, max_bytes_billed=max_bytes_billed, max_rows=max_rows
         )
     elif engine == "snowflake":
-        from cost_guard_mcp.engines import (
-            snowflake as snowflake_engine,
-        )  # Task 4.5 adds this module
-
         rows, row_count, row_cap_hit = snowflake_engine.execute_bounded(
             sql, warehouse=warehouse, max_rows=max_rows
         )
