@@ -26,11 +26,41 @@ Set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key file path (or run 
 ### Snowflake
 Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no default, never `ACCOUNTADMIN`), and either `SNOWFLAKE_PRIVATE_KEY_PATH` (preferred) or `SNOWFLAKE_PASSWORD` (discouraged).
 
+### A note on credentials with MCP hosts
+
+Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as its own subprocess — it does **not** automatically inherit your shell's environment variables, even if they're set in your `.zshrc`/`.bashrc`. Put them directly in the host's server config instead. For Claude Desktop's `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "cost-guard-mcp": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/cost-guard-mcp", "cost-guard-mcp"],
+      "env": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account.json",
+        "BIGQUERY_PROJECT": "your-project-id",
+        "SNOWFLAKE_ACCOUNT": "your-account",
+        "SNOWFLAKE_USER": "your-user",
+        "SNOWFLAKE_ROLE": "your-role",
+        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8"
+      }
+    }
+  }
+}
+```
+
 ## Install
 
+Not yet published to PyPI — for now, clone and run directly:
+
 ```bash
-uvx cost-guard-mcp
+git clone https://github.com/mcpsmiths/cost-guard-mcp.git
+cd cost-guard-mcp
+uv sync
+uv run cost-guard-mcp
 ```
+
+Once published, `uvx cost-guard-mcp` will work as a one-line install.
 
 ## Known limitations
 
