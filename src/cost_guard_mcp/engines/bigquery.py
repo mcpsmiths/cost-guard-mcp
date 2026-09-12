@@ -1,6 +1,8 @@
 from google.cloud import bigquery, bigquery_reservation_v1
 
 from cost_guard_mcp.errors import sanitize_exceptions
+from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
+from cost_guard_mcp.types import AccuracyTier, CostEstimate
 
 
 @sanitize_exceptions("bigquery")
@@ -17,3 +19,57 @@ def is_capacity_billed(project: str, location: str = "US") -> bool:
     parent = f"projects/{project}/locations/{location}"
     assignments = client.search_all_assignments(request={"parent": parent})
     return any(assignments)
+
+
+_BQ_ACCURACY_TO_TIER = {
+    "PRECISE": AccuracyTier.PRECISE,
+    "LOWER_BOUND": AccuracyTier.UPPER_BOUND,
+    "UPPER_BOUND": AccuracyTier.UPPER_BOUND,
+    "UNKNOWN": AccuracyTier.UPPER_BOUND,
+}
+
+
+@sanitize_exceptions("bigquery")
+def dry_run(sql: str, project: str | None = None) -> CostEstimate:
+    """Estimate BigQuery query cost via a dry run. Tagged PRECISE unless BigQuery's own
+    totalBytesProcessedAccuracy says otherwise, or the project is capacity-billed."""
+    client = bigquery.Client(project=project)
+    job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+    query_job = client.query(sql, job_config=job_config)
+
+    total_bytes_processed = query_job.total_bytes_processed or 0
+    raw_accuracy = (
+        query_job._properties.get("statistics", {})
+        .get("query", {})
+        .get("totalBytesProcessedAccuracy", "UNKNOWN")
+    )
+    tier = _BQ_ACCURACY_TO_TIER.get(raw_accuracy, AccuracyTier.UPPER_BOUND)
+
+    caveats: list[str] = []
+    if tier != AccuracyTier.PRECISE:
+        caveats.append(
+            f"BigQuery reported this estimate's own accuracy as '{raw_accuracy}', not "
+            "PRECISE — treating it conservatively as UPPER_BOUND."
+        )
+
+    if is_capacity_billed(client.project):
+        caveats.append(
+            "This project is on BigQuery Editions/capacity billing (slot-hours), which has "
+            "no fixed $/byte rate — no dollar estimate is possible from bytes alone."
+        )
+        return CostEstimate(
+            engine="bigquery",
+            accuracy_tier=tier,
+            estimated_bytes=total_bytes_processed,
+            estimated_cost_usd=None,
+            caveats=caveats,
+        )
+
+    estimated_cost_usd = (total_bytes_processed / TIB_IN_BYTES) * ON_DEMAND_USD_PER_TIB
+    return CostEstimate(
+        engine="bigquery",
+        accuracy_tier=tier,
+        estimated_bytes=total_bytes_processed,
+        estimated_cost_usd=round(estimated_cost_usd, 6),
+        caveats=caveats,
+    )
