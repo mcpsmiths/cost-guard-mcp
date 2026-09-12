@@ -38,7 +38,7 @@ def estimate_query_cost(engine: Engine, sql: str, warehouse: str | None = None) 
     return _estimate_query_cost(engine, sql, warehouse)
 
 
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True))
 def run_query_bounded(
     engine: Engine,
     sql: str,
