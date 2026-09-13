@@ -8,6 +8,7 @@ for Python's `logging` module when no handler is configured, and for `print(...,
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 
+from cost_guard_mcp.errors import as_tool_error
 from cost_guard_mcp.tools.describe_engine_capabilities import (
     describe_engine_capabilities as _describe_engine_capabilities,
 )
@@ -21,6 +22,7 @@ mcp = MCPServer("cost-guard-mcp")
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+@as_tool_error
 def describe_engine_capabilities(engine: Engine) -> EngineCapabilities:
     """Declare which cost signals are exact vs. approximate for the given warehouse engine.
 
@@ -31,6 +33,7 @@ def describe_engine_capabilities(engine: Engine) -> EngineCapabilities:
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+@as_tool_error
 def estimate_query_cost(engine: Engine, sql: str, warehouse: str | None = None) -> CostEstimate:
     """Estimate the cost of a SQL query before running it. ALWAYS call this before running
     an expensive-looking query. The response's accuracy_tier tells you how much to trust
@@ -39,6 +42,7 @@ def estimate_query_cost(engine: Engine, sql: str, warehouse: str | None = None) 
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True))
+@as_tool_error
 def run_query_bounded(
     engine: Engine,
     sql: str,
