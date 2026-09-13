@@ -74,6 +74,86 @@ uv sync
 uv run cost-guard-mcp
 ```
 
+## Use with other AI coding tools
+
+`cost-guard-mcp` is a standard stdio MCP server — any MCP-compatible client works, not just Claude Desktop. Only the config file format differs per tool; the underlying `command`/`args`/`env` are the same everywhere.
+
+### Claude Code
+
+```bash
+claude mcp add cost-guard-mcp -e GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json -e BIGQUERY_PROJECT=your-project-id -e SNOWFLAKE_ACCOUNT=your-account -e SNOWFLAKE_USER=your-user -e SNOWFLAKE_ROLE=your-role -e SNOWFLAKE_PRIVATE_KEY_PATH=/path/to/rsa_key.p8 -- uvx cost-guard-mcp
+```
+
+Or add to a project's `.mcp.json` directly, using the same shape as the Claude Desktop example above.
+
+### Cursor
+
+Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
+
+```json
+{
+  "mcpServers": {
+    "cost-guard-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["cost-guard-mcp"],
+      "env": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account.json",
+        "BIGQUERY_PROJECT": "your-project-id",
+        "SNOWFLAKE_ACCOUNT": "your-account",
+        "SNOWFLAKE_USER": "your-user",
+        "SNOWFLAKE_ROLE": "your-role",
+        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8"
+      }
+    }
+  }
+}
+```
+
+### OpenAI Codex CLI
+
+Add to `~/.codex/config.toml` (or `.codex/config.toml` for a project):
+
+```toml
+[mcp_servers.cost-guard-mcp]
+command = "uvx"
+args = ["cost-guard-mcp"]
+
+[mcp_servers.cost-guard-mcp.env]
+GOOGLE_APPLICATION_CREDENTIALS = "/path/to/service-account.json"
+BIGQUERY_PROJECT = "your-project-id"
+SNOWFLAKE_ACCOUNT = "your-account"
+SNOWFLAKE_USER = "your-user"
+SNOWFLAKE_ROLE = "your-role"
+SNOWFLAKE_PRIVATE_KEY_PATH = "/path/to/rsa_key.p8"
+```
+
+Or via the CLI: `codex mcp add cost-guard-mcp -- uvx cost-guard-mcp`.
+
+### GitHub Copilot (VS Code)
+
+Add to `.vscode/mcp.json` (note the top-level key is `servers`, not `mcpServers`):
+
+```json
+{
+  "servers": {
+    "cost-guard-mcp": {
+      "type": "stdio",
+      "command": "uvx",
+      "args": ["cost-guard-mcp"],
+      "env": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account.json",
+        "BIGQUERY_PROJECT": "your-project-id",
+        "SNOWFLAKE_ACCOUNT": "your-account",
+        "SNOWFLAKE_USER": "your-user",
+        "SNOWFLAKE_ROLE": "your-role",
+        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8"
+      }
+    }
+  }
+}
+```
+
 ## Known limitations
 
 - Databricks is not yet supported (deferred past v1).
