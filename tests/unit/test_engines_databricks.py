@@ -1,4 +1,7 @@
+import time
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from cost_guard_mcp.engines.databricks import _connect, check_credentials
 
@@ -168,3 +171,76 @@ def test_explain_estimate_cost_math_matches_pricing_table(mock_connect):
 
     expected_cost = round(dbus_per_hour("Small") * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
     assert estimate.estimated_cost_usd == expected_cost
+
+
+from cost_guard_mcp.engines.databricks import execute_bounded
+from cost_guard_mcp.errors import SanitizedEngineError
+
+
+def _make_mock_cursor(rows, execute_delay_seconds=0.0):
+    mock_cursor = MagicMock()
+
+    def _execute(_sql):
+        if execute_delay_seconds:
+            time.sleep(execute_delay_seconds)
+
+    mock_cursor.execute.side_effect = _execute
+    mock_cursor.fetchall.return_value = rows
+    return mock_cursor
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_wraps_query_with_limit_when_max_rows_set(mock_connect):
+    mock_cursor = _make_mock_cursor([{"a": 1}, {"a": 2}, {"a": 3}])
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    rows, row_count, row_cap_hit = execute_bounded("SELECT * FROM t", warehouse=None, max_rows=2)
+
+    called_sql = mock_cursor.execute.call_args[0][0]
+    assert "LIMIT 3" in called_sql  # max_rows + 1
+    assert row_count == 2
+    assert row_cap_hit is True
+    assert rows == [{"a": 1}, {"a": 2}]
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_no_cap_hit_when_fewer_rows_than_max(mock_connect):
+    mock_cursor = _make_mock_cursor([{"a": 1}])
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    _rows, row_count, row_cap_hit = execute_bounded("SELECT * FROM t", warehouse=None, max_rows=5)
+
+    assert row_count == 1
+    assert row_cap_hit is False
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_cancels_and_raises_when_wait_times_out(mock_connect):
+    # The plan's original test patched the module-level `_MAX_EXECUTION_WAIT_SECONDS`
+    # constant via `execute_bounded.__wrapped__.__globals__["_MAX_EXECUTION_WAIT_SECONDS"]`
+    # as a `mock.patch` target string. Confirmed unworkable: `mock.patch`'s target resolver
+    # parses dotted paths via getattr chains and cannot resolve a bracketed subscript, so
+    # that target raises `AttributeError: ... does not have the attribute
+    # '__globals__["_MAX_EXECUTION_WAIT_SECONDS"]'` rather than patching anything. Using the
+    # plan's own documented fallback instead: a private `_max_wait_seconds` keyword-only
+    # override on `execute_bounded` itself. The observable behavior under test is unchanged
+    # from the plan - cancel called, SanitizedEngineError raised, message contains
+    # "Query exceeded".
+    mock_cursor = _make_mock_cursor([], execute_delay_seconds=2.0)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="Query exceeded"):
+        execute_bounded(
+            "SELECT * FROM huge_table",
+            warehouse=None,
+            max_rows=None,
+            _max_wait_seconds=0.2,
+        )
+
+    mock_cursor.cancel.assert_called_once()

@@ -1,4 +1,5 @@
 import re
+import threading
 
 from databricks import sql
 from databricks.sdk.core import Config, oauth_service_principal
@@ -146,3 +147,79 @@ def explain_estimate(
         estimated_cost_usd=round(estimated_cost_usd, 6),
         caveats=caveats,
     )
+
+
+# dust-tt/dust's precedent for bounding a long-running warehouse job, already applied to
+# Snowflake in this project (PR #22): give up after 2 minutes. Unlike Snowflake, there is
+# no native async/polling execute mode here (confirmed via research) - execute() runs in
+# a background thread, joined with this timeout, and Cursor.cancel() is called if it is
+# still alive. cancel() is confirmed callable from a different thread than the one that
+# called execute(), per the connector's own source docstring.
+_MAX_EXECUTION_WAIT_SECONDS = 120
+
+
+@sanitize_exceptions("databricks")
+def execute_bounded(
+    sql_text: str,
+    warehouse: str | None,
+    max_rows: int | None,
+    *,
+    _max_wait_seconds: float | None = None,
+) -> tuple[list[dict], int, bool]:
+    """Execute `sql_text` with an optional row bound and a wall-clock execution cap.
+
+    `warehouse` is accepted only for calling-convention consistency and is a documented
+    no-op - see check_credentials's docstring for why.
+
+    `_max_wait_seconds` is a private, test-only override for `_MAX_EXECUTION_WAIT_SECONDS`.
+    It exists because patching the module-level constant from a test needs a target
+    `unittest.mock.patch` can actually resolve - `execute_bounded.__wrapped__.__globals__`
+    (reachable since `sanitize_exceptions` uses `functools.wraps`) is a real dict, but
+    `mock.patch`'s dotted-path resolver can't parse a bracketed subscript like
+    `__globals__["_MAX_EXECUTION_WAIT_SECONDS"]` as a target string (confirmed: it raises
+    AttributeError, not a successful patch) - so callers needing a shorter wait pass this
+    keyword instead. Not part of the calling convention shared with bigquery/snowflake.
+    """
+    max_wait_seconds = (
+        _max_wait_seconds if _max_wait_seconds is not None else _MAX_EXECUTION_WAIT_SECONDS
+    )
+
+    conn = _connect()
+    wrapped_sql = sql_text
+    if max_rows is not None:
+        # `sql_text` is the caller's own query, passed as this tool's actual `sql`
+        # parameter - wrapping their query in a LIMIT subquery to cap rows is this
+        # function's job, not untrusted input reaching a query built elsewhere.
+        wrapped_sql = f"SELECT * FROM ({sql_text}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
+
+    cur = conn.cursor()
+    execution_error: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            cur.execute(wrapped_sql)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the calling thread below
+            execution_error.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout=max_wait_seconds)
+
+    if thread.is_alive():
+        try:
+            cur.cancel()
+        except Exception:  # noqa: BLE001, S110 - best-effort; the TimeoutError below matters
+            pass
+        raise TimeoutError(f"Query exceeded {max_wait_seconds}s and was cancelled.")
+
+    if execution_error:
+        raise execution_error[0]
+
+    rows = [dict(row) for row in cur.fetchall()]
+    cur.close()
+
+    row_cap_hit = max_rows is not None and len(rows) > max_rows
+    if row_cap_hit:
+        rows = rows[:max_rows]
+
+    return rows, len(rows), row_cap_hit
