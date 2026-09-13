@@ -1,3 +1,4 @@
+from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.types import AccuracyTier, Engine, EngineCapabilities
 
 _CAPABILITIES: dict[str, EngineCapabilities] = {
@@ -44,7 +45,7 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
 
 def describe_engine_capabilities(engine: Engine) -> EngineCapabilities:
     if engine not in _CAPABILITIES:
-        raise ValueError(
+        raise UserVisibleError(
             f"describe_engine_capabilities: engine '{engine}' is not yet supported. "
             f"Supported engines: {sorted(_CAPABILITIES)}."
         )

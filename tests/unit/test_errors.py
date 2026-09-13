@@ -4,7 +4,12 @@ import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from cost_guard_mcp.config import ConfigError
-from cost_guard_mcp.errors import SanitizedEngineError, as_tool_error, sanitize_exceptions
+from cost_guard_mcp.errors import (
+    SanitizedEngineError,
+    UserVisibleError,
+    as_tool_error,
+    sanitize_exceptions,
+)
 
 
 def test_sanitize_exceptions_redacts_password_in_message():
@@ -105,12 +110,24 @@ def test_as_tool_error_converts_config_error_and_keeps_its_message():
         boom()
 
 
-def test_as_tool_error_converts_value_error_and_keeps_its_message():
+def test_as_tool_error_converts_user_visible_error_and_keeps_its_message():
     @as_tool_error
     def boom():
-        raise ValueError("engine 'redshift' is not yet supported")
+        raise UserVisibleError("engine 'redshift' is not yet supported")
 
     with pytest.raises(ToolError, match="engine 'redshift' is not yet supported"):
+        boom()
+
+
+def test_as_tool_error_does_not_forward_a_bare_value_error():
+    # A plain ValueError is NOT assumed safe (unlike UserVisibleError, its deliberately
+    # vetted subclass) - it must propagate unwrapped, exactly like any other unanticipated
+    # exception, so an unaudited message from a library call is never forwarded to the client.
+    @as_tool_error
+    def boom():
+        raise ValueError("some incidental library detail")
+
+    with pytest.raises(ValueError, match="some incidental library detail"):
         boom()
 
 

@@ -1,5 +1,6 @@
 from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines import snowflake as snowflake_engine
+from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
 
@@ -69,7 +70,7 @@ def run_query_bounded(
             sql, warehouse=warehouse, max_rows=max_rows
         )
     else:
-        raise ValueError(f"run_query_bounded: engine '{engine}' is not yet supported.")
+        raise UserVisibleError(f"run_query_bounded: engine '{engine}' is not yet supported.")
 
     if row_cap_hit:
         return BoundedQueryResult(
