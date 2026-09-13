@@ -124,14 +124,20 @@ def explain_estimate(
     estimated_cost_usd = rate * SERVERLESS_USD_PER_DBU * _ASSUMED_RUNTIME_HOURS
 
     caveats = [
-        "Databricks has no BigQuery-style dry-run; this estimate is HEURISTIC, the "
-        "least precise of this project's three accuracy tiers.",
-        f"Cost assumes a {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on a "
-        f"{warehouse_size} Serverless SQL warehouse - a rough placeholder, not derived "
-        "from this query's actual expected runtime.",
-        "Pricing assumes a Serverless SQL warehouse; Classic/Pro warehouses use "
-        "different (lower) DBU rates plus a separate underlying cloud VM cost not "
-        "modeled here.",
+        (
+            "Databricks has no BigQuery-style dry-run; this estimate is HEURISTIC, the "
+            "least precise of this project's three accuracy tiers."
+        ),
+        (
+            f"Cost assumes a {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on a "
+            f"{warehouse_size} Serverless SQL warehouse - a rough placeholder, not derived "
+            "from this query's actual expected runtime."
+        ),
+        (
+            "Pricing assumes a Serverless SQL warehouse; Classic/Pro warehouses use "
+            "different (lower) DBU rates plus a separate underlying cloud VM cost not "
+            "modeled here."
+        ),
     ]
     if max_size_in_bytes is None:
         caveats.append(

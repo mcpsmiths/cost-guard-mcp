@@ -46,15 +46,23 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
         supports_dollar_estimate=True,
         default_accuracy_tier=AccuracyTier.HEURISTIC,
         known_gaps=[
-            "Databricks has no BigQuery-style dry-run; EXPLAIN COST's plan-node "
-            "statistics are frequently absent (no ANALYZE TABLE run, streaming "
-            "sources, non-Delta external tables) - byte estimates may be unavailable.",
-            "The dollar figure assumes a fixed placeholder runtime on a Serverless SQL "
-            "warehouse, not derived from this query's actual expected runtime.",
-            "Only Serverless SQL warehouse pricing is modeled - Classic/Pro warehouses "
-            "use different DBU rates plus a separate cloud VM cost not modeled here.",
-            "There is no per-query USE WAREHOUSE equivalent - the SQL warehouse is "
-            "fixed by DATABRICKS_HTTP_PATH at connect time, not overridable per call.",
+            (
+                "Databricks has no BigQuery-style dry-run; EXPLAIN COST's plan-node "
+                "statistics are frequently absent (no ANALYZE TABLE run, streaming "
+                "sources, non-Delta external tables) - byte estimates may be unavailable."
+            ),
+            (
+                "The dollar figure assumes a fixed placeholder runtime on a Serverless SQL "
+                "warehouse, not derived from this query's actual expected runtime."
+            ),
+            (
+                "Only Serverless SQL warehouse pricing is modeled - Classic/Pro warehouses "
+                "use different DBU rates plus a separate cloud VM cost not modeled here."
+            ),
+            (
+                "There is no per-query USE WAREHOUSE equivalent - the SQL warehouse is "
+                "fixed by DATABRICKS_HTTP_PATH at connect time, not overridable per call."
+            ),
         ],
     ),
 }
