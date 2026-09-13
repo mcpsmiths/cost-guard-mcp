@@ -42,3 +42,9 @@ class BoundedQueryResult(BaseModel):
     hint: str | None = None
     rows: list[dict] | None = None
     row_count: int | None = None
+
+
+class CredentialCheckResult(BaseModel):
+    engine: Engine
+    ok: bool
+    detail: str

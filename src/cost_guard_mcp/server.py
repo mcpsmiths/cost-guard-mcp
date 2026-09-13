@@ -9,6 +9,7 @@ from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 
 from cost_guard_mcp.errors import as_tool_error
+from cost_guard_mcp.tools.check_credentials import check_credentials as _check_credentials
 from cost_guard_mcp.tools.describe_engine_capabilities import (
     describe_engine_capabilities as _describe_engine_capabilities,
 )
@@ -16,9 +17,25 @@ from cost_guard_mcp.tools.estimate_query_cost import (
     estimate_query_cost as _estimate_query_cost,
 )
 from cost_guard_mcp.tools.run_query_bounded import run_query_bounded as _run_query_bounded
-from cost_guard_mcp.types import BoundedQueryResult, CostEstimate, Engine, EngineCapabilities
+from cost_guard_mcp.types import (
+    BoundedQueryResult,
+    CostEstimate,
+    CredentialCheckResult,
+    Engine,
+    EngineCapabilities,
+)
 
 mcp = MCPServer("cost-guard-mcp")
+
+
+@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+@as_tool_error
+def check_credentials(engine: Engine, warehouse: str | None = None) -> CredentialCheckResult:
+    """Verify credentials/connectivity for an engine without running any real query or
+    dry-run estimate. Call this once after configuring a new engine (or when a real tool
+    call fails) to get a fast, clear yes/no signal instead of debugging via trial queries.
+    """
+    return _check_credentials(engine, warehouse)
 
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))

@@ -2,9 +2,9 @@ import re
 
 from google.cloud import bigquery, bigquery_reservation_v1
 
-from cost_guard_mcp.errors import sanitize_exceptions
+from cost_guard_mcp.errors import redact_secrets, sanitize_exceptions
 from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
-from cost_guard_mcp.types import AccuracyTier, CostEstimate
+from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
 # GCP project ID format: lowercase letter, then lowercase letters/digits/hyphens, 6-30 chars
 # total, cannot end with a hyphen. `project` is not currently reachable from an MCP tool
@@ -132,3 +132,28 @@ def execute_bounded(
         rows = rows[:max_rows]
 
     return rows, len(rows), row_cap_hit
+
+
+def check_credentials(project: str | None = None) -> CredentialCheckResult:
+    """Verify BigQuery credentials/connectivity without running or dry-running any query.
+
+    Deliberately does NOT use @sanitize_exceptions: a failed check is the expected, useful
+    result here, not an error condition — this function always returns a
+    CredentialCheckResult (never raises for a credential/connectivity failure) so a caller
+    can distinguish "not configured yet" from "actually broken" before attempting a real
+    estimate_query_cost/run_query_bounded call.
+    """
+    try:
+        client = bigquery.Client(project=project)
+        service_account_email = client.get_service_account_email()
+    except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
+        return CredentialCheckResult(engine="bigquery", ok=False, detail=redact_secrets(str(exc)))
+
+    return CredentialCheckResult(
+        engine="bigquery",
+        ok=True,
+        detail=(
+            f"Authenticated to project '{client.project}' "
+            f"(BigQuery service account: {service_account_email})."
+        ),
+    )
