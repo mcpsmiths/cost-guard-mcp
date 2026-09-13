@@ -8,6 +8,14 @@ from cost_guard_mcp.errors import sanitize_exceptions
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
 from cost_guard_mcp.types import AccuracyTier, CostEstimate
 
+# The connector's own defaults leave this tool exposed to indefinite hangs: login_timeout
+# falls back to snowflake.connector.auth.by_plugin.DEFAULT_AUTH_CLASS_TIMEOUT (120s) only if
+# unset, and network_timeout has NO fallback at all — it's infinite. A pre-flight cost-check
+# tool that can hang forever on a stalled connection defeats its own purpose, so both are set
+# explicitly here rather than left to those defaults.
+_LOGIN_TIMEOUT_SECONDS = 30
+_NETWORK_TIMEOUT_SECONDS = 60
+
 
 @sanitize_exceptions("snowflake")
 def _connect() -> "snowflake.connector.SnowflakeConnection":
@@ -21,6 +29,8 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
             authenticator="SNOWFLAKE_JWT",
             private_key_file=config.private_key_path,
             private_key_file_pwd=config.private_key_passphrase,
+            login_timeout=_LOGIN_TIMEOUT_SECONDS,
+            network_timeout=_NETWORK_TIMEOUT_SECONDS,
         )
 
     return snowflake.connector.connect(
@@ -28,6 +38,8 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
         user=config.user,
         role=config.role,
         password=config.password,
+        login_timeout=_LOGIN_TIMEOUT_SECONDS,
+        network_timeout=_NETWORK_TIMEOUT_SECONDS,
     )
 
 
