@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -278,3 +279,50 @@ def test_check_credentials_redacts_secrets_in_failure_detail(mock_bq_module):
     assert result.ok is False
     assert body not in result.detail
     assert "REDACTED" in result.detail
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_cancels_and_raises_when_wait_times_out(mock_bq_module):
+    mock_client = MagicMock()
+    mock_query_job = MagicMock()
+    mock_query_job.job_id = "job-123"
+    mock_query_job.result.side_effect = concurrent.futures.TimeoutError()
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    with pytest.raises(SanitizedEngineError, match="Query exceeded 120s and was cancelled"):
+        execute_bounded("SELECT * FROM huge_table", max_bytes_billed=None, max_rows=None)
+
+    mock_query_job.cancel.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_passes_timeout_to_result(mock_bq_module):
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([])
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=None)
+
+    mock_query_job.result.assert_called_once_with(timeout=120)
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_raise_survives_a_failed_cancel_attempt(mock_bq_module):
+    mock_client = MagicMock()
+    mock_query_job = MagicMock()
+    mock_query_job.job_id = "job-456"
+    mock_query_job.result.side_effect = concurrent.futures.TimeoutError()
+    mock_query_job.cancel.side_effect = Exception("cancel also failed")
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    with pytest.raises(SanitizedEngineError, match="Query exceeded 120s and was cancelled"):
+        execute_bounded("SELECT * FROM huge_table", max_bytes_billed=None, max_rows=None)

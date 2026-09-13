@@ -1,5 +1,7 @@
 import json
 import re
+import time
+import uuid
 
 import snowflake.connector
 
@@ -111,6 +113,30 @@ def explain_estimate(
     )
 
 
+# dust-tt/dust's precedent for bounding a long-running warehouse job: poll every 2s, give
+# up (and cancel) after 2 minutes total. Snowflake's own get_results_from_sfqid() has an
+# internal retry loop, but no overall wall-clock cap — a query stuck behind slot contention
+# or a suspended/cold warehouse would otherwise block this tool call indefinitely, still
+# burning warehouse-seconds the whole time, which defeats the point of a "bounded" tool.
+_POLL_INTERVAL_SECONDS = 2
+_MAX_EXECUTION_WAIT_SECONDS = 120
+
+
+def _cancel_query(conn: "snowflake.connector.SnowflakeConnection", query_id: str) -> None:
+    """Best-effort cancel; a failed cancel must not mask the TimeoutError the caller raises.
+
+    `query_id` is connector-generated (cur.sfqid), not caller input — but it still gets
+    validated as a UUID before reaching raw SQL text, same defense-in-depth discipline as
+    _validate_warehouse and _validate_project_id use for genuinely caller-supplied values.
+    """
+    try:
+        uuid.UUID(query_id)
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT SYSTEM$CANCEL_QUERY('{query_id}')")
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+
 @sanitize_exceptions("snowflake")
 def execute_bounded(
     sql: str, warehouse: str | None, max_rows: int | None
@@ -126,7 +152,26 @@ def execute_bounded(
     with conn.cursor(snowflake.connector.DictCursor) as cur:
         if warehouse is not None:
             cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-        cur.execute(wrapped_sql)
+        cur.execute_async(wrapped_sql)
+        query_id = cur.sfqid
+        if query_id is None:
+            raise SanitizedEngineError("execute_async did not return a query id")
+
+        elapsed_seconds = 0
+        status = conn.get_query_status(query_id)
+        while conn.is_still_running(status):
+            if elapsed_seconds >= _MAX_EXECUTION_WAIT_SECONDS:
+                _cancel_query(conn, query_id)
+                raise TimeoutError(
+                    f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
+                    f"(query_id={query_id})."
+                )
+            time.sleep(_POLL_INTERVAL_SECONDS)
+            elapsed_seconds += _POLL_INTERVAL_SECONDS
+            status = conn.get_query_status(query_id)
+
+        conn.get_query_status_throw_if_error(query_id)
+        cur.get_results_from_sfqid(query_id)
         rows = cur.fetchall()
 
     row_cap_hit = max_rows is not None and len(rows) > max_rows

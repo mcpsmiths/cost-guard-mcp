@@ -133,6 +133,7 @@ SNOWFLAKE_PRIVATE_KEY_PATH = "/path/to/rsa_key.p8"
 - Databricks is not yet supported (deferred past v1).
 - Snowflake's `UPPER_BOUND` estimate excludes Cortex AI Function ("AI Credits") cost.
 - BigQuery Editions/capacity-billed projects cannot get a dollar estimate — only a byte count (capacity billing has no fixed $/byte rate).
+- `run_query_bounded` gives up on a still-running query after 120 seconds and cancels it (BigQuery: `QueryJob.cancel()`; Snowflake: `SYSTEM$CANCEL_QUERY`) rather than waiting indefinitely — a query stuck behind slot contention or a cold/suspended warehouse would otherwise block the tool call, and keep burning warehouse-seconds the whole time, defeating the point of a "bounded" tool.
 
 ## More docs
 

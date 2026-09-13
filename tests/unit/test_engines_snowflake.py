@@ -10,6 +10,7 @@ from cost_guard_mcp.engines.snowflake import (
     _NETWORK_TIMEOUT_SECONDS,
     _connect,
     check_credentials,
+    execute_bounded,
     explain_estimate,
 )
 from cost_guard_mcp.errors import SanitizedEngineError
@@ -263,3 +264,106 @@ def test_check_credentials_rejects_invalid_warehouse_name_as_failure_not_a_raise
     assert result.ok is False
     assert "Invalid warehouse name" in result.detail
     mock_cursor.execute.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_polls_until_done_then_fetches_results(mock_connect, _mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = [{"a": 1}]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.side_effect = [True, False]
+    mock_connect.return_value = mock_conn
+
+    rows, row_count, row_cap_hit = execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+
+    mock_conn.get_query_status_throw_if_error.assert_called_once_with(mock_cursor.sfqid)
+    mock_cursor.get_results_from_sfqid.assert_called_once_with(mock_cursor.sfqid)
+    assert rows == [{"a": 1}]
+    assert row_count == 1
+    assert row_cap_hit is False
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_pins_warehouse_before_execute_async(mock_connect, _mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = []
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = False
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT 1", warehouse="COMPUTE_WH", max_rows=None)
+
+    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert "USE WAREHOUSE COMPUTE_WH" in executed_sql[0]
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_still_applies_row_cap_after_async_wait(mock_connect, _mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = [{"a": 1}, {"a": 2}, {"a": 3}]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = False
+    mock_connect.return_value = mock_conn
+
+    rows, row_count, row_cap_hit = execute_bounded("SELECT * FROM t", warehouse=None, max_rows=2)
+
+    called_sql = mock_cursor.execute_async.call_args[0][0]
+    assert "LIMIT 3" in called_sql  # max_rows + 1
+    assert row_count == 2
+    assert row_cap_hit is True
+    assert rows == [{"a": 1}, {"a": 2}]
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_cancels_and_raises_when_wait_times_out(mock_connect, mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = True  # never finishes
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="Query exceeded 120s and was cancelled"):
+        execute_bounded("SELECT * FROM huge_table", warehouse=None, max_rows=None)
+
+    mock_sleep.assert_called()
+    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert any("SYSTEM$CANCEL_QUERY" in stmt for stmt in executed_sql)
+    mock_conn.get_query_status_throw_if_error.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_raise_survives_a_failed_cancel_attempt(mock_connect, _mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = True
+    mock_connect.return_value = mock_conn
+    mock_cursor.execute.side_effect = Exception("cancel also failed")
+
+    with pytest.raises(SanitizedEngineError, match="Query exceeded 120s and was cancelled"):
+        execute_bounded("SELECT * FROM huge_table", warehouse=None, max_rows=None)
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_raises_when_execute_async_returns_no_query_id(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = None
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="did not return a query id"):
+        execute_bounded("SELECT 1", warehouse=None, max_rows=None)

@@ -1,3 +1,4 @@
+import concurrent.futures
 import re
 
 from google.cloud import bigquery, bigquery_reservation_v1
@@ -96,6 +97,15 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
     )
 
 
+# How long to wait for a bounded query to finish before giving up and cancelling it. This
+# is a Polling Timeout in google-api-core's terms — confirmed via the base
+# PollingFuture._blocking_poll implementation, not just QueryJob.result()'s own (looser)
+# docstring wording — so it genuinely bounds the whole wait, not just one HTTP call. Without
+# this, a query stuck behind slot contention or a cold warehouse could block a tool call
+# indefinitely, which defeats the point of a "bounded" execution tool.
+_MAX_EXECUTION_WAIT_SECONDS = 120
+
+
 @sanitize_exceptions("bigquery")
 def execute_bounded(
     sql: str,
@@ -125,7 +135,18 @@ def execute_bounded(
         else bigquery.QueryJobConfig()
     )
     query_job = client.query(wrapped_sql, job_config=job_config)
-    rows = [dict(row) for row in query_job.result()]
+    try:
+        rows = [dict(row) for row in query_job.result(timeout=_MAX_EXECUTION_WAIT_SECONDS)]
+    except concurrent.futures.TimeoutError:
+        try:
+            query_job.cancel()
+        except Exception:  # noqa: BLE001, S110 - best-effort cancel; the TimeoutError below is
+            # the message that matters to the caller, a failed cancel must not mask it
+            pass
+        raise TimeoutError(
+            f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
+            f"(job_id={query_job.job_id})."
+        ) from None
 
     row_cap_hit = max_rows is not None and len(rows) > max_rows
     if row_cap_hit:
