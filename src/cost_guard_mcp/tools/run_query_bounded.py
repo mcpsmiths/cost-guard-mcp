@@ -1,4 +1,5 @@
 from cost_guard_mcp.engines import bigquery as bigquery_engine
+from cost_guard_mcp.engines import databricks as databricks_engine
 from cost_guard_mcp.engines import snowflake as snowflake_engine
 from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
@@ -67,6 +68,10 @@ def run_query_bounded(
         )
     elif engine == "snowflake":
         rows, row_count, row_cap_hit = snowflake_engine.execute_bounded(
+            sql, warehouse=warehouse, max_rows=max_rows
+        )
+    elif engine == "databricks":
+        rows, row_count, row_cap_hit = databricks_engine.execute_bounded(
             sql, warehouse=warehouse, max_rows=max_rows
         )
     else:

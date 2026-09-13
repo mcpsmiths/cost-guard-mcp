@@ -8,7 +8,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![tests](https://github.com/mcpsmiths/cost-guard-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/mcpsmiths/cost-guard-mcp/actions/workflows/tests.yml)
 
-Pre-flight query cost & result-size guardrails for AI agents, across BigQuery and Snowflake — before the query ever runs.
+Pre-flight query cost & result-size guardrails for AI agents, across BigQuery, Snowflake, and Databricks — before the query ever runs.
 
 ## Why
 
@@ -16,16 +16,16 @@ An AI agent using a warehouse MCP can silently trigger a full-table scan that co
 
 ## What makes this different
 
-- **Every cost estimate discloses its accuracy tier** — `PRECISE` (BigQuery `dryRun`), `UPPER_BOUND` (Snowflake `EXPLAIN`), or `HEURISTIC` (Databricks, not yet shipped) — so your agent never over-trusts a heuristic number.
+- **Every cost estimate discloses its accuracy tier** — `PRECISE` (BigQuery `dryRun`), `UPPER_BOUND` (Snowflake `EXPLAIN`), or `HEURISTIC` (Databricks `EXPLAIN COST`) — so your agent never over-trusts a heuristic number.
 - **Per-call bounds** — `run_query_bounded` takes `max_bytes_billed` / `max_rows` / `max_estimated_cost_usd` on each call; no shared session state required.
 - **Zero infrastructure** — a single local stdio process. No database, no gateway, no Docker Compose.
 
 ## Tools
 
-- `check_credentials(engine, warehouse?)` — verifies credentials/connectivity without running any real query; call this first after configuring a new engine.
+- `check_credentials(engine, warehouse?)` — verifies credentials/connectivity without running any real query; call this first after configuring a new engine. Supports BigQuery, Snowflake, and Databricks.
 - `describe_engine_capabilities(engine)` — what's exact vs. approximate for this engine.
-- `estimate_query_cost(engine, sql, warehouse?)` — pre-flight cost estimate, tagged with its accuracy tier.
-- `run_query_bounded(engine, sql, max_bytes_billed?, max_rows?, max_estimated_cost_usd?)` — refuses to run if the estimate exceeds your bound.
+- `estimate_query_cost(engine, sql, warehouse?)` — pre-flight cost estimate, tagged with its accuracy tier. Supports BigQuery, Snowflake, and Databricks.
+- `run_query_bounded(engine, sql, max_bytes_billed?, max_rows?, max_estimated_cost_usd?)` — refuses to run if the estimate exceeds your bound. Supports BigQuery, Snowflake, and Databricks.
 
 ## Setup
 
@@ -34,6 +34,13 @@ Set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key file path (or run 
 
 ### Snowflake
 Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no default, never `ACCOUNTADMIN`), and either `SNOWFLAKE_PRIVATE_KEY_PATH` (preferred) or `SNOWFLAKE_PASSWORD` (discouraged).
+
+### Databricks
+Set `DATABRICKS_SERVER_HOSTNAME` and `DATABRICKS_HTTP_PATH` (from the SQL warehouse's
+Connection Details tab), and either `DATABRICKS_TOKEN` (a personal access token,
+simplest) or `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET` (OAuth machine-to-machine
+via a service principal, preferred for automated use). Only Serverless SQL warehouses are
+priced accurately — see Known Limitations.
 
 ### A note on credentials with MCP hosts
 
@@ -133,14 +140,22 @@ SNOWFLAKE_ACCOUNT = "your-account"
 SNOWFLAKE_USER = "your-user"
 SNOWFLAKE_ROLE = "your-role"
 SNOWFLAKE_PRIVATE_KEY_PATH = "/path/to/rsa_key.p8"
+DATABRICKS_SERVER_HOSTNAME = "your-workspace.cloud.databricks.com"
+DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/your-warehouse-id"
+DATABRICKS_TOKEN = "your-personal-access-token"
 ```
 
 ## Known limitations
 
-- Databricks is not yet supported (deferred past v1).
+- Databricks cost estimates are always `HEURISTIC` (the least precise tier) - Databricks
+  has no dry-run, and `EXPLAIN COST`'s byte estimates are frequently unavailable.
+- Databricks pricing only models Serverless SQL warehouses - Classic/Pro warehouses use
+  different (lower) DBU rates plus a separate cloud VM cost not modeled here.
+- Databricks has no per-query warehouse override - the SQL warehouse is fixed by
+  `DATABRICKS_HTTP_PATH` at connect time.
 - Snowflake's `UPPER_BOUND` estimate excludes Cortex AI Function ("AI Credits") cost.
 - BigQuery Editions/capacity-billed projects cannot get a dollar estimate — only a byte count (capacity billing has no fixed $/byte rate).
-- `run_query_bounded` gives up on a still-running query after 120 seconds and cancels it (BigQuery: `QueryJob.cancel()`; Snowflake: `SYSTEM$CANCEL_QUERY`) rather than waiting indefinitely — a query stuck behind slot contention or a cold/suspended warehouse would otherwise block the tool call, and keep burning warehouse-seconds the whole time, defeating the point of a "bounded" tool.
+- `run_query_bounded` gives up on a still-running query after 120 seconds and cancels it (BigQuery: `QueryJob.cancel()`; Snowflake: `SYSTEM$CANCEL_QUERY`; Databricks: `Cursor.cancel()` from a watchdog thread) rather than waiting indefinitely — a query stuck behind slot contention or a cold/suspended warehouse would otherwise block the tool call, and keep burning warehouse-seconds the whole time, defeating the point of a "bounded" tool.
 
 ## More docs
 

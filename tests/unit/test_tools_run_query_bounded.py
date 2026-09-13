@@ -74,3 +74,15 @@ def test_refuses_after_execution_when_row_cap_hit(mock_estimate, mock_engine):
     assert result.reason == RefusalReason.ROW_CAP_EXCEEDED
     assert result.row_count == 2
     assert result.rows == [{"a": 1}, {"a": 2}]  # still returns the (capped) rows it did fetch
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_run_query_bounded_dispatches_to_databricks(mock_estimate, mock_engine):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_engine.execute_bounded.return_value = ([{"a": 1}], 1, False)
+
+    result = run_query_bounded("databricks", "SELECT 1")
+
+    mock_engine.execute_bounded.assert_called_once_with("SELECT 1", warehouse=None, max_rows=None)
+    assert result.status == "ok"
