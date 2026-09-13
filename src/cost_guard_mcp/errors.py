@@ -3,6 +3,10 @@ import re
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
+from mcp.server.mcpserver.exceptions import ToolError
+
+from cost_guard_mcp.config import ConfigError
+
 P = ParamSpec("P")
 T = TypeVar("T")
 
@@ -46,6 +50,34 @@ def _redact(text: str) -> str:
         else:
             redacted = pattern.sub(lambda m: f"{m.group(1)}=***REDACTED***", redacted)
     return redacted
+
+
+def as_tool_error[**P, T](func: Callable[P, T]) -> Callable[P, T]:
+    """Wrap an @mcp.tool()-decorated function so its known, already-safe exceptions reach
+    the MCP client's model instead of being silently discarded.
+
+    The mcp SDK only passes an exception's message to the client when it is (or wraps) a
+    `ToolError`; any other exception type becomes an `UnexpectedToolError`, whose message
+    is deliberately the generic "Error executing tool <name>" — the original text "stays on
+    the server" by design (see mcp.server.mcpserver.tools.base). That default is the right
+    call for exceptions we didn't anticipate, but it also silently swallows the messages
+    this project already goes out of its way to make safe: `SanitizedEngineError` (redacted
+    by sanitize_exceptions above), `ConfigError` (never contains secrets), and the plain
+    `ValueError`s this codebase raises deliberately for an unsupported engine name or an
+    invalid warehouse identifier. Converting exactly those three into `ToolError` is what
+    lets an agent actually see (and act on) the hint/reason text instead of a black box.
+    """
+
+    @functools.wraps(func)
+    def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        try:
+            return func(*args, **kwargs)
+        except ToolError:
+            raise
+        except (SanitizedEngineError, ConfigError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
+
+    return wrapper
 
 
 def sanitize_exceptions(engine: str) -> Callable[[Callable[P, T]], Callable[P, T]]:

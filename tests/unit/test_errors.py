@@ -1,8 +1,10 @@
 import base64
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
-from cost_guard_mcp.errors import SanitizedEngineError, sanitize_exceptions
+from cost_guard_mcp.config import ConfigError
+from cost_guard_mcp.errors import SanitizedEngineError, as_tool_error, sanitize_exceptions
 
 
 def test_sanitize_exceptions_redacts_password_in_message():
@@ -83,3 +85,56 @@ def test_sanitize_exceptions_redacts_multiline_pem_block_without_separator():
     assert body1 not in message
     assert body2 not in message
     assert "REDACTED" in message
+
+
+def test_as_tool_error_converts_sanitized_engine_error_and_keeps_its_message():
+    @as_tool_error
+    def boom():
+        raise SanitizedEngineError("snowflake client call failed: safe redacted message")
+
+    with pytest.raises(ToolError, match="safe redacted message"):
+        boom()
+
+
+def test_as_tool_error_converts_config_error_and_keeps_its_message():
+    @as_tool_error
+    def boom():
+        raise ConfigError("SNOWFLAKE_ROLE must be set explicitly.")
+
+    with pytest.raises(ToolError, match="SNOWFLAKE_ROLE must be set explicitly"):
+        boom()
+
+
+def test_as_tool_error_converts_value_error_and_keeps_its_message():
+    @as_tool_error
+    def boom():
+        raise ValueError("engine 'redshift' is not yet supported")
+
+    with pytest.raises(ToolError, match="engine 'redshift' is not yet supported"):
+        boom()
+
+
+def test_as_tool_error_passes_through_return_value():
+    @as_tool_error
+    def add(a, b):
+        return a + b
+
+    assert add(2, 3) == 5
+
+
+def test_as_tool_error_does_not_double_wrap_an_existing_tool_error():
+    @as_tool_error
+    def boom():
+        raise ToolError("already a tool error")
+
+    with pytest.raises(ToolError, match="already a tool error"):
+        boom()
+
+
+def test_as_tool_error_lets_unanticipated_exceptions_propagate_unwrapped():
+    @as_tool_error
+    def boom():
+        raise KeyError("genuinely unexpected")
+
+    with pytest.raises(KeyError):
+        boom()

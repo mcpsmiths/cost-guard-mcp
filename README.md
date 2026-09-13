@@ -55,6 +55,47 @@ uv sync
 uv run cost-guard-mcp
 ```
 
+## Quickstart (~5 minutes to your first estimate)
+
+This walks through the fastest path to a real tool call — no data of your own required
+(it uses a public BigQuery dataset), no Snowflake trial signup needed.
+
+1. **Get a GCP project with the BigQuery API enabled.** Any project works, including the
+   free-tier Sandbox mode (no billing card required to run `dryRun`, which is all
+   `estimate_query_cost` does). Create one at
+   [console.cloud.google.com](https://console.cloud.google.com) if you don't have one.
+2. **Get Application Default Credentials**: run `gcloud auth application-default login`
+   locally, or create a service-account key and point `GOOGLE_APPLICATION_CREDENTIALS` at
+   its JSON file.
+3. **Add the server to your MCP client** — see [`.mcp.json.example`](.mcp.json.example),
+   filling in only `GOOGLE_APPLICATION_CREDENTIALS` (leave the Snowflake vars out entirely
+   for this quickstart).
+4. **Restart your MCP client** so it picks up the new server config, then ask your agent
+   to call `estimate_query_cost` against a public dataset — for example:
+
+   > Use cost-guard-mcp's estimate_query_cost tool on bigquery for this query:
+   > `SELECT name, SUM(number) AS total FROM `bigquery-public-data.usa_names.usa_1910_2013`
+   > GROUP BY name ORDER BY total DESC LIMIT 10`
+
+5. **You'll know it worked** when the response looks like this — the exact numbers will
+   differ, but `accuracy_tier` should read `PRECISE`:
+
+   ```json
+   {
+     "engine": "bigquery",
+     "accuracy_tier": "PRECISE",
+     "estimated_bytes": 320866545,
+     "estimated_cost_usd": 0.001842,
+     "currency": "USD",
+     "caveats": []
+   }
+   ```
+
+If you get a `ConfigError` mentioning `GOOGLE_APPLICATION_CREDENTIALS` instead, your MCP
+client didn't pass the env var through to the server process — see the credentials note
+above, and double check the value is set inside the client's own server config block, not
+just your shell.
+
 ## Use with other AI coding tools
 
 `cost-guard-mcp` is a standard stdio MCP server — any MCP-compatible client works, not just Claude Desktop. Every client ultimately runs the same `command`/`args`/`env`; only the wrapping file format differs, so there's one canonical definition — [`.mcp.json.example`](.mcp.json.example) — instead of a separately maintained copy per tool below.
