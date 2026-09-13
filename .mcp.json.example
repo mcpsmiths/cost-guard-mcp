@@ -9,7 +9,10 @@
         "SNOWFLAKE_ACCOUNT": "your-account",
         "SNOWFLAKE_USER": "your-user",
         "SNOWFLAKE_ROLE": "your-role",
-        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8"
+        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8",
+        "DATABRICKS_SERVER_HOSTNAME": "your-workspace.cloud.databricks.com",
+        "DATABRICKS_HTTP_PATH": "/sql/1.0/warehouses/your-warehouse-id",
+        "DATABRICKS_TOKEN": "your-personal-access-token"
       }
     }
   }
