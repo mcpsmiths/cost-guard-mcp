@@ -1,8 +1,14 @@
+import base64
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cost_guard_mcp.engines.bigquery import dry_run, execute_bounded, is_capacity_billed
+from cost_guard_mcp.engines.bigquery import (
+    check_credentials,
+    dry_run,
+    execute_bounded,
+    is_capacity_billed,
+)
 from cost_guard_mcp.errors import SanitizedEngineError
 from cost_guard_mcp.types import AccuracyTier
 
@@ -227,3 +233,48 @@ def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_bq_modul
     called_sql = mock_client.query.call_args[0][0]
     assert ";)" not in called_sql
     assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_check_credentials_ok_when_service_account_email_succeeds(mock_bq_module):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.get_service_account_email.return_value = "bq-sa@my-project.iam.gserviceaccount.com"
+    mock_bq_module.Client.return_value = mock_client
+
+    result = check_credentials()
+
+    assert result.engine == "bigquery"
+    assert result.ok is True
+    assert "my-project" in result.detail
+    assert "bq-sa@my-project.iam.gserviceaccount.com" in result.detail
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_check_credentials_reports_failure_as_data_not_a_raise(mock_bq_module):
+    mock_client = MagicMock()
+    mock_client.get_service_account_email.side_effect = Exception("401 Unauthorized")
+    mock_bq_module.Client.return_value = mock_client
+
+    result = check_credentials()
+
+    assert result.engine == "bigquery"
+    assert result.ok is False
+    assert "401 Unauthorized" in result.detail
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_check_credentials_redacts_secrets_in_failure_detail(mock_bq_module):
+    body = base64.b64decode(b"YWJjMTIzc2VjcmV0").decode()
+    prefix = "-----BEGIN " + "PRIVATE KEY" + "-----"
+    mock_client = MagicMock()
+    mock_client.get_service_account_email.side_effect = Exception(
+        "auth error, private_key=" + prefix + body
+    )
+    mock_bq_module.Client.return_value = mock_client
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert body not in result.detail
+    assert "REDACTED" in result.detail

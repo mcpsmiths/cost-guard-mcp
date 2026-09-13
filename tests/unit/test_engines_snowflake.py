@@ -1,3 +1,4 @@
+import base64
 import json
 from unittest.mock import MagicMock, patch
 
@@ -8,6 +9,7 @@ from cost_guard_mcp.engines.snowflake import (
     _LOGIN_TIMEOUT_SECONDS,
     _NETWORK_TIMEOUT_SECONDS,
     _connect,
+    check_credentials,
     explain_estimate,
 )
 from cost_guard_mcp.errors import SanitizedEngineError
@@ -175,3 +177,89 @@ def test_explain_estimate_raises_clear_error_when_explain_returns_no_rows(mock_c
 
     with pytest.raises(SanitizedEngineError, match="EXPLAIN USING JSON returned no rows"):
         explain_estimate("SELECT 1", warehouse=None)
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_ok_and_pins_warehouse_when_given(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = ("COST_GUARD_READER", "COMPUTE_WH", "ABC12345")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials(warehouse="COMPUTE_WH")
+
+    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert "USE WAREHOUSE COMPUTE_WH" in executed_sql[0]
+    assert result.engine == "snowflake"
+    assert result.ok is True
+    assert "COST_GUARD_READER" in result.detail
+    assert "COMPUTE_WH" in result.detail
+    assert "ABC12345" in result.detail
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_skips_use_warehouse_when_none(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = ("COST_GUARD_READER", None, "ABC12345")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    check_credentials(warehouse=None)
+
+    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert len(executed_sql) == 1
+    assert not any("USE WAREHOUSE" in stmt for stmt in executed_sql)
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_reports_connection_failure_as_data_not_a_raise(mock_connect):
+    mock_connect.side_effect = SanitizedEngineError("snowflake client call failed: bad account")
+
+    result = check_credentials()
+
+    assert result.engine == "snowflake"
+    assert result.ok is False
+    assert "bad account" in result.detail
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_redacts_secrets_in_failure_detail(mock_connect):
+    body = base64.b64decode(b"YWJjMTIzc2VjcmV0").decode()
+    prefix = "-----BEGIN " + "PRIVATE KEY" + "-----"
+    mock_connect.side_effect = Exception("auth error, private_key=" + prefix + body)
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert body not in result.detail
+    assert "REDACTED" in result.detail
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_reports_no_rows_as_failure_not_a_raise(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = None
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert "no rows" in result.detail
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_rejects_invalid_warehouse_name_as_failure_not_a_raise(mock_connect):
+    mock_cursor = MagicMock()
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials(warehouse="WH1; malicious")
+
+    assert result.ok is False
+    assert "Invalid warehouse name" in result.detail
+    mock_cursor.execute.assert_not_called()

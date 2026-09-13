@@ -4,9 +4,9 @@ import re
 import snowflake.connector
 
 from cost_guard_mcp.config import load_snowflake_config
-from cost_guard_mcp.errors import sanitize_exceptions
+from cost_guard_mcp.errors import SanitizedEngineError, redact_secrets, sanitize_exceptions
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
-from cost_guard_mcp.types import AccuracyTier, CostEstimate
+from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
 # The connector's own defaults leave this tool exposed to indefinite hangs: login_timeout
 # falls back to snowflake.connector.auth.by_plugin.DEFAULT_AUTH_CLASS_TIMEOUT (120s) only if
@@ -134,3 +134,36 @@ def execute_bounded(
         rows = rows[:max_rows]
 
     return rows, len(rows), row_cap_hit
+
+
+def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
+    """Verify Snowflake credentials/connectivity without running EXPLAIN or any real query.
+
+    Deliberately does NOT use @sanitize_exceptions: a failed check is the expected, useful
+    result here, not an error condition — this function always returns a
+    CredentialCheckResult (never raises for a credential/connectivity failure) so a caller
+    can distinguish "not configured yet" from "actually broken" before attempting a real
+    estimate_query_cost/run_query_bounded call. redact_secrets is applied defensively even
+    though _connect() already redacts its own failures — it is a no-op on already-safe text.
+    """
+    try:
+        conn = _connect()
+        with conn.cursor() as cur:
+            if warehouse is not None:
+                cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
+            cur.execute("SELECT CURRENT_ROLE(), CURRENT_WAREHOUSE(), CURRENT_ACCOUNT()")
+            row = cur.fetchone()
+            if row is None:
+                raise SanitizedEngineError("session context query returned no rows")
+            role, current_warehouse, account = row
+    except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
+        return CredentialCheckResult(engine="snowflake", ok=False, detail=redact_secrets(str(exc)))
+
+    return CredentialCheckResult(
+        engine="snowflake",
+        ok=True,
+        detail=(
+            f"Authenticated as role '{role}' on account '{account}', "
+            f"warehouse '{current_warehouse}'."
+        ),
+    )
