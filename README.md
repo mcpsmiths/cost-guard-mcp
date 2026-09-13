@@ -56,6 +56,13 @@ uv sync
 uv run cost-guard-mcp
 ```
 
+Or via Docker:
+
+```bash
+docker build -t cost-guard-mcp .
+docker run -i --rm -e GOOGLE_APPLICATION_CREDENTIALS=/creds.json -v /path/to/service-account.json:/creds.json cost-guard-mcp
+```
+
 ## Quickstart (~5 minutes to your first estimate)
 
 This walks through the fastest path to a real tool call — no data of your own required
