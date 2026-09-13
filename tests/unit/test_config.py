@@ -2,6 +2,7 @@ import pytest
 
 from cost_guard_mcp.config import (
     ConfigError,
+    DatabricksConfig,
     SnowflakeConfig,
     load_bigquery_config,
     load_databricks_config,
@@ -139,3 +140,20 @@ def test_load_databricks_config_succeeds_with_oauth_m2m(monkeypatch):
     assert config.access_token is None
     assert config.client_id == "client-abc"
     assert config.client_secret == "secret-xyz"
+
+
+def test_databricks_config_does_not_leak_secrets_in_repr():
+    token_value = "dapi_supersecret"
+    secret_value = "oauth_supersecret"
+    config = DatabricksConfig(
+        server_hostname="my-workspace.cloud.databricks.com",
+        http_path="/sql/1.0/warehouses/abc123",
+        access_token=token_value,
+        client_id="client-abc",
+        client_secret=secret_value,
+    )
+    config_repr = repr(config)
+    assert token_value not in config_repr
+    assert secret_value not in config_repr
+    assert "my-workspace.cloud.databricks.com" in config_repr
+    assert "client-abc" in config_repr

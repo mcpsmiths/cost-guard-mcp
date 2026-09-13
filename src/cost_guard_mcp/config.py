@@ -25,9 +25,9 @@ class SnowflakeConfig:
 class DatabricksConfig:
     server_hostname: str
     http_path: str
-    access_token: str | None
-    client_id: str | None
-    client_secret: str | None = field(repr=False)
+    access_token: str | None = field(repr=False)
+    client_id: str | None = None
+    client_secret: str | None = field(default=None, repr=False)
 
 
 def load_bigquery_config() -> BigQueryConfig:
