@@ -91,6 +91,15 @@ SNOWFLAKE_PRIVATE_KEY_PATH = "/path/to/rsa_key.p8"
 - Snowflake's `UPPER_BOUND` estimate excludes Cortex AI Function ("AI Credits") cost.
 - BigQuery Editions/capacity-billed projects cannot get a dollar estimate — only a byte count (capacity billing has no fixed $/byte rate).
 
+## More docs
+
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) — component/data-flow map
+- [`DECISIONS.md`](DECISIONS.md) — why the design looks the way it does
+- [`CONTEXT.md`](CONTEXT.md) — terminology glossary (BigQuery/Snowflake concepts that sound alike but aren't)
+- [`CHANGELOG.md`](CHANGELOG.md) — release history
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) / [`AGENTS.md`](AGENTS.md) — contributing and build/test/lint commands
+- [`SECURITY.md`](SECURITY.md) — vulnerability reporting
+
 ## License
 
 MIT
