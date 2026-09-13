@@ -3,7 +3,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cost_guard_mcp.engines.snowflake import _ASSUMED_RUNTIME_HOURS, _connect, explain_estimate
+from cost_guard_mcp.engines.snowflake import (
+    _ASSUMED_RUNTIME_HOURS,
+    _LOGIN_TIMEOUT_SECONDS,
+    _NETWORK_TIMEOUT_SECONDS,
+    _connect,
+    explain_estimate,
+)
 from cost_guard_mcp.errors import SanitizedEngineError
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
 from cost_guard_mcp.types import AccuracyTier
@@ -30,6 +36,8 @@ def test_connect_uses_key_pair_when_private_key_path_set(mock_load_config, mock_
         authenticator="SNOWFLAKE_JWT",
         private_key_file="/tmp/rsa_key.p8",
         private_key_file_pwd="pw",
+        login_timeout=_LOGIN_TIMEOUT_SECONDS,
+        network_timeout=_NETWORK_TIMEOUT_SECONDS,
     )
 
 
@@ -48,7 +56,12 @@ def test_connect_falls_back_to_password_when_no_key_pair(mock_load_config, mock_
     _connect()
 
     mock_connect.assert_called_once_with(
-        account="abc123", user="svc_user", role="COST_GUARD_READER", password="hunter2"
+        account="abc123",
+        user="svc_user",
+        role="COST_GUARD_READER",
+        password="hunter2",
+        login_timeout=_LOGIN_TIMEOUT_SECONDS,
+        network_timeout=_NETWORK_TIMEOUT_SECONDS,
     )
 
 
