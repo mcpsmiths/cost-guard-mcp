@@ -13,11 +13,6 @@ def test_bigquery_capabilities_are_precise_by_default():
     assert len(caps.known_gaps) >= 1
 
 
-def test_unsupported_engine_raises_clear_error():
-    with pytest.raises(ValueError, match="databricks"):
-        describe_engine_capabilities("databricks")
-
-
 def test_unknown_engine_string_raises_clear_error():
     with pytest.raises(ValueError, match="not yet supported"):
         describe_engine_capabilities("redshift")  # type: ignore[arg-type]
@@ -30,3 +25,12 @@ def test_snowflake_capabilities_are_upper_bound_by_default():
     assert caps.supports_dollar_estimate is True
     assert caps.default_accuracy_tier == AccuracyTier.UPPER_BOUND
     assert any("Cortex" in gap for gap in caps.known_gaps)
+
+
+def test_databricks_capabilities_are_heuristic_by_default():
+    caps = describe_engine_capabilities("databricks")
+    assert caps.engine == "databricks"
+    assert caps.supports_precise_bytes is False
+    assert caps.supports_dollar_estimate is True
+    assert caps.default_accuracy_tier == AccuracyTier.HEURISTIC
+    assert any("EXPLAIN COST" in gap for gap in caps.known_gaps)
