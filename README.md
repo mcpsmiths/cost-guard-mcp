@@ -2,6 +2,12 @@
 
 <!-- mcp-name: io.github.mcpsmiths/cost-guard-mcp -->
 
+[![PyPI](https://img.shields.io/pypi/v/cost-guard-mcp)](https://pypi.org/project/cost-guard-mcp/)
+[![Python](https://img.shields.io/pypi/pyversions/cost-guard-mcp)](https://pypi.org/project/cost-guard-mcp/)
+[![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.mcpsmiths%2Fcost--guard--mcp-blue)](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.mcpsmiths/cost-guard-mcp)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![tests](https://github.com/mcpsmiths/cost-guard-mcp/actions/workflows/tests.yml/badge.svg)](https://github.com/mcpsmiths/cost-guard-mcp/actions/workflows/tests.yml)
+
 Pre-flight query cost & result-size guardrails for AI agents, across BigQuery and Snowflake — before the query ever runs.
 
 ## Why
@@ -36,8 +42,8 @@ Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as it
 {
   "mcpServers": {
     "cost-guard-mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "/path/to/cost-guard-mcp", "cost-guard-mcp"],
+      "command": "uvx",
+      "args": ["cost-guard-mcp"],
       "env": {
         "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account.json",
         "BIGQUERY_PROJECT": "your-project-id",
@@ -53,7 +59,13 @@ Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as it
 
 ## Install
 
-Not yet published to PyPI — for now, clone and run directly:
+```bash
+uvx cost-guard-mcp
+```
+
+Also published on the [official MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.mcpsmiths/cost-guard-mcp) as `io.github.mcpsmiths/cost-guard-mcp`.
+
+For local development instead:
 
 ```bash
 git clone https://github.com/mcpsmiths/cost-guard-mcp.git
@@ -61,8 +73,6 @@ cd cost-guard-mcp
 uv sync
 uv run cost-guard-mcp
 ```
-
-Once published, `uvx cost-guard-mcp` will work as a one-line install.
 
 ## Known limitations
 
