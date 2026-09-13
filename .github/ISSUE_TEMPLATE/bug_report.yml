@@ -1,0 +1,40 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      options:
+        - BigQuery
+        - Snowflake
+        - Both / not engine-specific
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Include the tool call and, if possible, a minimal SQL example (no real table/column names if sensitive).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: cost-guard-mcp version
+      description: "`pip show cost-guard-mcp` or the git commit if running from source"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Paste any error output. Do not paste credentials, service-account keys, or private keys.
