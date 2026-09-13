@@ -36,26 +36,7 @@ Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no def
 
 ### A note on credentials with MCP hosts
 
-Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as its own subprocess — it does **not** automatically inherit your shell's environment variables, even if they're set in your `.zshrc`/`.bashrc`. Put them directly in the host's server config instead. For Claude Desktop's `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "cost-guard-mcp": {
-      "command": "uvx",
-      "args": ["cost-guard-mcp"],
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account.json",
-        "BIGQUERY_PROJECT": "your-project-id",
-        "SNOWFLAKE_ACCOUNT": "your-account",
-        "SNOWFLAKE_USER": "your-user",
-        "SNOWFLAKE_ROLE": "your-role",
-        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8"
-      }
-    }
-  }
-}
-```
+Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as its own subprocess — it does **not** automatically inherit your shell's environment variables, even if they're set in your `.zshrc`/`.bashrc`. Put them directly in the host's server config instead — see [`.mcp.json.example`](.mcp.json.example) for the exact block, and the "Use with other AI coding tools" section below for where each specific tool wants it.
 
 ## Install
 
@@ -76,43 +57,19 @@ uv run cost-guard-mcp
 
 ## Use with other AI coding tools
 
-`cost-guard-mcp` is a standard stdio MCP server — any MCP-compatible client works, not just Claude Desktop. Only the config file format differs per tool; the underlying `command`/`args`/`env` are the same everywhere.
+`cost-guard-mcp` is a standard stdio MCP server — any MCP-compatible client works, not just Claude Desktop. Every client ultimately runs the same `command`/`args`/`env`; only the wrapping file format differs, so there's one canonical definition — [`.mcp.json.example`](.mcp.json.example) — instead of a separately maintained copy per tool below.
 
-### Claude Code
+There is no single file every tool reads automatically (each looks in its own location), but three of the four use the exact same `mcpServers` wrapper `.mcp.json.example` already has, so those need nothing more than copying it into place. Fill in your real credential values, then:
 
-```bash
-claude mcp add cost-guard-mcp -e GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account.json -e BIGQUERY_PROJECT=your-project-id -e SNOWFLAKE_ACCOUNT=your-account -e SNOWFLAKE_USER=your-user -e SNOWFLAKE_ROLE=your-role -e SNOWFLAKE_PRIVATE_KEY_PATH=/path/to/rsa_key.p8 -- uvx cost-guard-mcp
-```
+| Client | Where it goes | Change needed from `.mcp.json.example` |
+|---|---|---|
+| **Claude Code** | `.mcp.json` (project) | None — copy as-is, or `claude mcp add-json cost-guard-mcp '<the "cost-guard-mcp" object>'` |
+| **Claude Desktop** | `claude_desktop_config.json` | None — copy as-is |
+| **Cursor** | `.cursor/mcp.json` or `~/.cursor/mcp.json` | Add `"type": "stdio"` inside the server object |
+| **GitHub Copilot (VS Code)** | `.vscode/mcp.json` | Rename top-level key `mcpServers` → `servers`, add `"type": "stdio"` |
+| **OpenAI Codex CLI** | `~/.codex/config.toml` | Same fields, TOML syntax instead of JSON (below) — or `codex mcp add cost-guard-mcp -- uvx cost-guard-mcp` |
 
-Or add to a project's `.mcp.json` directly, using the same shape as the Claude Desktop example above.
-
-### Cursor
-
-Add to `.cursor/mcp.json` (project) or `~/.cursor/mcp.json` (global):
-
-```json
-{
-  "mcpServers": {
-    "cost-guard-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["cost-guard-mcp"],
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account.json",
-        "BIGQUERY_PROJECT": "your-project-id",
-        "SNOWFLAKE_ACCOUNT": "your-account",
-        "SNOWFLAKE_USER": "your-user",
-        "SNOWFLAKE_ROLE": "your-role",
-        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8"
-      }
-    }
-  }
-}
-```
-
-### OpenAI Codex CLI
-
-Add to `~/.codex/config.toml` (or `.codex/config.toml` for a project):
+Codex is the one genuine exception (TOML, not JSON), so it still needs its own block:
 
 ```toml
 [mcp_servers.cost-guard-mcp]
@@ -126,32 +83,6 @@ SNOWFLAKE_ACCOUNT = "your-account"
 SNOWFLAKE_USER = "your-user"
 SNOWFLAKE_ROLE = "your-role"
 SNOWFLAKE_PRIVATE_KEY_PATH = "/path/to/rsa_key.p8"
-```
-
-Or via the CLI: `codex mcp add cost-guard-mcp -- uvx cost-guard-mcp`.
-
-### GitHub Copilot (VS Code)
-
-Add to `.vscode/mcp.json` (note the top-level key is `servers`, not `mcpServers`):
-
-```json
-{
-  "servers": {
-    "cost-guard-mcp": {
-      "type": "stdio",
-      "command": "uvx",
-      "args": ["cost-guard-mcp"],
-      "env": {
-        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account.json",
-        "BIGQUERY_PROJECT": "your-project-id",
-        "SNOWFLAKE_ACCOUNT": "your-account",
-        "SNOWFLAKE_USER": "your-user",
-        "SNOWFLAKE_ROLE": "your-role",
-        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8"
-      }
-    }
-  }
-}
 ```
 
 ## Known limitations

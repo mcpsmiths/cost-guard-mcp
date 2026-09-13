@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "cost-guard-mcp": {
+      "command": "uvx",
+      "args": ["cost-guard-mcp"],
+      "env": {
+        "GOOGLE_APPLICATION_CREDENTIALS": "/path/to/service-account.json",
+        "BIGQUERY_PROJECT": "your-project-id",
+        "SNOWFLAKE_ACCOUNT": "your-account",
+        "SNOWFLAKE_USER": "your-user",
+        "SNOWFLAKE_ROLE": "your-role",
+        "SNOWFLAKE_PRIVATE_KEY_PATH": "/path/to/rsa_key.p8"
+      }
+    }
+  }
+}
