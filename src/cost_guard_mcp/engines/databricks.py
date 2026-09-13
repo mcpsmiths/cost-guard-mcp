@@ -1,10 +1,13 @@
+import re
+
 from databricks import sql
 from databricks.sdk.core import Config, oauth_service_principal
 from databricks.sdk.credentials_provider import OAuthCredentialsProvider
 
 from cost_guard_mcp.config import load_databricks_config
 from cost_guard_mcp.errors import redact_secrets, sanitize_exceptions
-from cost_guard_mcp.types import CredentialCheckResult
+from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
+from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
 # databricks-sql-connector's own _socket_timeout defaults to 900s on the backend used
 # here (confirmed via CONNECTION_PARAMETERS.md against the installed package) - not
@@ -72,4 +75,74 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
 
     return CredentialCheckResult(
         engine="databricks", ok=True, detail=f"Authenticated as '{current_user}'."
+    )
+
+
+_UNIT_MULTIPLIERS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
+
+# Real confirmed EXPLAIN COST output format (docs.databricks.com/aws/en/optimizations/cbo,
+# live-verified 2026-09-13): "Statistics(sizeInBytes=134.6 GB, rowCount=2.88E+9, ...)" -
+# unit-suffixed, not a raw byte integer like Snowflake's bytesAssigned.
+_STATISTICS_RE = re.compile(r"sizeInBytes=([\d.]+)\s*(B|KB|MB|GB|TB|PB)\b", re.IGNORECASE)
+
+# EXPLAIN COST gives no runtime estimate at all - same deliberately conservative,
+# documented placeholder pattern already used for Snowflake (see _ASSUMED_RUNTIME_HOURS
+# in snowflake.py), turning a byte estimate (when available) into SOME dollar figure.
+_ASSUMED_RUNTIME_HOURS = 30 / 3600
+
+
+def _parse_max_size_in_bytes(explain_output: str) -> int | None:
+    matches = _STATISTICS_RE.findall(explain_output)
+    if not matches:
+        return None
+    sizes = [float(value) * _UNIT_MULTIPLIERS[unit.upper()] for value, unit in matches]
+    return int(max(sizes))
+
+
+@sanitize_exceptions("databricks")
+def explain_estimate(
+    sql_text: str, warehouse: str | None, warehouse_size: str = "X-Small"
+) -> CostEstimate:
+    """Estimate Databricks query cost via EXPLAIN COST. Always HEURISTIC - never PRECISE
+    or UPPER_BOUND - since Databricks has no dry-run and EXPLAIN COST's plan-node
+    statistics are frequently absent (no ANALYZE TABLE, streaming sources, non-Delta
+    external tables).
+
+    `warehouse` is accepted only for calling-convention consistency and is a documented
+    no-op - see check_credentials's docstring for why.
+    """
+    conn = _connect()
+    with conn.cursor() as cur:
+        cur.execute(f"EXPLAIN COST {sql_text}")
+        rows = cur.fetchall()
+
+    explain_output = "\n".join(row[0] for row in rows)
+    max_size_in_bytes = _parse_max_size_in_bytes(explain_output)
+
+    rate = dbus_per_hour(warehouse_size)
+    estimated_cost_usd = rate * SERVERLESS_USD_PER_DBU * _ASSUMED_RUNTIME_HOURS
+
+    caveats = [
+        "Databricks has no BigQuery-style dry-run; this estimate is HEURISTIC, the "
+        "least precise of this project's three accuracy tiers.",
+        f"Cost assumes a {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on a "
+        f"{warehouse_size} Serverless SQL warehouse - a rough placeholder, not derived "
+        "from this query's actual expected runtime.",
+        "Pricing assumes a Serverless SQL warehouse; Classic/Pro warehouses use "
+        "different (lower) DBU rates plus a separate underlying cloud VM cost not "
+        "modeled here.",
+    ]
+    if max_size_in_bytes is None:
+        caveats.append(
+            "EXPLAIN COST returned no size statistics for this query (common without "
+            "ANALYZE TABLE having been run, for streaming sources, or for non-Delta "
+            "external tables) - the byte estimate is unavailable, not zero."
+        )
+
+    return CostEstimate(
+        engine="databricks",
+        accuracy_tier=AccuracyTier.HEURISTIC,
+        estimated_bytes=max_size_in_bytes,
+        estimated_cost_usd=round(estimated_cost_usd, 6),
+        caveats=caveats,
     )

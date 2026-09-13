@@ -103,3 +103,68 @@ def test_check_credentials_ignores_warehouse_parameter(mock_connect):
 
     assert result.ok is True
     mock_cursor.execute.assert_called_once_with("SELECT current_user()")
+
+
+from cost_guard_mcp.engines.databricks import explain_estimate
+from cost_guard_mcp.types import AccuracyTier
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_parses_max_size_in_bytes_from_statistics(mock_connect):
+    # Real confirmed EXPLAIN COST output shape (docs.databricks.com/aws/en/optimizations/cbo,
+    # live-verified 2026-09-13): one Statistics(sizeInBytes=X unit, rowCount=Y) tuple per
+    # plan node, larger unit suffixes (GB) alongside smaller ones (B) in the same plan.
+    explain_output = (
+        "== Optimized Logical Plan ==\n"
+        "Aggregate [count(1) AS count(1)#2L], Statistics(sizeInBytes=20.0 B, rowCount=1)\n"
+        "+- Relation[ss_store_sk,ss_sold_date_sk] parquet, "
+        "Statistics(sizeInBytes=134.6 GB, rowCount=2.88E+9, hints=none)\n"
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [(explain_output,)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    estimate = explain_estimate("SELECT COUNT(*) FROM store_sales", warehouse=None)
+
+    executed_sql = mock_cursor.execute.call_args[0][0]
+    assert executed_sql == "EXPLAIN COST SELECT COUNT(*) FROM store_sales"
+    assert estimate.engine == "databricks"
+    assert estimate.accuracy_tier == AccuracyTier.HEURISTIC
+    assert estimate.estimated_bytes == int(134.6 * 1024**3)
+    assert estimate.estimated_cost_usd is not None
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_handles_missing_statistics(mock_connect):
+    # Real, confirmed case: no ANALYZE TABLE run, streaming source, or non-Delta external
+    # table with no collected stats.
+    explain_output = "== Optimized Logical Plan ==\nRelation[a,b] csv\n"
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [(explain_output,)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    estimate = explain_estimate("SELECT * FROM external_csv_table", warehouse=None)
+
+    assert estimate.estimated_bytes is None
+    assert estimate.accuracy_tier == AccuracyTier.HEURISTIC
+    assert any("no size statistics" in c.lower() for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_cost_math_matches_pricing_table(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [("Relation[a] parquet, Statistics(sizeInBytes=1.0 B)",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    estimate = explain_estimate("SELECT 1", warehouse=None, warehouse_size="Small")
+
+    from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
+
+    expected_cost = round(dbus_per_hour("Small") * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
+    assert estimate.estimated_cost_usd == expected_cost
