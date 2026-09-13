@@ -12,6 +12,7 @@ so they're not duplicated here and can't drift out of sync.
 ## Before opening a PR
 
 - [ ] `uv run ruff check src tests` passes
+- [ ] `uv run mypy src` passes
 - [ ] `uv run pytest tests/unit -v --cov=cost_guard_mcp --cov-fail-under=80` passes
 - [ ] A bug fix includes a regression test in the same commit
 - [ ] Commit messages follow [Conventional Commits](https://www.conventionalcommits.org/)
