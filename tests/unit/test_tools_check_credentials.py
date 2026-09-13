@@ -27,6 +27,16 @@ def test_check_credentials_dispatches_to_snowflake_with_warehouse(mock_engine):
     assert result.engine == "snowflake"
 
 
+@patch("cost_guard_mcp.tools.check_credentials.databricks_engine")
+def test_check_credentials_dispatches_to_databricks(mock_engine):
+    mock_engine.check_credentials.return_value = CredentialCheckResult(
+        engine="databricks", ok=True, detail="Authenticated."
+    )
+    result = check_credentials("databricks", warehouse="ignored")
+    mock_engine.check_credentials.assert_called_once_with("ignored")
+    assert result.engine == "databricks"
+
+
 def test_check_credentials_rejects_unsupported_engine():
-    with pytest.raises(ValueError, match="databricks"):
-        check_credentials("databricks")
+    with pytest.raises(ValueError, match="redshift"):
+        check_credentials("redshift")  # type: ignore[arg-type]
