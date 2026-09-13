@@ -33,7 +33,16 @@ class SanitizedEngineError(RuntimeError):
     """Raised in place of a raw warehouse-client exception. Safe to log or return to a tool caller."""
 
 
-def _redact(text: str) -> str:
+class UserVisibleError(ValueError):
+    """A ValueError this codebase has deliberately vetted as containing no secrets or
+    internal detail. Raise this instead of a bare ValueError when the message should reach
+    the calling agent via as_tool_error below — a plain ValueError from somewhere
+    unaudited (a library call, a future code path) is NOT assumed safe and will NOT be
+    forwarded to the client.
+    """
+
+
+def redact_secrets(text: str) -> str:
     redacted = text
     for pattern in _SECRET_PATTERNS:
         if pattern.pattern.startswith(r"(://"):  # URI pattern
@@ -62,10 +71,12 @@ def as_tool_error[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     the server" by design (see mcp.server.mcpserver.tools.base). That default is the right
     call for exceptions we didn't anticipate, but it also silently swallows the messages
     this project already goes out of its way to make safe: `SanitizedEngineError` (redacted
-    by sanitize_exceptions above), `ConfigError` (never contains secrets), and the plain
-    `ValueError`s this codebase raises deliberately for an unsupported engine name or an
-    invalid warehouse identifier. Converting exactly those three into `ToolError` is what
-    lets an agent actually see (and act on) the hint/reason text instead of a black box.
+    by sanitize_exceptions above), `ConfigError` (never contains secrets), and
+    `UserVisibleError` (a ValueError this codebase deliberately vetted as safe — see its own
+    docstring). Converting exactly those three into `ToolError` is what lets an agent
+    actually see (and act on) the hint/reason text instead of a black box. Deliberately NOT
+    catching the bare `ValueError` type: that would forward the message of any ValueError
+    from anywhere in the call chain — including a future, unaudited one — to the client.
     """
 
     @functools.wraps(func)
@@ -74,7 +85,7 @@ def as_tool_error[**P, T](func: Callable[P, T]) -> Callable[P, T]:
             return func(*args, **kwargs)
         except ToolError:
             raise
-        except (SanitizedEngineError, ConfigError, ValueError) as exc:
+        except (SanitizedEngineError, ConfigError, UserVisibleError) as exc:
             raise ToolError(str(exc)) from exc
 
     return wrapper
@@ -91,7 +102,7 @@ def sanitize_exceptions(engine: str) -> Callable[[Callable[P, T]], Callable[P, T
             except SanitizedEngineError:
                 raise
             except Exception as exc:  # noqa: BLE001 - intentionally catching all exceptions to sanitize
-                safe_message = _redact(str(exc))
+                safe_message = redact_secrets(str(exc))
                 raise SanitizedEngineError(f"{engine} client call failed: {safe_message}") from None
 
         return wrapper
