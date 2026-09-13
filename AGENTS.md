@@ -19,12 +19,19 @@ uv sync --all-extras
 ## Build, lint, test
 
 ```bash
-uv run ruff check src tests        # lint
+uv run ruff check src tests        # lint (includes flake8-bandit security rules)
+uv run mypy src                    # type check
 uv run pytest tests/unit -v --cov=cost_guard_mcp --cov-report=term-missing --cov-fail-under=80
 ```
 
-Both must pass before committing. CI (`.github/workflows/tests.yml`) runs the same two
-commands on every push/PR — there is no separate local-vs-CI command set to keep in sync.
+All three must pass before committing. CI (`.github/workflows/tests.yml`) runs the same
+three commands on every push/PR — there is no separate local-vs-CI command set to keep in
+sync. A `.pre-commit-config.yaml` runs ruff automatically on commit (install with
+`uv run pre-commit install`) — deliberately just ruff, not mypy or pytest, to keep
+pre-commit fast; the full check set still runs in CI regardless.
+
+Dependency vulnerability scanning (`.github/workflows/audit.yml`), CodeQL, and OpenSSF
+Scorecard also run in CI but are not required checks — see `SECURITY.md`.
 
 Live-account integration tests (`tests/integration/`) require real BigQuery/Snowflake
 credentials and are excluded from the default `pytest` run (`testpaths = ["tests/unit"]`

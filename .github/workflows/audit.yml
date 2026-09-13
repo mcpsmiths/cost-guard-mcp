@@ -1,0 +1,26 @@
+# .github/workflows/audit.yml
+#
+# Dependency vulnerability scan. Deliberately NOT a required branch-protection
+# check: a new CVE in an already-approved, unrelated dependency shouldn't block
+# an unrelated PR (e.g. a docs fix) from merging - see this repo's own
+# solo-maintainer branch-protection design. Runs on every push/PR for
+# visibility, plus weekly since new CVEs are disclosed independent of code
+# changes here. uv's own native `uv audit` is still preview/unstable as of
+# this writing, so this uses the proven `uv export` -> pinned pip-audit
+# pattern instead.
+name: audit
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1"  # weekly, Monday 06:00 UTC
+permissions:
+  contents: read
+jobs:
+  pip-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+      - uses: astral-sh/setup-uv@8d55fbecc275b1c35dbe060458839f8d30439ccf  # v3
+      - run: uv export --no-hashes --format requirements-txt -o requirements.txt
+      - run: uvx pip-audit@2.10.1 --requirement requirements.txt

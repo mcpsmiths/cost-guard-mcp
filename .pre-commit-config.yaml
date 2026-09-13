@@ -1,0 +1,21 @@
+# Fast, deterministic checks only - pytest deliberately does NOT belong here
+# (see AGENTS.md and DECISIONS.md); slow/full-suite checks stay in CI.
+# Install: `uv run pre-commit install`. Hosted on pre-commit.ci (free for
+# public repos) for autofix + scheduled autoupdate - no GitHub Action needed.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.7
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: "0.12.13"
+    hooks:
+      - id: uv-lock
+      # uv-audit (runs `uv audit`) deliberately not included: `uv audit` isn't
+      # a real subcommand in the currently-installed uv release (verified
+      # 2026-09-13, "unrecognized subcommand"), despite being documented as
+      # preview. Dependency vulnerability scanning is covered by
+      # .github/workflows/audit.yml (uv export -> pip-audit) instead.

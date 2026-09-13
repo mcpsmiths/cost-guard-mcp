@@ -114,7 +114,10 @@ def execute_bounded(
     wrapped_sql = sql
     if max_rows is not None:
         inner_sql = sql.strip().rstrip(";").strip()
-        wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"
+        # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
+        # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
+        # untrusted input reaching a query built from a different source.
+        wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
 
     job_config = (
         bigquery.QueryJobConfig(maximum_bytes_billed=max_bytes_billed)

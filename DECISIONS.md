@@ -107,3 +107,21 @@ clear `ConfigError` if it's missing, rather than silently defaulting to any role
 
 **Consequences:** Slightly more setup friction for a new user, in exchange for making it
 structurally impossible to run this tool as an accidental `ACCOUNTADMIN`.
+
+## 8. PyPI releases publish via Trusted Publishing, not a stored API token
+
+**Context:** v0.1.0 published via a manually-run `uv publish` using a locally-stored PyPI
+API token. `uv publish` has native, built-in support for PyPI Trusted Publishing
+(OIDC) — no twine, no third-party action, no credential stored anywhere.
+
+**Decision:** `.github/workflows/release.yml`, triggered by pushing a `v*` tag, builds the
+package, publishes via `uv publish` under Trusted Publishing (`id-token: write` on the
+publish job only, split from the build job to limit the OIDC credential's blast radius),
+and creates the GitHub Release with the built artifacts plus a CycloneDX SBOM
+(`uv export --format cyclonedx1.5`, an experimental uv feature as of this writing).
+
+**Consequences:** No PyPI credential exists anywhere in this project's CI or on disk
+after this migration — a real reduction in what a compromised CI run or leaked secret
+could do. Requires a one-time PyPI-side setup (Trusted Publisher config naming this repo
+and workflow file) before the first Trusted-Publishing release; see the comment at the
+top of `release.yml`.

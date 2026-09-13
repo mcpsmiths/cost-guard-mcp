@@ -68,6 +68,9 @@ def explain_estimate(
         cur.execute(f"EXPLAIN USING JSON {sql}")
         row = cur.fetchone()
 
+    if row is None:
+        raise ValueError("EXPLAIN USING JSON returned no rows")
+
     plan = json.loads(row[0])
     global_stats = plan["GlobalStats"]
     bytes_assigned = global_stats["bytesAssigned"]
@@ -103,7 +106,10 @@ def execute_bounded(
     conn = _connect()
     wrapped_sql = sql
     if max_rows is not None:
-        wrapped_sql = f"SELECT * FROM ({sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"
+        # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
+        # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
+        # untrusted input reaching a query built from a different source.
+        wrapped_sql = f"SELECT * FROM ({sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
 
     with conn.cursor(snowflake.connector.DictCursor) as cur:
         if warehouse is not None:

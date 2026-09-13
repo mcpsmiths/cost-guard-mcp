@@ -150,3 +150,15 @@ def test_explain_estimate_rejects_empty_string_warehouse(mock_connect):
         explain_estimate("SELECT 1", warehouse="")
 
     mock_cursor.execute.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_raises_clear_error_when_explain_returns_no_rows(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = None
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="EXPLAIN USING JSON returned no rows"):
+        explain_estimate("SELECT 1", warehouse=None)
