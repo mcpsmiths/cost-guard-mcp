@@ -1,6 +1,6 @@
 [project]
 name = "cost-guard-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Pre-flight query cost & result-size guardrails for AI agents across BigQuery and Snowflake"
 readme = "README.md"
 requires-python = ">=3.12"
