@@ -168,7 +168,9 @@ from cost_guard_mcp.types import HistoricalRuntimeSignal
 
 def test_normalize_sql_collapses_whitespace_but_not_case():
     assert _normalize_sql_for_matching("SELECT   1\n  FROM t") == "SELECT 1 FROM t"
-    assert _normalize_sql_for_matching("select 1 from t") != _normalize_sql_for_matching("SELECT 1 FROM t")
+    assert _normalize_sql_for_matching("select 1 from t") != _normalize_sql_for_matching(
+        "SELECT 1 FROM t"
+    )
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
@@ -450,14 +452,18 @@ import threading
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.sql import QueryFilter, QueryStatus
 
-from cost_guard_mcp.engines.snowflake import _normalize_sql_for_matching  # or duplicate locally, see note below
+from cost_guard_mcp.engines.snowflake import (
+    _normalize_sql_for_matching,
+)  # or duplicate locally, see note below
 from cost_guard_mcp.types import HistoricalRuntimeSignal
 
 _HISTORY_LOOKUP_TIMEOUT_SECONDS = 5
 _HISTORY_LOOKUP_MAX_RESULTS = 500
 
 
-def _lookup_historical_runtime(sql_text: str, warehouse_id: str | None) -> HistoricalRuntimeSignal | None:
+def _lookup_historical_runtime(
+    sql_text: str, warehouse_id: str | None
+) -> HistoricalRuntimeSignal | None:
     """Best-effort - mirrors the Snowflake function's contract exactly: never raises,
     excludes cache hits via cache_query_id."""
     normalized_target = _normalize_sql_for_matching(sql_text)
@@ -470,7 +476,9 @@ def _lookup_historical_runtime(sql_text: str, warehouse_id: str | None) -> Histo
             filter_by = QueryFilter(statuses=[QueryStatus.FINISHED])
             if warehouse_id:
                 filter_by.warehouse_ids = [warehouse_id]
-            result.extend(w.query_history.list(filter_by=filter_by, max_results=_HISTORY_LOOKUP_MAX_RESULTS))
+            result.extend(
+                w.query_history.list(filter_by=filter_by, max_results=_HISTORY_LOOKUP_MAX_RESULTS)
+            )
         except BaseException as exc:  # noqa: BLE001
             error.append(exc)
 
