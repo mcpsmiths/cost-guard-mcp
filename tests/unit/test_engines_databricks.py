@@ -119,6 +119,20 @@ def test_check_credentials_closes_connection_even_on_failure(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_handles_no_rows_returned(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = None
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert "no rows" in result.detail.lower()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
 def test_check_credentials_ignores_warehouse_parameter(mock_connect):
     # Databricks has no per-query USE WAREHOUSE - the warehouse parameter exists only
     # for calling-convention consistency with bigquery/snowflake and is a documented
@@ -327,6 +341,28 @@ def test_execute_bounded_cancels_and_raises_when_wait_times_out(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_raise_survives_a_failed_cancel_attempt(mock_connect):
+    # Mirrors snowflake.py's equivalent test for its own cancel-fails case: cur.cancel()
+    # itself raising during the timeout path must not mask the TimeoutError-derived
+    # SanitizedEngineError that's already in flight.
+    mock_cursor = _make_mock_cursor([], execute_delay_seconds=2.0)
+    mock_cursor.cancel.side_effect = Exception("cancel also failed")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="Query exceeded"):
+        execute_bounded(
+            "SELECT * FROM huge_table",
+            warehouse=None,
+            max_rows=None,
+            _max_wait_seconds=0.2,
+        )
+
+    mock_cursor.cancel.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
 def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect):
     mock_cursor = _make_mock_cursor([(1,)])
     mock_conn = MagicMock()
@@ -382,4 +418,22 @@ def test_execute_bounded_closes_connection_even_on_failure(mock_connect):
     with pytest.raises(SanitizedEngineError, match="TABLE_OR_VIEW_NOT_FOUND"):
         execute_bounded("SELECT * FROM missing_table", warehouse=None, max_rows=None)
 
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_survives_a_failed_connection_close(mock_connect):
+    # The outer finally's own conn.close() is best-effort, mirroring cur.cancel()'s
+    # discipline above - a failed close must not mask a successful result.
+    mock_cursor = _make_mock_cursor([(1,)])
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_conn.close.side_effect = Exception("close also failed")
+    mock_connect.return_value = mock_conn
+
+    rows, row_count, row_cap_hit = execute_bounded("SELECT * FROM t", warehouse=None, max_rows=None)
+
+    assert rows == [{"a": 1}]
+    assert row_count == 1
+    assert row_cap_hit is False
     mock_conn.close.assert_called_once()

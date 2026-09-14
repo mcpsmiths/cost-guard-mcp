@@ -1,5 +1,8 @@
 from unittest.mock import patch
 
+import pytest
+
+from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, RefusalReason
 
@@ -109,3 +112,15 @@ def test_run_query_bounded_threads_warehouse_size_and_edition_to_cap_check(
     )
 
     mock_estimate.assert_called_once_with("snowflake", "SELECT 1", "WH", "X6LARGE", "enterprise")
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_run_query_bounded_rejects_unsupported_engine(mock_estimate):
+    # estimate_query_cost has its OWN identical engine-dispatch else that raises for an
+    # invalid engine BEFORE this function's own dispatch block is ever reached - mock it
+    # to a non-refusing estimate so execution actually reaches this function's own else
+    # branch instead of raising from the wrong function and passing for the wrong reason.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+
+    with pytest.raises(UserVisibleError, match="is not yet supported"):
+        run_query_bounded("redshift", "SELECT 1")

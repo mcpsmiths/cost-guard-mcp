@@ -498,3 +498,25 @@ def test_execute_bounded_closes_connection_even_on_failure(mock_connect, _mock_s
         execute_bounded("SELECT * FROM huge_table", warehouse=None, max_rows=None)
 
     mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_survives_a_failed_connection_close(mock_connect, _mock_sleep):
+    # The outer finally's own conn.close() is best-effort, mirroring _cancel_query's own
+    # discipline - a failed close must not mask a successful result.
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = [{"a": 1}]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.side_effect = [True, False]
+    mock_conn.close.side_effect = Exception("close also failed")
+    mock_connect.return_value = mock_conn
+
+    rows, row_count, row_cap_hit = execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+
+    assert rows == [{"a": 1}]
+    assert row_count == 1
+    assert row_cap_hit is False
+    mock_conn.close.assert_called_once()

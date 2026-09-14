@@ -82,6 +82,14 @@ def test_call_tool_run_query_bounded_end_to_end(mock_bq_module, _mock_capacity):
     assert result.structured_content["row_count"] == 1
 
 
+@patch("cost_guard_mcp.server.mcp")
+def test_main_calls_mcp_run(mock_mcp):
+    from cost_guard_mcp.server import main
+
+    main()
+    mock_mcp.run.assert_called_once()
+
+
 @patch("cost_guard_mcp.engines.bigquery.bigquery")
 def test_call_tool_check_credentials_end_to_end(mock_bq_module):
     mock_client = MagicMock()
