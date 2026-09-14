@@ -92,6 +92,33 @@ def test_check_credentials_reports_failure_as_data_not_a_raise(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_closes_connection_on_success(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = ("alice@example.com",)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials()
+
+    assert result.ok is True
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_closes_connection_even_on_failure(mock_connect):
+    mock_conn = MagicMock()
+    mock_conn.cursor.side_effect = RuntimeError("boom")
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert "boom" in result.detail
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
 def test_check_credentials_ignores_warehouse_parameter(mock_connect):
     # Databricks has no per-query USE WAREHOUSE - the warehouse parameter exists only
     # for calling-convention consistency with bigquery/snowflake and is a documented
@@ -189,6 +216,34 @@ def test_explain_estimate_cost_scales_up_for_large_byte_estimate(mock_connect):
     baseline = 30 / 3600
     expected_cost = round(dbus_per_hour("Small") * SERVERLESS_USD_PER_DBU * baseline * 4, 6)
     assert estimate.estimated_cost_usd == expected_cost
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_closes_connection_on_success(mock_connect):
+    explain_output = "Relation[a] parquet, Statistics(sizeInBytes=1.0 B)"
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [(explain_output,)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    explain_estimate("SELECT 1", warehouse=None)
+
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_closes_connection_even_on_failure(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = RuntimeError("EXPLAIN COST failed")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="EXPLAIN COST failed"):
+        explain_estimate("SELECT 1", warehouse=None)
+
+    mock_conn.close.assert_called_once()
 
 
 from cost_guard_mcp.engines.databricks import execute_bounded
@@ -302,3 +357,29 @@ def test_execute_bounded_reraises_real_query_error_not_a_timeout(mock_connect):
         execute_bounded("SELECT * FROM missing_table", warehouse=None, max_rows=None)
 
     mock_cursor.cancel.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_closes_connection_on_success(mock_connect):
+    mock_cursor = _make_mock_cursor([(1,)])
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT * FROM t", warehouse=None, max_rows=None)
+
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_closes_connection_even_on_failure(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = RuntimeError("TABLE_OR_VIEW_NOT_FOUND")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="TABLE_OR_VIEW_NOT_FOUND"):
+        execute_bounded("SELECT * FROM missing_table", warehouse=None, max_rows=None)
+
+    mock_conn.close.assert_called_once()

@@ -205,6 +205,36 @@ def test_explain_estimate_raises_clear_error_when_explain_returns_no_rows(mock_c
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_closes_connection_on_success(mock_connect):
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    explain_estimate("SELECT 1", warehouse=None)
+
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_closes_connection_even_on_failure(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = None
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="EXPLAIN USING JSON returned no rows"):
+        explain_estimate("SELECT 1", warehouse=None)
+
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
 def test_check_credentials_ok_and_pins_warehouse_when_given(mock_connect):
     mock_cursor = MagicMock()
     mock_cursor.fetchone.return_value = ("COST_GUARD_READER", "COMPUTE_WH", "ABC12345")
@@ -288,6 +318,33 @@ def test_check_credentials_rejects_invalid_warehouse_name_as_failure_not_a_raise
     assert result.ok is False
     assert "Invalid warehouse name" in result.detail
     mock_cursor.execute.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_closes_connection_on_success(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = ("COST_GUARD_READER", "COMPUTE_WH", "ABC12345")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials()
+
+    assert result.ok is True
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_closes_connection_even_on_failure(mock_connect):
+    mock_conn = MagicMock()
+    mock_conn.cursor.side_effect = RuntimeError("boom")
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert "boom" in result.detail
+    mock_conn.close.assert_called_once()
 
 
 @patch("cost_guard_mcp.engines.snowflake.time.sleep")
@@ -409,3 +466,35 @@ def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect,
     called_sql = mock_cursor.execute_async.call_args[0][0]
     assert ";)" not in called_sql
     assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_closes_connection_on_success(mock_connect, _mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = [{"a": 1}]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.side_effect = [True, False]
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_closes_connection_even_on_failure(mock_connect, _mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = True  # never finishes -> times out
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="Query exceeded 120s and was cancelled"):
+        execute_bounded("SELECT * FROM huge_table", warehouse=None, max_rows=None)
+
+    mock_conn.close.assert_called_once()

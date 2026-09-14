@@ -77,43 +77,51 @@ def explain_estimate(
     themselves documented upper bounds ("runtime optimizations... can reduce the number of
     partitions and bytes scanned")."""
     conn = _connect()
-    with conn.cursor() as cur:
-        if warehouse is not None:
-            cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-        cur.execute(f"EXPLAIN USING JSON {sql}")
-        row = cur.fetchone()
+    try:
+        with conn.cursor() as cur:
+            if warehouse is not None:
+                cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
+            cur.execute(f"EXPLAIN USING JSON {sql}")
+            row = cur.fetchone()
 
-    if row is None:
-        raise ValueError("EXPLAIN USING JSON returned no rows")
+        if row is None:
+            raise ValueError("EXPLAIN USING JSON returned no rows")
 
-    plan = json.loads(row[0])
-    global_stats = plan["GlobalStats"]
-    bytes_assigned = global_stats["bytesAssigned"]
+        plan = json.loads(row[0])
+        global_stats = plan["GlobalStats"]
+        bytes_assigned = global_stats["bytesAssigned"]
 
-    rate = credits_per_hour(warehouse_size)
-    price = usd_per_credit(edition)
-    runtime_hours = scale_runtime_hours(bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS)
-    estimated_cost_usd = rate * price * runtime_hours
+        rate = credits_per_hour(warehouse_size)
+        price = usd_per_credit(edition)
+        runtime_hours = scale_runtime_hours(bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS)
+        estimated_cost_usd = rate * price * runtime_hours
 
-    return CostEstimate(
-        engine="snowflake",
-        accuracy_tier=AccuracyTier.UPPER_BOUND,
-        estimated_bytes=bytes_assigned,
-        estimated_cost_usd=round(estimated_cost_usd, 6),
-        caveats=[
-            (
-                "This estimate excludes Cortex AI Function ('AI Credits') cost — EXPLAIN's "
-                "bytesAssigned only reflects warehouse compute/scan, not AI-inference calls "
-                "inside the SQL."
-            ),
-            (
-                f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
-                f"on a {warehouse_size} warehouse, scaled up by a coarse size tier based on "
-                f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
-                "query's actual expected runtime."
-            ),
-        ],
-    )
+        return CostEstimate(
+            engine="snowflake",
+            accuracy_tier=AccuracyTier.UPPER_BOUND,
+            estimated_bytes=bytes_assigned,
+            estimated_cost_usd=round(estimated_cost_usd, 6),
+            caveats=[
+                (
+                    "This estimate excludes Cortex AI Function ('AI Credits') cost — EXPLAIN's "
+                    "bytesAssigned only reflects warehouse compute/scan, not AI-inference calls "
+                    "inside the SQL."
+                ),
+                (
+                    f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
+                    f"on a {warehouse_size} warehouse, scaled up by a coarse size tier based on "
+                    f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
+                    "query's actual expected runtime."
+                ),
+            ],
+        )
+    finally:
+        # Best-effort close, mirroring the cancel-is-best-effort discipline in execute_bounded
+        # below — a failed close must never mask the real return value/exception above.
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
 # dust-tt/dust's precedent for bounding a long-running warehouse job: poll every 2s, give
@@ -145,46 +153,55 @@ def execute_bounded(
     sql: str, warehouse: str | None, max_rows: int | None
 ) -> tuple[list[dict], int, bool]:
     conn = _connect()
-    wrapped_sql = sql
-    if max_rows is not None:
-        # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
-        # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
-        # untrusted input reaching a query built from a different source. Strip a trailing
-        # semicolon first (matching bigquery.py's own execute_bounded) - LLM-generated SQL
-        # commonly ends in one, and `SELECT * FROM (...;) AS x LIMIT n` is a syntax error.
-        inner_sql = sql.strip().rstrip(";").strip()
-        wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
+    try:
+        wrapped_sql = sql
+        if max_rows is not None:
+            # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
+            # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
+            # untrusted input reaching a query built from a different source. Strip a trailing
+            # semicolon first (matching bigquery.py's own execute_bounded) - LLM-generated SQL
+            # commonly ends in one, and `SELECT * FROM (...;) AS x LIMIT n` is a syntax error.
+            inner_sql = sql.strip().rstrip(";").strip()
+            wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
 
-    with conn.cursor(snowflake.connector.DictCursor) as cur:
-        if warehouse is not None:
-            cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-        cur.execute_async(wrapped_sql)
-        query_id = cur.sfqid
-        if query_id is None:
-            raise SanitizedEngineError("execute_async did not return a query id")
+        with conn.cursor(snowflake.connector.DictCursor) as cur:
+            if warehouse is not None:
+                cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
+            cur.execute_async(wrapped_sql)
+            query_id = cur.sfqid
+            if query_id is None:
+                raise SanitizedEngineError("execute_async did not return a query id")
 
-        elapsed_seconds = 0
-        status = conn.get_query_status(query_id)
-        while conn.is_still_running(status):
-            if elapsed_seconds >= _MAX_EXECUTION_WAIT_SECONDS:
-                _cancel_query(conn, query_id)
-                raise TimeoutError(
-                    f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
-                    f"(query_id={query_id})."
-                )
-            time.sleep(_POLL_INTERVAL_SECONDS)
-            elapsed_seconds += _POLL_INTERVAL_SECONDS
+            elapsed_seconds = 0
             status = conn.get_query_status(query_id)
+            while conn.is_still_running(status):
+                if elapsed_seconds >= _MAX_EXECUTION_WAIT_SECONDS:
+                    _cancel_query(conn, query_id)
+                    raise TimeoutError(
+                        f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
+                        f"(query_id={query_id})."
+                    )
+                time.sleep(_POLL_INTERVAL_SECONDS)
+                elapsed_seconds += _POLL_INTERVAL_SECONDS
+                status = conn.get_query_status(query_id)
 
-        conn.get_query_status_throw_if_error(query_id)
-        cur.get_results_from_sfqid(query_id)
-        rows = cur.fetchall()
+            conn.get_query_status_throw_if_error(query_id)
+            cur.get_results_from_sfqid(query_id)
+            rows = cur.fetchall()
 
-    row_cap_hit = max_rows is not None and len(rows) > max_rows
-    if row_cap_hit:
-        rows = rows[:max_rows]
+        row_cap_hit = max_rows is not None and len(rows) > max_rows
+        if row_cap_hit:
+            rows = rows[:max_rows]
 
-    return rows, len(rows), row_cap_hit
+        return rows, len(rows), row_cap_hit
+    finally:
+        # Outermost finally: runs on every exit path (success, timeout-raised, real-query-
+        # error-reraised) after all existing cursor/cancel logic above. Best-effort, mirroring
+        # _cancel_query's own discipline — a failed close must never mask the real outcome.
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
 def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
@@ -197,6 +214,7 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     estimate_query_cost/run_query_bounded call. redact_secrets is applied defensively even
     though _connect() already redacts its own failures — it is a no-op on already-safe text.
     """
+    conn: snowflake.connector.SnowflakeConnection | None = None
     try:
         conn = _connect()
         with conn.cursor() as cur:
@@ -209,6 +227,14 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
             role, current_warehouse, account = row
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
         return CredentialCheckResult(engine="snowflake", ok=False, detail=redact_secrets(str(exc)))
+    finally:
+        # conn is None if _connect() itself raised — nothing to close in that case. A failed
+        # close() is best-effort and must never mask the success return below.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
 
     return CredentialCheckResult(
         engine="snowflake",
