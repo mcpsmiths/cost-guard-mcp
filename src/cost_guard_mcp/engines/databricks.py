@@ -64,6 +64,7 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     CredentialCheckResult so a caller can distinguish "not configured yet" from "actually
     broken" before attempting a real estimate_query_cost/run_query_bounded call.
     """
+    conn: sql.client.Connection | None = None
     try:
         conn = _connect()
         with conn.cursor() as cur:
@@ -74,6 +75,14 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
             current_user = row[0]
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
         return CredentialCheckResult(engine="databricks", ok=False, detail=redact_secrets(str(exc)))
+    finally:
+        # conn is None if _connect() itself raised — nothing to close in that case. A failed
+        # close() is best-effort and must never mask the success return below.
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
 
     return CredentialCheckResult(
         engine="databricks", ok=True, detail=f"Authenticated as '{current_user}'."
@@ -114,48 +123,58 @@ def explain_estimate(
     no-op - see check_credentials's docstring for why.
     """
     conn = _connect()
-    with conn.cursor() as cur:
-        cur.execute(f"EXPLAIN COST {sql_text}")
-        rows = cur.fetchall()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"EXPLAIN COST {sql_text}")
+            rows = cur.fetchall()
 
-    explain_output = "\n".join(row[0] for row in rows)
-    max_size_in_bytes = _parse_max_size_in_bytes(explain_output)
+        explain_output = "\n".join(row[0] for row in rows)
+        max_size_in_bytes = _parse_max_size_in_bytes(explain_output)
 
-    rate = dbus_per_hour(warehouse_size)
-    runtime_hours = scale_runtime_hours(max_size_in_bytes, baseline_hours=_ASSUMED_RUNTIME_HOURS)
-    estimated_cost_usd = rate * SERVERLESS_USD_PER_DBU * runtime_hours
-
-    caveats = [
-        (
-            "Databricks has no BigQuery-style dry-run; this estimate is HEURISTIC, the "
-            "least precise of this project's three accuracy tiers."
-        ),
-        (
-            f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on "
-            f"a {warehouse_size} Serverless SQL warehouse, scaled up by a coarse size tier "
-            f"based on {max_size_in_bytes} bytes scanned - still a heuristic, not derived "
-            "from this query's actual expected runtime."
-        ),
-        (
-            "Pricing assumes a Serverless SQL warehouse; Classic/Pro warehouses use "
-            "different (lower) DBU rates plus a separate underlying cloud VM cost not "
-            "modeled here."
-        ),
-    ]
-    if max_size_in_bytes is None:
-        caveats.append(
-            "EXPLAIN COST returned no size statistics for this query (common without "
-            "ANALYZE TABLE having been run, for streaming sources, or for non-Delta "
-            "external tables) - the byte estimate is unavailable, not zero."
+        rate = dbus_per_hour(warehouse_size)
+        runtime_hours = scale_runtime_hours(
+            max_size_in_bytes, baseline_hours=_ASSUMED_RUNTIME_HOURS
         )
+        estimated_cost_usd = rate * SERVERLESS_USD_PER_DBU * runtime_hours
 
-    return CostEstimate(
-        engine="databricks",
-        accuracy_tier=AccuracyTier.HEURISTIC,
-        estimated_bytes=max_size_in_bytes,
-        estimated_cost_usd=round(estimated_cost_usd, 6),
-        caveats=caveats,
-    )
+        caveats = [
+            (
+                "Databricks has no BigQuery-style dry-run; this estimate is HEURISTIC, the "
+                "least precise of this project's three accuracy tiers."
+            ),
+            (
+                f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on "
+                f"a {warehouse_size} Serverless SQL warehouse, scaled up by a coarse size tier "
+                f"based on {max_size_in_bytes} bytes scanned - still a heuristic, not derived "
+                "from this query's actual expected runtime."
+            ),
+            (
+                "Pricing assumes a Serverless SQL warehouse; Classic/Pro warehouses use "
+                "different (lower) DBU rates plus a separate underlying cloud VM cost not "
+                "modeled here."
+            ),
+        ]
+        if max_size_in_bytes is None:
+            caveats.append(
+                "EXPLAIN COST returned no size statistics for this query (common without "
+                "ANALYZE TABLE having been run, for streaming sources, or for non-Delta "
+                "external tables) - the byte estimate is unavailable, not zero."
+            )
+
+        return CostEstimate(
+            engine="databricks",
+            accuracy_tier=AccuracyTier.HEURISTIC,
+            estimated_bytes=max_size_in_bytes,
+            estimated_cost_usd=round(estimated_cost_usd, 6),
+            caveats=caveats,
+        )
+    finally:
+        # Best-effort close, mirroring the cancel-is-best-effort discipline in execute_bounded
+        # below — a failed close must never mask the real return value/exception above.
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
 
 
 # dust-tt/dust's precedent for bounding a long-running warehouse job, already applied to
@@ -194,51 +213,60 @@ def execute_bounded(
     )
 
     conn = _connect()
-    wrapped_sql = sql_text
-    if max_rows is not None:
-        # `sql_text` is the caller's own query, passed as this tool's actual `sql`
-        # parameter - wrapping their query in a LIMIT subquery to cap rows is this
-        # function's job, not untrusted input reaching a query built elsewhere. Strip a
-        # trailing semicolon first (matching bigquery.py's own execute_bounded) -
-        # LLM-generated SQL commonly ends in one, and `SELECT * FROM (...;) AS x LIMIT n`
-        # is a syntax error.
-        inner_sql = sql_text.strip().rstrip(";").strip()
-        wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
+    try:
+        wrapped_sql = sql_text
+        if max_rows is not None:
+            # `sql_text` is the caller's own query, passed as this tool's actual `sql`
+            # parameter - wrapping their query in a LIMIT subquery to cap rows is this
+            # function's job, not untrusted input reaching a query built elsewhere. Strip a
+            # trailing semicolon first (matching bigquery.py's own execute_bounded) -
+            # LLM-generated SQL commonly ends in one, and `SELECT * FROM (...;) AS x LIMIT n`
+            # is a syntax error.
+            inner_sql = sql_text.strip().rstrip(";").strip()
+            wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
 
-    cur = conn.cursor()
-    execution_error: list[BaseException] = []
+        cur = conn.cursor()
+        execution_error: list[BaseException] = []
 
-    def _run() -> None:
+        def _run() -> None:
+            try:
+                cur.execute(wrapped_sql)
+            except BaseException as exc:  # noqa: BLE001 - re-raised on the calling thread below
+                execution_error.append(exc)
+
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+        thread.join(timeout=max_wait_seconds)
+
+        if thread.is_alive():
+            try:
+                cur.cancel()
+            except Exception:  # noqa: BLE001, S110 - best-effort; the TimeoutError below matters
+                pass
+            raise TimeoutError(f"Query exceeded {max_wait_seconds}s and was cancelled.")
+
+        if execution_error:
+            raise execution_error[0]
+
+        # Unlike bigquery.Row (which has a .keys() method dict() detects and uses), this
+        # connector's row type is a plain tuple with no mapping protocol - dict(row) raises
+        # "cannot convert dictionary update sequence element #0 to a sequence" (confirmed via
+        # a live run against a real warehouse, not just unit tests). Build dicts from
+        # cursor.description instead, which is guaranteed by DB API 2.0 regardless of row type.
+        columns = [col[0] for col in cur.description] if cur.description else []
+        rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
+        cur.close()
+
+        row_cap_hit = max_rows is not None and len(rows) > max_rows
+        if row_cap_hit:
+            rows = rows[:max_rows]
+
+        return rows, len(rows), row_cap_hit
+    finally:
+        # Outermost finally: runs on every exit path (success, timeout-raised, real-query-
+        # error-reraised) after all existing cursor/cancel logic above. Best-effort, mirroring
+        # cur.cancel()'s own discipline — a failed close must never mask the real outcome.
         try:
-            cur.execute(wrapped_sql)
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the calling thread below
-            execution_error.append(exc)
-
-    thread = threading.Thread(target=_run, daemon=True)
-    thread.start()
-    thread.join(timeout=max_wait_seconds)
-
-    if thread.is_alive():
-        try:
-            cur.cancel()
-        except Exception:  # noqa: BLE001, S110 - best-effort; the TimeoutError below matters
+            conn.close()
+        except Exception:  # noqa: BLE001, S110
             pass
-        raise TimeoutError(f"Query exceeded {max_wait_seconds}s and was cancelled.")
-
-    if execution_error:
-        raise execution_error[0]
-
-    # Unlike bigquery.Row (which has a .keys() method dict() detects and uses), this
-    # connector's row type is a plain tuple with no mapping protocol - dict(row) raises
-    # "cannot convert dictionary update sequence element #0 to a sequence" (confirmed via
-    # a live run against a real warehouse, not just unit tests). Build dicts from
-    # cursor.description instead, which is guaranteed by DB API 2.0 regardless of row type.
-    columns = [col[0] for col in cur.description] if cur.description else []
-    rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
-    cur.close()
-
-    row_cap_hit = max_rows is not None and len(rows) > max_rows
-    if row_cap_hit:
-        rows = rows[:max_rows]
-
-    return rows, len(rows), row_cap_hit
