@@ -4,6 +4,8 @@
 
 **Goal:** Use each warehouse's own query history (Snowflake `INFORMATION_SCHEMA.QUERY_HISTORY`, Databricks Query History REST API) to calibrate `estimate_query_cost`'s runtime assumption with real data when an exact-text match exists, falling back to the existing byte-size-tier heuristic otherwise — no new persistence layer.
 
+**UPDATE (2026-09-15, after running Phase 1's live verification spikes): this ships Snowflake-only.** Databricks' Query History REST API returns `query_text: "<REDACTED>"` unconditionally on the live Free Edition account tested — confirmed even with `include_metrics=True`, and confirmed via direct SDK source read that this is server-side redaction, not something a client parameter can bypass. Since exact-text matching requires reading the text back to match against, this is impossible on this account tier, not merely a risk. Free Edition's documented "locked... enterprise admin" restriction makes it unlikely this account could ever disable that redaction. Phase 3 below is kept in this document for reference but marked SKIPPED — see its own note for exactly what was found and how to re-open this if a future paid workspace confirms the redaction is a toggleable setting there.
+
 **Architecture:** A new per-engine `_lookup_historical_runtime()` function, called from each engine's existing `explain_estimate()` right before the existing `scale_runtime_hours(...)` call. Returns a shared `HistoricalRuntimeSignal | None`. Never raises — any failure (permission, timeout, malformed response, no match) degrades silently to today's unchanged behavior.
 
 **Tech Stack:** Same as the rest of the repo — Python 3.12+, `snowflake-connector-python`, `databricks-sdk`, `pytest`, `ruff`, `mypy`.
@@ -111,6 +113,22 @@ print(inspect.signature(WorkspaceClient.__init__))
 Look for any `timeout`/`http_timeout_seconds`-shaped constructor or config parameter. Record whether one exists — Task 3.1 uses it if present, falls back to the thread+join pattern (mirroring Task 2.1's Snowflake implementation) if not.
 
 - [ ] **Step 4: Commit nothing** — this phase is pure investigation. Carry the recorded findings into Phase 2/3's task briefs verbatim (do not let a fresh implementer re-derive or re-guess them).
+
+## Phase 1 findings (both spikes run live, 2026-09-15)
+
+**Task 1.1 (Snowflake) — fully confirmed, design proceeds as written:**
+- `EXECUTION_STATUS = 'SUCCESS'` is the exact correct string (also observed `'FAILED_WITH_ERROR'`, `'RUNNING'` as other real values).
+- `TOTAL_ELAPSED_TIME` is in milliseconds — confirmed by comparing against observed wall-clock time.
+- `BYTES_SCANNED > 0` as a cache-hit-exclusion proxy is **confirmed working**: a real execution of `SELECT SUM(C_ACCTBAL) FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF1.CUSTOMER WHERE C_MKTSEGMENT = 'BUILDING'` showed `360ms, 10,741,184 bytes scanned`; the immediate repeat (a cache hit) showed `54ms, 0 bytes scanned`. The design's proxy correctly separates them.
+- Caveat found along the way: `SELECT COUNT(*)` (no `WHERE`) always shows `BYTES_SCANNED = 0` even on a genuinely fresh execution, because Snowflake answers it from partition metadata without a real scan — this is not a cache-hit false-negative, just means COUNT(*)-shaped queries will rarely get calibration benefit (safe, not dangerous — they simply always fall back to the heuristic).
+- `INFORMATION_SCHEMA.QUERY_HISTORY` requires an active `USE DATABASE` (or a fully-qualified `<db>.INFORMATION_SCHEMA.QUERY_HISTORY` reference) — `INFORMATION_SCHEMA` is per-database, not global. Task 2.1's implementation must account for this (the production `explain_estimate` already runs after a real query context is established via the caller's own SQL, so this is a minor implementation detail, not a design blocker — confirm the connection's active database is set before calling the lookup, or fully-qualify the table function call against a database the role is guaranteed to have access to).
+
+**Task 1.2 (Databricks) — BLOCKED, do not implement Phase 3 as originally designed:**
+- `WorkspaceClient()` needs an explicit `host`/`token` (or `DATABRICKS_HOST`/`DATABRICKS_TOKEN`-named env vars, not this project's own `DATABRICKS_SERVER_HOSTNAME` naming) — a real wiring detail, not a blocker, but note it for whoever eventually revisits this.
+- `w.query_history.list(...)` returns a `ListQueriesResponse` wrapper — the actual rows are `.res`, NOT directly iterable as the original spec/plan draft assumed. (Fixed if this phase is ever re-opened.)
+- **Hard blocker**: `QueryInfo.query_text` came back as the literal string `"<REDACTED>"` for every one of 9 real query-history rows on the live Free Edition account tested — including trivial queries with no PII-sensitive content. Confirmed this is server-side, not a missing parameter: `include_metrics=True` was tried and made no difference; a direct read of the installed `databricks-sdk` source (`sql.py`) shows zero client-side redaction logic, confirming the redaction happens on Databricks' backend before the response ever reaches the SDK. Exact-text matching is impossible without the text to match against — this blocks Phase 3 entirely as designed, not just as a risk.
+- Bonus finding for whenever this is revisited: `QueryMetrics.result_from_cache: bool` (available via `include_metrics=True`) is a far more reliable, explicit cache-hit signal than the `cache_query_id`/bytes-scanned proxies the spec guessed at — use this instead of `cache_query_id` if this feature ever becomes viable.
+- **Decision (confirmed with the user 2026-09-15): ship Snowflake-only.** Skip Phase 3 below entirely. Revisit only if a future paid Databricks workspace confirms this redaction setting is admin-toggleable there (Free Edition's documented admin-console lockout makes it unlikely this specific account tier ever could disable it).
 
 ---
 
@@ -324,9 +342,16 @@ git commit -m "feat: calibrate Snowflake cost estimates from the caller own quer
 
 ---
 
-## Phase 3: Databricks calibration (mirrors Phase 2)
+## Phase 3: Databricks calibration (mirrors Phase 2) — **SKIPPED, do not implement**
 
-### Task 3.1: Databricks `_lookup_historical_runtime`
+**Blocked as of 2026-09-15 — see "Phase 1 findings" above for the full evidence.** Databricks' Query
+History REST API returns `query_text: "<REDACTED>"` unconditionally on the account tested, confirmed
+server-side (not bypassable via any client parameter, confirmed via direct SDK source read). Exact-text
+matching cannot work without the text to match against. Kept below for reference only — do not execute
+these steps unless a future investigation confirms a real workspace can retrieve unredacted query text
+for the caller's own queries.
+
+### Task 3.1 (reference only, not executed): Databricks `_lookup_historical_runtime`
 
 **Files:**
 - Modify: `src/cost_guard_mcp/engines/databricks.py`
@@ -490,15 +515,15 @@ git commit -m "feat: calibrate Databricks cost estimates from the caller own que
 
 ## Phase 4: Live verification + docs
 
-### Task 4.1: End-to-end live verification against both real trial accounts
+### Task 4.1: End-to-end live verification against the real Snowflake trial account
 
-- [ ] **Step 1**: Run the same query twice against the live Snowflake trial account via the real `estimate_query_cost` tool function (not the isolated lookup function) and confirm the SECOND call's caveat mentions "informed by N historical run(s)" while the FIRST call's does not (proving the whole wired path, not just the unit-tested pieces).
-- [ ] **Step 2**: Repeat against the live Databricks Free Edition account.
-- [ ] **Step 3**: Confirm a genuinely novel one-off query (never run before) on both engines produces byte-for-byte the same caveat/estimate shape as before this feature shipped — the no-match fallback path must be indistinguishable from today's behavior.
+- [ ] **Step 1**: Run the same query twice against the live Snowflake trial account via the real `estimate_query_cost` tool function (not the isolated lookup function) and confirm the SECOND call's caveat mentions "informed by N historical run(s)" while the FIRST call's does not (proving the whole wired path, not just the unit-tested pieces). Use a query with a real `WHERE` filter (not a bare `COUNT(*)`, per Phase 1's finding that those always show `BYTES_SCANNED = 0`).
+- [ ] **Step 2**: Confirm a genuinely novel one-off query (never run before) produces byte-for-byte the same caveat/estimate shape as before this feature shipped — the no-match fallback path must be indistinguishable from today's behavior.
+- [ ] **Step 3**: Confirm the cache-hit case live, not just in mocked tests — run the same query 3+ times, confirm the caveat's `sample_count` reflects only the non-cached runs.
 
 ### Task 4.2: README update
 
-- [ ] Add one bullet to the existing "Known limitations" section (or a new short "How cost calibration works" note near the tool descriptions) explaining: calibration only fires on an exact repeated query, real-world hit rate depends on how often an agent re-runs identical SQL, and cache-hit results are deliberately excluded from the average.
+- [ ] Add one bullet to the existing "Known limitations" section explaining: (1) Snowflake calibration only fires on an exact repeated query, real-world hit rate depends on how often an agent re-runs identical SQL, and cache-hit results are deliberately excluded from the average; (2) Databricks calibration was investigated and found blocked by server-side query-text redaction on the tested account — not implemented, may be revisited if a paid workspace confirms this is toggleable there.
 - [ ] Commit.
 
 ---
