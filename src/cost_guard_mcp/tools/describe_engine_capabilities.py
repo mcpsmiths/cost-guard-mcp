@@ -36,7 +36,9 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
             ),
             (
                 "EXPLAIN's plan can vary by which warehouse is active when it runs; this tool "
-                "always pins the warehouse explicitly to reduce that variance."
+                "pins the warehouse explicitly to reduce that variance only when a "
+                "warehouse argument is supplied - omitting it uses whatever warehouse is "
+                "already active on the connection."
             ),
         ],
     ),

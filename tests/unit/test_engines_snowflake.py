@@ -367,3 +367,21 @@ def test_execute_bounded_raises_when_execute_async_returns_no_query_id(mock_conn
 
     with pytest.raises(SanitizedEngineError, match="did not return a query id"):
         execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect, _mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = []
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = False
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT * FROM t;", warehouse=None, max_rows=5)
+
+    called_sql = mock_cursor.execute_async.call_args[0][0]
+    assert ";)" not in called_sql
+    assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"

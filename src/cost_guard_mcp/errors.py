@@ -10,9 +10,23 @@ from cost_guard_mcp.config import ConfigError
 P = ParamSpec("P")
 T = TypeVar("T")
 
+# Shared value-matching fragment for the password/token patterns below. A bare (unquoted)
+# value is allowed to contain internal single spaces (real passwords legitimately can -
+# e.g. SNOWFLAKE_PASSWORD is an arbitrary user-chosen string) via the repetition's
+# lookahead, but that lookahead stops the moment what follows looks like the start of the
+# *next* key=value/key:value pair, so a multi-word value doesn't swallow an unrelated
+# trailing field. A quoted value (single or double) is matched up to its closing quote
+# regardless of what it contains, so both quotes are consumed and never leak.
+_BARE_WORD = r'[^\s,;"\'}=:]+'
+_VALUE_FRAGMENT = (
+    r'"[^"]*"' r"|'[^']*'" rf"|{_BARE_WORD}(?:\s+(?!{_BARE_WORD}\s*[=:]){_BARE_WORD})*"
+)
+
 _SECRET_PATTERNS = [
-    # Password in various formats: password=value, 'password': value, "password": value
-    re.compile(r'(password|passwd|pwd)["\']?\s*[=:]\s*["\']?[^\s,"\'}]+', re.IGNORECASE),
+    # Password in various formats: password=value, 'password': value, "password": value.
+    # Deliberately no leading ["\']? before the value fragment - the quoted alternatives
+    # inside _VALUE_FRAGMENT consume their own opening AND closing quote.
+    re.compile(rf'(password|passwd|pwd)["\']?\s*[=:]\s*(?:{_VALUE_FRAGMENT})', re.IGNORECASE),
     # Private key (with optional passphrase) - handles PEM blocks and quoted multiline values
     # Matches: private_key=-----BEGIN...-----END... or private_key='value' or 'private_key': 'value'
     re.compile(
@@ -20,8 +34,8 @@ _SECRET_PATTERNS = [
         r'(?:-----BEGIN[^\n]*(?:\n[^\n]*)*?\n-----END[^\n]*-----|["\'](?:[^"\']*)["\']|(?:[^\s,}]|\s(?![\s,}]))+)',
         re.IGNORECASE | re.DOTALL,
     ),
-    # Token, API key, secret - with optional quotes before separator
-    re.compile(r'(token|api[_-]?key|secret)["\']?\s*[=:]\s*["\']?[^\s,"\'}]+', re.IGNORECASE),
+    # Token, API key, secret - same whitespace-tolerant/quote-aware value fragment as password.
+    re.compile(rf'(token|api[_-]?key|secret)["\']?\s*[=:]\s*(?:{_VALUE_FRAGMENT})', re.IGNORECASE),
     # Standalone PEM block (full multiline from BEGIN to END)
     re.compile(r"-----BEGIN[^\n]*-----.*?-----END[^\n]*-----", re.DOTALL | re.IGNORECASE),
     # Snowflake connection URI format: user:password@host

@@ -13,8 +13,15 @@ def run_query_bounded(
     max_rows: int | None = None,
     max_estimated_cost_usd: float | None = None,
     warehouse: str | None = None,
+    warehouse_size: str | None = None,
+    edition: str | None = None,
 ) -> BoundedQueryResult:
-    estimate = estimate_query_cost(engine, sql, warehouse)
+    # warehouse_size/edition must reach the cap-check estimate below, not just
+    # estimate_query_cost's own public tool - otherwise the cost cap here would always be
+    # checked against the smallest warehouse's rate regardless of which warehouse the
+    # query actually runs on, silently under-enforcing the cap for a caller specifying a
+    # larger one.
+    estimate = estimate_query_cost(engine, sql, warehouse, warehouse_size, edition)
 
     if max_estimated_cost_usd is not None:
         if estimate.estimated_cost_usd is None:

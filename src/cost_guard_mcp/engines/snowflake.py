@@ -146,8 +146,11 @@ def execute_bounded(
     if max_rows is not None:
         # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
         # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
-        # untrusted input reaching a query built from a different source.
-        wrapped_sql = f"SELECT * FROM ({sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
+        # untrusted input reaching a query built from a different source. Strip a trailing
+        # semicolon first (matching bigquery.py's own execute_bounded) - LLM-generated SQL
+        # commonly ends in one, and `SELECT * FROM (...;) AS x LIMIT n` is a syntax error.
+        inner_sql = sql.strip().rstrip(";").strip()
+        wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
 
     with conn.cursor(snowflake.connector.DictCursor) as cur:
         if warehouse is not None:

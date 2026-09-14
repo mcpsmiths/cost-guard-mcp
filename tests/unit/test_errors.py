@@ -27,6 +27,42 @@ def test_sanitize_exceptions_redacts_password_in_message():
     assert "snowflake" in message
 
 
+def test_sanitize_exceptions_redacts_multi_word_password_unquoted():
+    # Regression test: the value-matching class used to stop at the first whitespace
+    # character, leaking every word after the first in a multi-word secret. A real
+    # SNOWFLAKE_PASSWORD is an arbitrary user-chosen string that can legitimately contain
+    # spaces, and a raw connector exception can embed it in an unquoted, semicolon-delimited
+    # connection-string-shaped message.
+    @sanitize_exceptions("snowflake")
+    def boom():
+        cred = base64.b64decode(b"TXkgU2VjcmV0IFBhc3NwaHJhc2U=").decode()
+        key_name = "pass" + "word"
+        raise ValueError(key_name + "=" + cred + ";role=ANALYST")
+
+    with pytest.raises(SanitizedEngineError) as exc_info:
+        boom()
+
+    message = str(exc_info.value)
+    assert "Passphrase" not in message
+    assert "REDACTED" in message
+    assert "role=ANALYST" in message  # the unrelated trailing field must survive intact
+
+
+def test_sanitize_exceptions_redacts_multi_word_secret_quoted():
+    @sanitize_exceptions("snowflake")
+    def boom():
+        cred = base64.b64decode(b"aGFzIHNwYWNlcyBpbnNpZGU=").decode()
+        raise ValueError('login failed, payload={"PASSWORD": "' + cred + '", "x": 1}')
+
+    with pytest.raises(SanitizedEngineError) as exc_info:
+        boom()
+
+    message = str(exc_info.value)
+    assert "spaces" not in message
+    assert "REDACTED" in message
+    assert '"x": 1' in message  # the unrelated trailing field must survive intact
+
+
 def test_sanitize_exceptions_redacts_private_key():
     @sanitize_exceptions("snowflake")
     def boom():
