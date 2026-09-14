@@ -26,3 +26,20 @@ def test_usd_per_credit_standard_edition_default():
 def test_usd_per_credit_scales_by_edition():
     assert usd_per_credit("enterprise") == 3.00  # 1.5x standard
     assert usd_per_credit("business_critical") == 4.00  # 2x standard
+
+
+def test_usd_per_credit_rejects_unknown_edition():
+    with pytest.raises(ValueError, match="unknown Snowflake edition"):
+        usd_per_credit("not_a_real_edition")
+
+
+def test_usd_per_credit_vps_edition():
+    assert usd_per_credit("vps") == 6.00
+
+
+def test_usd_per_credit_is_case_insensitive():
+    assert usd_per_credit("STANDARD") == usd_per_credit("standard")
+
+
+def test_credits_per_hour_is_case_insensitive():
+    assert credits_per_hour("xsmall") == credits_per_hour("XSMALL")

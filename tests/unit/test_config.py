@@ -39,6 +39,13 @@ def test_load_snowflake_config_requires_account_and_user(monkeypatch):
         load_snowflake_config()
 
 
+def test_load_snowflake_config_requires_user_when_account_present(monkeypatch):
+    monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "abc123")
+    monkeypatch.delenv("SNOWFLAKE_USER", raising=False)
+    with pytest.raises(ConfigError, match="SNOWFLAKE_USER"):
+        load_snowflake_config()
+
+
 def test_load_snowflake_config_requires_key_pair_or_password(monkeypatch):
     monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "abc123")
     monkeypatch.setenv("SNOWFLAKE_USER", "svc_user")
