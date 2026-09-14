@@ -225,7 +225,13 @@ def execute_bounded(
     if execution_error:
         raise execution_error[0]
 
-    rows = [dict(row) for row in cur.fetchall()]
+    # Unlike bigquery.Row (which has a .keys() method dict() detects and uses), this
+    # connector's row type is a plain tuple with no mapping protocol - dict(row) raises
+    # "cannot convert dictionary update sequence element #0 to a sequence" (confirmed via
+    # a live run against a real warehouse, not just unit tests). Build dicts from
+    # cursor.description instead, which is guaranteed by DB API 2.0 regardless of row type.
+    columns = [col[0] for col in cur.description] if cur.description else []
+    rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
     cur.close()
 
     row_cap_hit = max_rows is not None and len(rows) > max_rows

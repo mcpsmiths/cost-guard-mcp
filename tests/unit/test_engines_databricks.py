@@ -177,7 +177,12 @@ from cost_guard_mcp.engines.databricks import execute_bounded
 from cost_guard_mcp.errors import SanitizedEngineError
 
 
-def _make_mock_cursor(rows, execute_delay_seconds=0.0):
+def _make_mock_cursor(rows, execute_delay_seconds=0.0, columns=("a",)):
+    # Regression fixture: the real databricks-sql-connector row type is a plain tuple
+    # with no .keys() method - unlike bigquery.Row, dict(row) fails against it. Modeling
+    # rows as tuples (with a matching cursor.description) here, rather than as plain
+    # dicts, is what makes this fixture actually catch that bug class instead of masking
+    # it - a live run against a real warehouse hit this exact failure.
     mock_cursor = MagicMock()
 
     def _execute(_sql):
@@ -186,12 +191,13 @@ def _make_mock_cursor(rows, execute_delay_seconds=0.0):
 
     mock_cursor.execute.side_effect = _execute
     mock_cursor.fetchall.return_value = rows
+    mock_cursor.description = [(col,) for col in columns]
     return mock_cursor
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_execute_bounded_wraps_query_with_limit_when_max_rows_set(mock_connect):
-    mock_cursor = _make_mock_cursor([{"a": 1}, {"a": 2}, {"a": 3}])
+    mock_cursor = _make_mock_cursor([(1,), (2,), (3,)])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -207,7 +213,7 @@ def test_execute_bounded_wraps_query_with_limit_when_max_rows_set(mock_connect):
 
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_execute_bounded_no_cap_hit_when_fewer_rows_than_max(mock_connect):
-    mock_cursor = _make_mock_cursor([{"a": 1}])
+    mock_cursor = _make_mock_cursor([(1,)])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -216,6 +222,7 @@ def test_execute_bounded_no_cap_hit_when_fewer_rows_than_max(mock_connect):
 
     assert row_count == 1
     assert row_cap_hit is False
+    assert _rows == [{"a": 1}]
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
@@ -248,7 +255,7 @@ def test_execute_bounded_cancels_and_raises_when_wait_times_out(mock_connect):
 
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect):
-    mock_cursor = _make_mock_cursor([{"a": 1}])
+    mock_cursor = _make_mock_cursor([(1,)])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
     mock_connect.return_value = mock_conn
