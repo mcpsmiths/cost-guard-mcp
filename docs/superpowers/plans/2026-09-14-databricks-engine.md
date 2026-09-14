@@ -298,6 +298,7 @@ Expected: FAIL with `ImportError: cannot import name 'load_databricks_config'`
 ```python
 # src/cost_guard_mcp/config.py — add dataclass and loader function
 
+
 @dataclass(frozen=True)
 class DatabricksConfig:
     server_hostname: str
@@ -719,9 +720,7 @@ def test_explain_estimate_cost_math_matches_pricing_table(mock_connect):
 
     from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
 
-    expected_cost = round(
-        dbus_per_hour("Small") * SERVERLESS_USD_PER_DBU * (30 / 3600), 6
-    )
+    expected_cost = round(dbus_per_hour("Small") * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
     assert estimate.estimated_cost_usd == expected_cost
 ```
 
@@ -865,9 +864,7 @@ def test_execute_bounded_wraps_query_with_limit_when_max_rows_set(mock_connect):
     mock_conn.cursor.return_value = mock_cursor
     mock_connect.return_value = mock_conn
 
-    rows, row_count, row_cap_hit = execute_bounded(
-        "SELECT * FROM t", warehouse=None, max_rows=2
-    )
+    rows, row_count, row_cap_hit = execute_bounded("SELECT * FROM t", warehouse=None, max_rows=2)
 
     called_sql = mock_cursor.execute.call_args[0][0]
     assert "LIMIT 3" in called_sql  # max_rows + 1
@@ -883,15 +880,16 @@ def test_execute_bounded_no_cap_hit_when_fewer_rows_than_max(mock_connect):
     mock_conn.cursor.return_value = mock_cursor
     mock_connect.return_value = mock_conn
 
-    rows, row_count, row_cap_hit = execute_bounded(
-        "SELECT * FROM t", warehouse=None, max_rows=5
-    )
+    rows, row_count, row_cap_hit = execute_bounded("SELECT * FROM t", warehouse=None, max_rows=5)
 
     assert row_count == 1
     assert row_cap_hit is False
 
 
-@patch("cost_guard_mcp.engines.databricks.execute_bounded.__wrapped__.__globals__[\"_MAX_EXECUTION_WAIT_SECONDS\"]", 0.2)
+@patch(
+    'cost_guard_mcp.engines.databricks.execute_bounded.__wrapped__.__globals__["_MAX_EXECUTION_WAIT_SECONDS"]',
+    0.2,
+)
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_execute_bounded_cancels_and_raises_when_wait_times_out(mock_connect):
     mock_cursor = _make_mock_cursor([], execute_delay_seconds=2.0)
