@@ -139,6 +139,27 @@ def test_dry_run_treats_unrecognized_accuracy_value_as_upper_bound(mock_bq_modul
     assert any("SOME_FUTURE_VALUE" in c for c in estimate.caveats)
 
 
+@patch(
+    "cost_guard_mcp.engines.bigquery.is_capacity_billed",
+    side_effect=SanitizedEngineError("bigquery client call failed: reservation API unavailable"),
+)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_degrades_gracefully_when_capacity_check_fails(mock_bq_module, _mock_capacity):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(
+        total_bytes_processed=1024**4, accuracy="PRECISE"
+    )
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT * FROM t")
+
+    assert estimate.estimated_bytes == 1024**4  # byte estimate still returned
+    assert estimate.estimated_cost_usd is None  # but no dollar figure - billing model unknown
+    assert any("billing model" in c.lower() for c in estimate.caveats)
+
+
 @patch("cost_guard_mcp.engines.bigquery.bigquery")
 def test_execute_bounded_wraps_query_with_limit_when_max_rows_set(mock_bq_module):
     mock_client = MagicMock()
