@@ -29,7 +29,7 @@ def test_cost_estimate_accepts_valid_precise_estimate():
 
 def test_cost_estimate_rejects_invalid_tier_string():
     with pytest.raises(ValidationError):
-        CostEstimate(engine="bigquery", accuracy_tier='EXACT', estimated_bytes=1)
+        CostEstimate(engine="bigquery", accuracy_tier="EXACT", estimated_bytes=1)
 
 
 def test_engine_capabilities_round_trip():
