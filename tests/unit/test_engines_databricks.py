@@ -173,6 +173,24 @@ def test_explain_estimate_cost_math_matches_pricing_table(mock_connect):
     assert estimate.estimated_cost_usd == expected_cost
 
 
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_cost_scales_up_for_large_byte_estimate(mock_connect):
+    explain_output = "Relation[a] parquet, Statistics(sizeInBytes=50.0 GB, rowCount=1)"
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [(explain_output,)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    estimate = explain_estimate("SELECT * FROM huge_table", warehouse=None, warehouse_size="Small")
+
+    from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
+
+    baseline = 30 / 3600
+    expected_cost = round(dbus_per_hour("Small") * SERVERLESS_USD_PER_DBU * baseline * 4, 6)
+    assert estimate.estimated_cost_usd == expected_cost
+
+
 from cost_guard_mcp.engines.databricks import execute_bounded
 from cost_guard_mcp.errors import SanitizedEngineError
 

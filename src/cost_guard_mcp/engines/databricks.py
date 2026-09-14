@@ -8,6 +8,7 @@ from databricks.sdk.credentials_provider import OAuthCredentialsProvider
 from cost_guard_mcp.config import load_databricks_config
 from cost_guard_mcp.errors import redact_secrets, sanitize_exceptions
 from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
+from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
 # databricks-sql-connector's own _socket_timeout defaults to 900s on the backend used
@@ -121,7 +122,8 @@ def explain_estimate(
     max_size_in_bytes = _parse_max_size_in_bytes(explain_output)
 
     rate = dbus_per_hour(warehouse_size)
-    estimated_cost_usd = rate * SERVERLESS_USD_PER_DBU * _ASSUMED_RUNTIME_HOURS
+    runtime_hours = scale_runtime_hours(max_size_in_bytes, baseline_hours=_ASSUMED_RUNTIME_HOURS)
+    estimated_cost_usd = rate * SERVERLESS_USD_PER_DBU * runtime_hours
 
     caveats = [
         (
@@ -129,8 +131,9 @@ def explain_estimate(
             "least precise of this project's three accuracy tiers."
         ),
         (
-            f"Cost assumes a {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on a "
-            f"{warehouse_size} Serverless SQL warehouse - a rough placeholder, not derived "
+            f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on "
+            f"a {warehouse_size} Serverless SQL warehouse, scaled up by a coarse size tier "
+            f"based on {max_size_in_bytes} bytes scanned - still a heuristic, not derived "
             "from this query's actual expected runtime."
         ),
         (
