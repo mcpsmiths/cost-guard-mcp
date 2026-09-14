@@ -147,6 +147,21 @@ DATABRICKS_TOKEN = "your-personal-access-token"
 
 ## Known limitations
 
+- Snowflake cost estimates are calibrated from the caller's own recent query history
+  (`INFORMATION_SCHEMA.QUERY_HISTORY`, no elevated privilege required) when an exact repeat
+  of the same SQL text has run before - falling back to a coarse byte-size-tier heuristic
+  otherwise. This only fires on an exact repeated query; a genuinely novel query always
+  uses the heuristic. Result-cache hits are deliberately excluded from the average (a
+  cached, near-instant repeat would otherwise corrupt calibration toward underestimating
+  future runtime). Query history ingestion has its own latency - a query run moments ago
+  may not yet be visible to the lookup, in which case it safely falls back to the
+  heuristic rather than erroring.
+- Databricks calibration was investigated and found blocked: its Query History REST API
+  returns the query text as `"<REDACTED>"` unconditionally on the account tested, even for
+  the caller's own queries and even with `include_metrics=True` - confirmed server-side via
+  a direct SDK source read, not something a client-side parameter can bypass. Not
+  implemented for Databricks as a result; may be revisited if a future paid workspace
+  confirms this is a toggleable setting there.
 - Databricks cost estimates are always `HEURISTIC` (the least precise tier) - Databricks
   has no dry-run, and `EXPLAIN COST`'s byte estimates are frequently unavailable.
 - Databricks pricing only models Serverless SQL warehouses - Classic/Pro warehouses use

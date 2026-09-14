@@ -6,16 +6,19 @@ import pytest
 
 from cost_guard_mcp.engines.snowflake import (
     _ASSUMED_RUNTIME_HOURS,
+    _HISTORY_LOOKUP_TIMEOUT_SECONDS,
     _LOGIN_TIMEOUT_SECONDS,
     _NETWORK_TIMEOUT_SECONDS,
     _connect,
+    _lookup_historical_runtime,
+    _normalize_sql_for_matching,
     check_credentials,
     execute_bounded,
     explain_estimate,
 )
 from cost_guard_mcp.errors import SanitizedEngineError
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
-from cost_guard_mcp.types import AccuracyTier
+from cost_guard_mcp.types import AccuracyTier, HistoricalRuntimeSignal
 
 
 @patch("cost_guard_mcp.engines.snowflake.snowflake.connector.connect")
@@ -157,7 +160,11 @@ def test_explain_estimate_skips_use_warehouse_when_warehouse_is_none(mock_connec
     explain_estimate("SELECT 1", warehouse=None)
 
     executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
-    assert len(executed_sql) == 1
+    # 2 calls, not 1: EXPLAIN plus the warehouse-history calibration lookup added in
+    # Task 2.1 (_lookup_historical_runtime), which explain_estimate now always attempts on
+    # the same connection after EXPLAIN. Neither call issues USE WAREHOUSE when
+    # warehouse=None - that's the substantive behavior this test guards.
+    assert len(executed_sql) == 2
     assert not any("USE WAREHOUSE" in stmt for stmt in executed_sql)
     assert "EXPLAIN USING JSON SELECT 1" in executed_sql[0]
 
@@ -232,6 +239,206 @@ def test_explain_estimate_closes_connection_even_on_failure(mock_connect):
         explain_estimate("SELECT 1", warehouse=None)
 
     mock_conn.close.assert_called_once()
+
+
+def test_normalize_sql_collapses_whitespace_but_not_case():
+    assert _normalize_sql_for_matching("SELECT   1\n  FROM t") == "SELECT 1 FROM t"
+    assert _normalize_sql_for_matching("select 1 from t") != _normalize_sql_for_matching(
+        "SELECT 1 FROM t"
+    )
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_finds_single_real_match(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [
+        ("SELECT 1 FROM t", 4000, 1024),  # real execution: 4000ms, bytes_scanned > 0
+    ]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    signal = _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t")
+
+    assert signal == HistoricalRuntimeSignal(avg_runtime_hours=4000 / 1000 / 3600, sample_count=1)
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_averages_multiple_matches(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [
+        ("SELECT 1 FROM t", 4000, 1024),
+        ("SELECT   1 FROM t", 6000, 2048),  # whitespace-differing, still matches
+    ]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    signal = _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t")
+
+    assert signal.sample_count == 2
+    assert signal.avg_runtime_hours == (5000 / 1000 / 3600)
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_excludes_cache_hits(mock_connect):
+    # The single most important test in this feature (per the design spec) - a cache hit
+    # (bytes_scanned == 0) must never be averaged in, or calibration silently corrupts
+    # itself toward underestimating future runtime.
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [
+        ("SELECT 1 FROM t", 4000, 1024),  # real execution
+        ("SELECT 1 FROM t", 5, 0),  # cache hit - near-instant, zero bytes scanned
+    ]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    signal = _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t")
+
+    assert signal.sample_count == 1  # only the real execution counted
+    assert signal.avg_runtime_hours == 4000 / 1000 / 3600
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_returns_none_when_all_matches_are_cache_hits(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [("SELECT 1 FROM t", 5, 0)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    assert _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t") is None
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_returns_none_when_no_text_match(mock_connect):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [("SELECT * FROM other_table", 4000, 1024)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    assert _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t") is None
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_returns_none_on_exception(mock_connect):
+    mock_conn = MagicMock()
+    mock_conn.cursor.side_effect = RuntimeError("permission denied")
+    mock_connect.return_value = mock_conn
+
+    assert _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t") is None
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_treats_none_query_text_as_non_match(mock_connect):
+    # Regression test: a real QUERY_HISTORY row with QUERY_TEXT=None previously crashed
+    # with AttributeError ('NoneType' object has no attribute 'split') from
+    # _normalize_sql_for_matching - it must be treated as a non-match instead, and must not
+    # stop the good row below it from being counted.
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [
+        (None, 4000, 1024),
+        ("SELECT 1 FROM t", 4000, 1024),
+    ]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    signal = _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t")
+
+    assert signal.sample_count == 1
+    assert signal.avg_runtime_hours == 4000 / 1000 / 3600
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_treats_none_bytes_scanned_as_non_match(mock_connect):
+    # Regression test: a real QUERY_HISTORY row with BYTES_SCANNED=None previously crashed
+    # with TypeError ('>' not supported between instances of 'NoneType' and 'int') - it must
+    # be treated as a non-match instead, not as a real (or cache-hit) execution.
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [
+        ("SELECT 1 FROM t", 4000, None),
+        ("SELECT 1 FROM t", 5000, 2048),
+    ]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    signal = _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t")
+
+    assert signal.sample_count == 1
+    assert signal.avg_runtime_hours == 5000 / 1000 / 3600
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_lookup_historical_runtime_bounds_the_query_with_a_timeout(mock_connect):
+    # The design spec requires the lookup be bounded by _HISTORY_LOOKUP_TIMEOUT_SECONDS -
+    # verify it's actually wired into cur.execute()'s own `timeout` kwarg (the connector's
+    # client-side cancel-after-N-seconds mechanism), not just documented in a comment.
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = []
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    _lookup_historical_runtime(mock_conn, "SELECT 1 FROM t")
+
+    _, kwargs = mock_cursor.execute.call_args
+    assert kwargs.get("timeout") == _HISTORY_LOOKUP_TIMEOUT_SECONDS
+
+
+@patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_uses_historical_signal_when_available(mock_connect, mock_lookup):
+    # Integration-level wiring test (plan Task 2.1 Step 7): proves explain_estimate itself
+    # picks the historical path when _lookup_historical_runtime returns a signal, rather than
+    # just testing the isolated lookup function above.
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    mock_lookup.return_value = HistoricalRuntimeSignal(avg_runtime_hours=10 / 3600, sample_count=3)
+
+    estimate = explain_estimate("SELECT 1", warehouse="WH", warehouse_size="XSMALL")
+
+    expected_cost = round(credits_per_hour("XSMALL") * usd_per_credit("standard") * (10 / 3600), 6)
+    assert estimate.estimated_cost_usd == expected_cost
+    assert any("informed by 3 historical run(s)" in c for c in estimate.caveats)
+    assert not any("Cost assumes a baseline" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_uses_tiered_heuristic_when_no_historical_signal(
+    mock_connect, mock_lookup
+):
+    # Same wiring test, opposite branch: when _lookup_historical_runtime returns None, the
+    # existing tiered-heuristic path and caveat must fire exactly as before this feature -
+    # zero behavior change for the common no-match case.
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    mock_lookup.return_value = None
+
+    estimate = explain_estimate("SELECT 1", warehouse="WH", warehouse_size="XSMALL")
+
+    expected_cost = round(
+        credits_per_hour("XSMALL") * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
+    )
+    assert estimate.estimated_cost_usd == expected_cost
+    assert any("Cost assumes a baseline" in c for c in estimate.caveats)
+    assert not any("informed by" in c for c in estimate.caveats)
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
