@@ -26,8 +26,23 @@ jobs:
           push: false
           load: true
           tags: cost-guard-mcp:ci
-      - name: Smoke test the built image speaks MCP over stdio
+      - name: Smoke test the built image via the real MCP client
         run: |
-          echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}' \
-            | docker run -i --rm cost-guard-mcp:ci > /tmp/out.json
-          grep -q '"serverInfo"' /tmp/out.json
+          uv run python -c "
+          import asyncio
+          from mcp import StdioServerParameters
+          from mcp.client.session import ClientSession
+          from mcp.client.stdio import stdio_client
+
+          async def main():
+              params = StdioServerParameters(command='docker', args=['run', '-i', '--rm', 'cost-guard-mcp:ci'])
+              async with stdio_client(params) as (read, write):
+                  async with ClientSession(read, write) as session:
+                      await session.initialize()
+                      tools = await session.list_tools()
+                      names = {t.name for t in tools.tools}
+                      assert names == {'check_credentials', 'describe_engine_capabilities', 'estimate_query_cost', 'run_query_bounded'}, names
+                      result = await session.call_tool('describe_engine_capabilities', {'engine': 'bigquery'})
+                      assert result.structured_content['engine'] == 'bigquery'
+          asyncio.run(main())
+          "
