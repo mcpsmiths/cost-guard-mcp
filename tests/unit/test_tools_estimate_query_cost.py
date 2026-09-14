@@ -42,3 +42,29 @@ def test_estimate_query_cost_dispatches_to_databricks(mock_engine):
     result = estimate_query_cost("databricks", "SELECT 1", warehouse="ignored")
     mock_engine.explain_estimate.assert_called_once_with("SELECT 1", "ignored")
     assert result.engine == "databricks"
+
+
+@patch("cost_guard_mcp.tools.estimate_query_cost.snowflake_engine")
+def test_estimate_query_cost_threads_warehouse_size_and_edition_to_snowflake(mock_engine):
+    # Regression test: warehouse_size/edition must reach the engine, or the dollar estimate
+    # always assumes the smallest warehouse regardless of which one the query actually runs on.
+    mock_engine.explain_estimate.return_value = CostEstimate(
+        engine="snowflake", accuracy_tier=AccuracyTier.UPPER_BOUND, estimated_bytes=100
+    )
+    estimate_query_cost(
+        "snowflake", "SELECT 1", warehouse="WH", warehouse_size="X6LARGE", edition="enterprise"
+    )
+    mock_engine.explain_estimate.assert_called_once_with(
+        "SELECT 1", "WH", warehouse_size="X6LARGE", edition="enterprise"
+    )
+
+
+@patch("cost_guard_mcp.tools.estimate_query_cost.databricks_engine")
+def test_estimate_query_cost_threads_warehouse_size_to_databricks(mock_engine):
+    mock_engine.explain_estimate.return_value = CostEstimate(
+        engine="databricks", accuracy_tier=AccuracyTier.HEURISTIC, estimated_bytes=100
+    )
+    estimate_query_cost("databricks", "SELECT 1", warehouse_size="4X-Large")
+    mock_engine.explain_estimate.assert_called_once_with(
+        "SELECT 1", None, warehouse_size="4X-Large"
+    )

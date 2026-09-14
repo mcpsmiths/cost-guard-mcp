@@ -24,8 +24,8 @@ An AI agent using a warehouse MCP can silently trigger a full-table scan that co
 
 - `check_credentials(engine, warehouse?)` — verifies credentials/connectivity without running any real query; call this first after configuring a new engine. Supports BigQuery, Snowflake, and Databricks.
 - `describe_engine_capabilities(engine)` — what's exact vs. approximate for this engine.
-- `estimate_query_cost(engine, sql, warehouse?)` — pre-flight cost estimate, tagged with its accuracy tier. Supports BigQuery, Snowflake, and Databricks.
-- `run_query_bounded(engine, sql, max_bytes_billed?, max_rows?, max_estimated_cost_usd?)` — refuses to run if the estimate exceeds your bound. Supports BigQuery, Snowflake, and Databricks.
+- `estimate_query_cost(engine, sql, warehouse?, warehouse_size?, edition?)` — pre-flight cost estimate, tagged with its accuracy tier. Supports BigQuery, Snowflake, and Databricks. `warehouse_size` (Snowflake/Databricks) and `edition` (Snowflake) default to the smallest/standard tier if omitted — set them to match the warehouse you actually run on, or the dollar figure understates cost on a larger one.
+- `run_query_bounded(engine, sql, max_bytes_billed?, max_rows?, max_estimated_cost_usd?, warehouse?, warehouse_size?, edition?)` — refuses to run if the estimate exceeds your bound. Supports BigQuery, Snowflake, and Databricks.
 
 ## Setup
 

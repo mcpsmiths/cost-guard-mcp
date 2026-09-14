@@ -86,3 +86,26 @@ def test_run_query_bounded_dispatches_to_databricks(mock_estimate, mock_engine):
 
     mock_engine.execute_bounded.assert_called_once_with("SELECT 1", warehouse=None, max_rows=None)
     assert result.status == "ok"
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.snowflake_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_run_query_bounded_threads_warehouse_size_and_edition_to_cap_check(
+    mock_estimate, mock_engine
+):
+    # Regression test: warehouse_size/edition must reach the cap-check estimate, or
+    # max_estimated_cost_usd is always checked against the smallest warehouse's rate
+    # regardless of which warehouse the query actually runs on - silently under-enforcing
+    # the cap for a caller who specified a larger one.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_engine.execute_bounded.return_value = ([], 0, False)
+
+    run_query_bounded(
+        "snowflake",
+        "SELECT 1",
+        warehouse="WH",
+        warehouse_size="X6LARGE",
+        edition="enterprise",
+    )
+
+    mock_estimate.assert_called_once_with("snowflake", "SELECT 1", "WH", "X6LARGE", "enterprise")
