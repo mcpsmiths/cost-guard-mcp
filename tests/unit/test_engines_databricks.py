@@ -258,3 +258,22 @@ def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect)
     called_sql = mock_cursor.execute.call_args[0][0]
     assert ";)" not in called_sql
     assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_reraises_real_query_error_not_a_timeout(mock_connect):
+    # Regression test: the background-thread query-FAILURE path (as opposed to a timeout)
+    # had zero test coverage. cur.execute() raising a real error (bad SQL, missing table,
+    # permission denied) is the most realistic failure mode for run_query_bounded, and is
+    # exactly the kind of concurrency code most prone to a subtle bug (e.g. forgetting to
+    # check execution_error, or re-raising the wrong object).
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = RuntimeError("TABLE_OR_VIEW_NOT_FOUND")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="TABLE_OR_VIEW_NOT_FOUND"):
+        execute_bounded("SELECT * FROM missing_table", warehouse=None, max_rows=None)
+
+    mock_cursor.cancel.assert_not_called()
