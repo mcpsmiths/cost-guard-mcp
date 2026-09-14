@@ -3,7 +3,7 @@ import re
 
 from google.cloud import bigquery, bigquery_reservation_v1
 
-from cost_guard_mcp.errors import redact_secrets, sanitize_exceptions
+from cost_guard_mcp.errors import SanitizedEngineError, redact_secrets, sanitize_exceptions
 from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
@@ -74,7 +74,23 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
             "PRECISE — treating it conservatively as UPPER_BOUND."
         )
 
-    if is_capacity_billed(client.project):
+    try:
+        capacity_billed = is_capacity_billed(client.project)
+    except SanitizedEngineError:
+        caveats.append(
+            "Could not verify BigQuery billing model (Reservations API call failed) - "
+            "returning a byte estimate only, no dollar figure, to avoid reporting a "
+            "possibly-wrong-billing-model dollar amount."
+        )
+        return CostEstimate(
+            engine="bigquery",
+            accuracy_tier=tier,
+            estimated_bytes=total_bytes_processed,
+            estimated_cost_usd=None,
+            caveats=caveats,
+        )
+
+    if capacity_billed:
         caveats.append(
             "This project is on BigQuery Editions/capacity billing (slot-hours), which has "
             "no fixed $/byte rate — no dollar estimate is possible from bytes alone."
