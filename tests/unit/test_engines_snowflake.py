@@ -120,6 +120,30 @@ def test_explain_estimate_cost_math_matches_credit_rate_times_price(mock_connect
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_cost_scales_up_for_large_byte_estimate(mock_connect):
+    plan_json = json.dumps(
+        {
+            "GlobalStats": {
+                "partitionsTotal": 1000,
+                "partitionsAssigned": 1000,
+                "bytesAssigned": 50 * 1024**3,
+            }
+        }
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    estimate = explain_estimate("SELECT * FROM huge_table", warehouse="WH", warehouse_size="XSMALL")
+
+    baseline = 30 / 3600
+    expected = round(credits_per_hour("XSMALL") * usd_per_credit("standard") * baseline * 4, 6)
+    assert estimate.estimated_cost_usd == expected
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
 def test_explain_estimate_skips_use_warehouse_when_warehouse_is_none(mock_connect):
     plan_json = json.dumps(
         {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}

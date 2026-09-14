@@ -7,6 +7,7 @@ import snowflake.connector
 
 from cost_guard_mcp.config import load_snowflake_config
 from cost_guard_mcp.errors import SanitizedEngineError, redact_secrets, sanitize_exceptions
+from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
@@ -91,7 +92,8 @@ def explain_estimate(
 
     rate = credits_per_hour(warehouse_size)
     price = usd_per_credit(edition)
-    estimated_cost_usd = rate * price * _ASSUMED_RUNTIME_HOURS
+    runtime_hours = scale_runtime_hours(bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS)
+    estimated_cost_usd = rate * price * runtime_hours
 
     return CostEstimate(
         engine="snowflake",
@@ -105,8 +107,9 @@ def explain_estimate(
                 "inside the SQL."
             ),
             (
-                f"Cost assumes a {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on a "
-                f"{warehouse_size} warehouse — a rough placeholder, not derived from this "
+                f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
+                f"on a {warehouse_size} warehouse, scaled up by a coarse size tier based on "
+                f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
                 "query's actual expected runtime."
             ),
         ],
