@@ -76,6 +76,7 @@ Kept engine-agnostic and tiny (two fields) so both engines' lookup functions ret
 _HISTORY_LOOKUP_TIMEOUT_SECONDS = 5
 _HISTORY_LOOKUP_RESULT_LIMIT = 500  # recent window, not the function's 10,000-row max
 
+
 def _normalize_sql_for_matching(sql_text: str) -> str:
     """Collapse whitespace runs to single spaces and strip - deliberately NOT case-folded,
     since quoted identifiers in Snowflake are case-sensitive and case-folding risks
@@ -135,7 +136,10 @@ warehouse-billed data scan).
 _HISTORY_LOOKUP_TIMEOUT_SECONDS = 5
 _HISTORY_LOOKUP_MAX_RESULTS = 500
 
-def _lookup_historical_runtime(sql_text: str, warehouse_id: str | None) -> HistoricalRuntimeSignal | None:
+
+def _lookup_historical_runtime(
+    sql_text: str, warehouse_id: str | None
+) -> HistoricalRuntimeSignal | None:
     """Best-effort - mirrors the Snowflake function's contract exactly: never raises,
     bounded by its own timeout."""
     from databricks.sdk import WorkspaceClient
@@ -148,7 +152,9 @@ def _lookup_historical_runtime(sql_text: str, warehouse_id: str | None) -> Histo
         if warehouse_id:
             filter_by.warehouse_ids = [warehouse_id]
         response = _run_with_timeout(
-            lambda: list(w.query_history.list(filter_by=filter_by, max_results=_HISTORY_LOOKUP_MAX_RESULTS)),
+            lambda: list(
+                w.query_history.list(filter_by=filter_by, max_results=_HISTORY_LOOKUP_MAX_RESULTS)
+            ),
             _HISTORY_LOOKUP_TIMEOUT_SECONDS,
         )
     except Exception:  # noqa: BLE001
