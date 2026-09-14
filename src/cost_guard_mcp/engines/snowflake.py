@@ -9,7 +9,12 @@ from cost_guard_mcp.config import load_snowflake_config
 from cost_guard_mcp.errors import SanitizedEngineError, redact_secrets, sanitize_exceptions
 from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
-from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
+from cost_guard_mcp.types import (
+    AccuracyTier,
+    CostEstimate,
+    CredentialCheckResult,
+    HistoricalRuntimeSignal,
+)
 
 # The connector's own defaults leave this tool exposed to indefinite hangs: login_timeout
 # falls back to snowflake.connector.auth.by_plugin.DEFAULT_AUTH_CLASS_TIMEOUT (120s) only if
@@ -64,6 +69,86 @@ def _validate_warehouse(warehouse: str) -> str:
 # warehouse) is the highest-value follow-up work once real usage data exists.
 _ASSUMED_RUNTIME_HOURS = 30 / 3600
 
+# Warehouse-history calibration (see docs/superpowers/specs/2026-09-15-warehouse-history-
+# calibration-design.md): when the caller's own INFORMATION_SCHEMA.QUERY_HISTORY has a real
+# (non-cache-hit) execution of this exact SQL text, use its average runtime instead of the
+# coarse byte-size-tier heuristic above. _HISTORY_LOOKUP_TIMEOUT_SECONDS bounds the lookup
+# per the design spec's Global Constraints — it's passed as cur.execute()'s own `timeout`
+# kwarg below, which is the connector's client-side "timebomb" (cancels the query and raises
+# after N seconds); this metadata read is a single synchronous call, not a real warehouse-
+# billed job awaiting async completion, so it doesn't need execute_bounded's heavier
+# poll/cancel loop — the connector's own per-call timeout is the right-sized tool here.
+_HISTORY_LOOKUP_TIMEOUT_SECONDS = 5
+_HISTORY_LOOKUP_RESULT_LIMIT = 500
+
+
+def _normalize_sql_for_matching(sql_text: str) -> str:
+    """Collapse whitespace runs to single spaces and strip - deliberately NOT case-folded,
+    since quoted identifiers in Snowflake are case-sensitive and case-folding risks
+    conflating genuinely different queries."""
+    return " ".join(sql_text.split())
+
+
+def _lookup_historical_runtime(
+    conn: "snowflake.connector.SnowflakeConnection", sql_text: str
+) -> HistoricalRuntimeSignal | None:
+    """Best-effort - any failure (permission, network, malformed/None-valued row, timeout)
+    returns None, never raises; no exception propagates out of explain_estimate because of
+    this lookup. Cache-hit rows (bytes_scanned == 0) are excluded - averaging in a
+    near-instant cached result would corrupt calibration toward underestimating future
+    runtime (confirmed live 2026-09-15: a real 360ms/10,741,184-byte execution vs. an
+    immediate 54ms/0-byte cache-hit repeat).
+
+    INFORMATION_SCHEMA.QUERY_HISTORY is per-database, not global, and this connection never
+    issues its own USE DATABASE (see _connect() / load_snowflake_config() - neither sets a
+    default database). Rather than requiring a new, feature-specific database context, this
+    fully-qualifies the table function against the built-in `SNOWFLAKE` system database,
+    which every account has and which is visible to all users by default. Per Snowflake's own
+    docs, INFORMATION_SCHEMA access is not among the object types that require an explicit
+    ACCOUNTADMIN-only grant (unlike ACCOUNT_USAGE/READER_ACCOUNT_USAGE/ORGANIZATION_USAGE/
+    DATA_SHARING_USAGE) - but that is an inference from documentation, not a live-tested
+    result against this project's actual least-privilege role (DECISIONS.md #7 requires a
+    role scoped to the objects being cost-estimated, never ACCOUNTADMIN). This assumption is
+    exactly what the plan's Phase 4 live-verification task is meant to confirm or correct
+    before it's treated as settled; until then, if a specific role somehow lacks access, the
+    surrounding try/except degrades to None exactly like any other permission failure, so a
+    wrong assumption here fails safe rather than breaking explain_estimate.
+    """
+    normalized_target = _normalize_sql_for_matching(sql_text)
+    try:
+        with conn.cursor() as cur:
+            # RESULT_LIMIT is our own int constant, never caller input - same class of
+            # interpolation as execute_bounded's LIMIT clause below.
+            history_query = (
+                "SELECT QUERY_TEXT, TOTAL_ELAPSED_TIME, BYTES_SCANNED "  # noqa: S608
+                "FROM TABLE(SNOWFLAKE.INFORMATION_SCHEMA.QUERY_HISTORY("
+                f"RESULT_LIMIT => {_HISTORY_LOOKUP_RESULT_LIMIT})) "
+                "WHERE EXECUTION_STATUS = 'SUCCESS'"
+            )
+            cur.execute(history_query, timeout=_HISTORY_LOOKUP_TIMEOUT_SECONDS)
+            rows = cur.fetchall()
+
+        # Row-level type guards, not just a blanket except: a real QUERY_HISTORY row with a
+        # None QUERY_TEXT or a non-numeric BYTES_SCANNED (both observed as plausible real
+        # values) must be treated as a non-match, not crash the whole lookup - this whole
+        # block sits inside the same try as the query above so any other malformed-response
+        # shape still degrades to None rather than raising.
+        matches_ms = [
+            elapsed_ms
+            for query_text, elapsed_ms, bytes_scanned in rows
+            if isinstance(query_text, str)
+            and isinstance(elapsed_ms, (int, float))
+            and isinstance(bytes_scanned, (int, float))
+            and bytes_scanned > 0
+            and _normalize_sql_for_matching(query_text) == normalized_target
+        ]
+        if not matches_ms:
+            return None
+        avg_hours = (sum(matches_ms) / len(matches_ms)) / 1000 / 3600
+        return HistoricalRuntimeSignal(avg_runtime_hours=avg_hours, sample_count=len(matches_ms))
+    except Exception:  # noqa: BLE001 - best-effort, matches cancel()/close() discipline
+        return None
+
 
 @sanitize_exceptions("snowflake")
 def explain_estimate(
@@ -93,7 +178,25 @@ def explain_estimate(
 
         rate = credits_per_hour(warehouse_size)
         price = usd_per_credit(edition)
-        runtime_hours = scale_runtime_hours(bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS)
+
+        historical = _lookup_historical_runtime(conn, sql)
+        if historical is not None:
+            runtime_hours = historical.avg_runtime_hours
+            runtime_caveat = (
+                f"Cost is informed by {historical.sample_count} historical run(s) of this "
+                f"exact query, averaging {historical.avg_runtime_hours * 3600:.1f}s — more "
+                "reliable than the coarse size-tier heuristic below."
+            )
+        else:
+            runtime_hours = scale_runtime_hours(
+                bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS
+            )
+            runtime_caveat = (
+                f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
+                f"on a {warehouse_size} warehouse, scaled up by a coarse size tier based on "
+                f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
+                "query's actual expected runtime."
+            )
         estimated_cost_usd = rate * price * runtime_hours
 
         return CostEstimate(
@@ -107,12 +210,7 @@ def explain_estimate(
                     "bytesAssigned only reflects warehouse compute/scan, not AI-inference calls "
                     "inside the SQL."
                 ),
-                (
-                    f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
-                    f"on a {warehouse_size} warehouse, scaled up by a coarse size tier based on "
-                    f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
-                    "query's actual expected runtime."
-                ),
+                runtime_caveat,
             ],
         )
     finally:

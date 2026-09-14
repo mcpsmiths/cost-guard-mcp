@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
@@ -10,6 +11,17 @@ class AccuracyTier(str, Enum):
     PRECISE = "PRECISE"
     UPPER_BOUND = "UPPER_BOUND"
     HEURISTIC = "HEURISTIC"
+
+
+@dataclass(frozen=True)
+class HistoricalRuntimeSignal:
+    """A warehouse-history-derived runtime signal for an exact-text SQL match, used to
+    calibrate estimate_query_cost's runtime assumption in place of the coarse byte-size-tier
+    heuristic. Engine-agnostic and intentionally tiny so every engine's lookup function
+    returns the same shape."""
+
+    avg_runtime_hours: float
+    sample_count: int
 
 
 class CostEstimate(BaseModel):
