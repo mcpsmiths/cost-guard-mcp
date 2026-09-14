@@ -244,3 +244,17 @@ def test_execute_bounded_cancels_and_raises_when_wait_times_out(mock_connect):
         )
 
     mock_cursor.cancel.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect):
+    mock_cursor = _make_mock_cursor([{"a": 1}])
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT * FROM t;", warehouse=None, max_rows=5)
+
+    called_sql = mock_cursor.execute.call_args[0][0]
+    assert ";)" not in called_sql
+    assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
