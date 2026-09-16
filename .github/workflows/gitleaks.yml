@@ -1,0 +1,34 @@
+# .github/workflows/gitleaks.yml
+#
+# Local secret-scanning check, redundant to the GitHub-native secret scanning + push
+# protection that are already enabled on this repo (see SECURITY.md). Runs the
+# open-source gitleaks CLI directly rather than the gitleaks/gitleaks-action wrapper:
+# that wrapper requires a GITLEAKS_LICENSE secret for organization-owned repos
+# (mcpsmiths is a GitHub Organization), and this project doesn't invent placeholder
+# secrets for gated third-party tooling. The underlying gitleaks CLI itself is
+# free/OSS with no license requirement, so it's installed and run directly, with its
+# release tarball checksum-verified against gitleaks' own published checksums file.
+name: gitleaks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      GITLEAKS_VERSION: "8.30.1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks (checksum-verified)
+        run: |
+          curl -sSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          sha256sum --ignore-missing -c "gitleaks_${GITLEAKS_VERSION}_checksums.txt"
+          tar -xzf "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" gitleaks
+          sudo install gitleaks /usr/local/bin/gitleaks
+      - name: Scan for secrets
+        run: gitleaks detect --source . --redact -v
