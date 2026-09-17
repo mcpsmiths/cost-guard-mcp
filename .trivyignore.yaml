@@ -1,0 +1,81 @@
+# Scoped, expiring Trivy ignores for the Docker base image.
+#
+# Every CVE below is an OS-level package in the base image (perl, ncurses, sqlite3,
+# systemd/udev, gzip, acl, util-linux/mount tooling, pcre2) that cost-guard-mcp's own
+# Python code never invokes - this is a pure stdio MCP server with no persistence layer,
+# no shell-outs, and no PCRE-linked dependency (Python's `re` module has its own regex
+# engine, not libpcre2). Debian has already published fixes for all of these in
+# bookworm/trixie-security; the upstream ghcr.io/astral-sh/uv image simply has not
+# rebuilt to pick them up yet (confirmed 2026-09-18 - astral-sh's images only rebuild as
+# a side effect of a new uv release, not on the OS package's own patch cycle, and
+# python3.12-bookworm-slim specifically no longer appears in astral-sh's own published
+# image catalog).
+#
+# Expiry forces a re-check rather than a silent permanent blind spot - if this file is
+# still needed past its expiry date, re-verify the same reasoning still holds (a new
+# rebuild may have already picked up the fixes) rather than just pushing the date out.
+
+vulnerabilities:
+  - id: CVE-2025-69720
+    statement: "ncurses - unused by cost-guard-mcp, no interactive terminal UI"
+    expired_at: 2026-11-15
+  - id: CVE-2026-11822
+    statement: "libsqlite3-0 (OS package) - cost-guard-mcp has no persistence layer, never uses sqlite"
+    expired_at: 2026-11-15
+  - id: CVE-2026-11824
+    statement: "libsqlite3-0 (OS package) - cost-guard-mcp has no persistence layer, never uses sqlite"
+    expired_at: 2026-11-15
+  - id: CVE-2026-13221
+    statement: "perl - unused, cost-guard-mcp never shells out to perl. Debian trixie-security fix pending image rebuild"
+    expired_at: 2026-11-15
+  - id: CVE-2026-16742
+    statement: "libsystemd0/libudev1 - unused, container has no systemd/udev interaction"
+    expired_at: 2026-11-15
+  - id: CVE-2026-41992
+    statement: "gzip - unused at runtime (only used implicitly by apt during image build, not by cost-guard-mcp itself)"
+    expired_at: 2026-11-15
+  - id: CVE-2026-42496
+    statement: "perl-archive-tar - unused, cost-guard-mcp never invokes perl"
+    expired_at: 2026-11-15
+  - id: CVE-2026-42497
+    statement: "perl-archive-tar - unused, cost-guard-mcp never invokes perl"
+    expired_at: 2026-11-15
+  - id: CVE-2026-48962
+    statement: "perl-IO-Compress - unused, cost-guard-mcp never invokes perl"
+    expired_at: 2026-11-15
+  - id: CVE-2026-54369
+    statement: "libacl1 - unused, cost-guard-mcp does no ACL manipulation"
+    expired_at: 2026-11-15
+  - id: CVE-2026-57432
+    statement: "perl - unused, cost-guard-mcp never invokes perl"
+    expired_at: 2026-11-15
+  - id: CVE-2026-57433
+    statement: "Storable (perl) - unused, cost-guard-mcp never invokes perl"
+    expired_at: 2026-11-15
+  - id: CVE-2026-76642
+    statement: "util-linux mount tooling - unused, container never mounts filesystems"
+    expired_at: 2026-11-15
+  - id: CVE-2026-78408
+    statement: "util-linux nsenter/cgroup - unused, container has no cgroup namespace manipulation"
+    expired_at: 2026-11-15
+  - id: CVE-2026-78409
+    statement: "util-linux mount tooling - unused, container never mounts filesystems"
+    expired_at: 2026-11-15
+  - id: CVE-2026-78410
+    statement: "util-linux mount tooling - unused, container never mounts filesystems"
+    expired_at: 2026-11-15
+  - id: CVE-2026-8376
+    statement: "perl regex engine - unused, cost-guard-mcp never invokes perl (Python's own re module is unaffected)"
+    expired_at: 2026-11-15
+  - id: CVE-2026-86145
+    statement: "libpcre2-8-0 - Python's re module does not link libpcre2; no dependency in this project uses PCRE"
+    expired_at: 2026-11-15
+  - id: CVE-2026-89157
+    statement: "libpcre2-8-0 - Python's re module does not link libpcre2; no dependency in this project uses PCRE"
+    expired_at: 2026-11-15
+  - id: CVE-2026-89161
+    statement: "libpcre2-8-0 - Python's re module does not link libpcre2; no dependency in this project uses PCRE"
+    expired_at: 2026-11-15
+  - id: CVE-2026-9538
+    statement: "perl-Archive-Tar - unused, cost-guard-mcp never invokes perl"
+    expired_at: 2026-11-15
