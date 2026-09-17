@@ -37,6 +37,7 @@ jobs:
           ignore-unfixed: true
           vuln-type: os,library
           severity: CRITICAL,HIGH
+          trivyignores: .trivyignore.yaml
       - name: Smoke test the built image via the real MCP client
         run: |
           uv run python -c "

@@ -1,6 +1,12 @@
 # syntax=docker/dockerfile:1
-# python3.12-bookworm-slim, resolved 2026-09-14
-FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim@sha256:e5b65587bce7de595f299855d7385fe7fca39b8a74baa261ba1b7147afa78e58
+# python3.12-trixie-slim, resolved 2026-09-18 - switched from bookworm-slim (see
+# DECISIONS.md): astral-sh's own current docs no longer list bookworm-slim in their
+# published image catalog (deprecated in favor of trixie-slim), and a Trivy scan of the
+# bookworm-slim digest found 7 real CVEs in openssl/libssl3/pcre2 that Debian had already
+# patched in bookworm-security - astral-sh's image simply hadn't rebuilt to pick them up,
+# with no scheduled rebuild cadence to rely on (their images only rebuild as a side effect
+# of a new uv release, not the OS package's own patch cycle).
+FROM ghcr.io/astral-sh/uv:python3.12-trixie-slim@sha256:a87b6a9711d3b5fb5ef9d8db6d991594beb1e5bc46d002fc83ffcdc2e95c32ad
 
 WORKDIR /app
 
