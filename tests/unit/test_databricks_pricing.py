@@ -19,16 +19,26 @@ def test_dbus_per_hour_matches_confirmed_table():
     assert dbus_per_hour("4X-Large") == 528
 
 
+def test_dbus_per_hour_supports_5x_large():
+    # 5X-Large is a real, currently-provisionable cluster size (Public Preview, see
+    # docs.databricks.com/aws/en/compute/sql-warehouse/warehouse-behavior) that must not
+    # raise. Rate sourced from a Databricks-employee technical blog post ("Introducing 5XL
+    # SQL Warehouses"), whose 4XL figure (528 DBU/hr) matches this table's confirmed
+    # 4X-Large value exactly — see the module docstring for the full citation.
+    assert dbus_per_hour("5X-Large") == 1042
+    assert dbus_per_hour("5x-large") == 1042
+
+
 def test_dbus_per_hour_is_case_insensitive():
     assert dbus_per_hour("small") == 12
     assert dbus_per_hour("SMALL") == 12
 
 
 def test_dbus_per_hour_rejects_unknown_size():
-    # 5X-Large exists as a cluster size (Public Preview) but has no published DBU rate in
-    # the confirmed pricing table — refuse rather than guess a number.
+    # 6X-Large does not exist as a documented Databricks cluster size — refuse rather
+    # than guess a number.
     with pytest.raises(ValueError, match="unknown Databricks warehouse size"):
-        dbus_per_hour("5X-Large")
+        dbus_per_hour("6X-Large")
 
 
 def test_serverless_rate_matches_confirmed_pricing_page():
