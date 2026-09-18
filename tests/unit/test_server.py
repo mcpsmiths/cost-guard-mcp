@@ -13,7 +13,7 @@ def test_server_lists_all_four_registered_tools():
     # isinstance(tools, list), which passes whether 0 or 4 tools are registered - it
     # provided zero signal on actual tool registration. This asserts the real, current
     # tool set by name.
-    tools = asyncio.get_event_loop().run_until_complete(mcp.list_tools())
+    tools = asyncio.run(mcp.list_tools())
     tool_names = {t.name for t in tools}
     assert tool_names == {
         "check_credentials",
@@ -24,7 +24,15 @@ def test_server_lists_all_four_registered_tools():
 
 
 def _call_tool(name, arguments):
-    return asyncio.get_event_loop().run_until_complete(mcp.call_tool(name, arguments))
+    # asyncio.run() (not the deprecated asyncio.get_event_loop().run_until_complete()
+    # pattern this used to use) - get_event_loop() raises "There is no current event loop"
+    # once anything elsewhere in the same pytest session (any pytest-asyncio-managed async
+    # test, including this project's own MCP-cancellation regression test) has called
+    # asyncio.set_event_loop(None) during its own teardown, which flips asyncio's internal
+    # _set_called flag and disables get_event_loop()'s legacy auto-create fallback for the
+    # rest of the process - a real ordering hazard this test file was previously exposed to
+    # only by accident, since no async test used to sort alphabetically before this file.
+    return asyncio.run(mcp.call_tool(name, arguments))
 
 
 def test_call_tool_describe_engine_capabilities_end_to_end():
