@@ -1,3 +1,4 @@
+import logging
 import re
 import threading
 
@@ -10,6 +11,8 @@ from cost_guard_mcp.errors import redact_secrets, sanitize_exceptions
 from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
 from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
+
+logger = logging.getLogger(__name__)
 
 # databricks-sql-connector's own _socket_timeout defaults to 900s on the backend used
 # here (confirmed via CONNECTION_PARAMETERS.md against the installed package) - not
@@ -243,6 +246,10 @@ def execute_bounded(
                 cur.cancel()
             except Exception:  # noqa: BLE001, S110 - best-effort; the TimeoutError below matters
                 pass
+            logger.warning(
+                "engine=databricks execute_bounded timed out after %ss, cancelled",
+                max_wait_seconds,
+            )
             raise TimeoutError(f"Query exceeded {max_wait_seconds}s and was cancelled.")
 
         if execution_error:

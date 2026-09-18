@@ -145,6 +145,42 @@ DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/your-warehouse-id"
 DATABRICKS_TOKEN = "your-personal-access-token"
 ```
 
+## Observability
+
+- **Structured logging (always on, no configuration needed)** — every tool call and
+  warehouse-client failure is logged via Python's standard `logging` module. Since stdout
+  is the MCP transport channel in stdio mode, `logging`'s default (stderr) is what this
+  server relies on — never redirect these loggers to stdout. What gets logged:
+  - Every tool call (`check_credentials`, `describe_engine_capabilities`,
+    `estimate_query_cost`, `run_query_bounded`) logs one INFO record on completion:
+    `tool=<name> outcome=<success|error> elapsed_ms=<n>`.
+  - Every warehouse-client failure (BigQuery/Snowflake/Databricks) logs one WARNING record:
+    `engine=<engine> warehouse_client_call_failed message=<redacted>` — `message` is always
+    the same secret-redacted text the caller gets back, never the raw exception.
+  - Every `run_query_bounded` refusal logs one INFO record naming the engine and the
+    specific refusal reason (`cost_cap_exceeded`, `byte_cap_exceeded`, or
+    `row_cap_exceeded`).
+  - Each engine's 120-second execution watchdog logs one WARNING record before cancelling a
+    still-running query.
+  - None of the above ever logs a credential, connection string, or raw (unredacted)
+    warehouse-client exception message — the same `redact_secrets` helper that sanitizes
+    what a tool caller sees is applied before anything is logged.
+
+- **OpenTelemetry tracing (opt-in, off by default)** — the underlying `mcp` SDK ships an
+  `OpenTelemetryMiddleware` on by default for every server, wrapping each inbound message
+  in a SERVER span, but that middleware is a documented no-op until a real exporter is
+  registered — this project registers none unless you ask for it. Set
+  `OTEL_EXPORTER_OTLP_ENDPOINT` to your OTel Collector's endpoint (e.g.
+  `http://localhost:4317`) to turn it on: at that point `cost-guard-mcp` constructs a
+  `TracerProvider` with a gRPC OTLP exporter pointed at that endpoint and registers it as
+  the global tracer provider before the server starts running. Leave the env var unset and
+  nothing changes — no exporter is constructed, and the two extra dependencies below never
+  need to be installed. Requires the `otel` extra:
+  ```bash
+  uv sync --extra otel
+  # or: pip install "cost-guard-mcp[otel]"
+  ```
+
 ## Known limitations
 
 - Snowflake cost estimates are calibrated from the caller's own recent query history
@@ -169,9 +205,22 @@ DATABRICKS_TOKEN = "your-personal-access-token"
 - Databricks has no per-query warehouse override - the SQL warehouse is fixed by
   `DATABRICKS_HTTP_PATH` at connect time.
 - Snowflake's `UPPER_BOUND` estimate excludes Cortex AI Function ("AI Credits") cost.
+- Snowflake warehouse generation (Gen1 vs. the newer, pricier Gen2) is detected on a
+  best-effort basis via `SHOW WAREHOUSES` and `CURRENT_REGION()` (both ordinary,
+  non-privileged SQL) to pick the correct credit rate — Gen2 bills ~1.35x Gen1 on AWS/GCP
+  and ~1.25x on Azure. Detection needs a `warehouse` to be specified; if it isn't, or the
+  lookup fails for any reason (permission, timeout, unrecognized response shape), the
+  estimate safely falls back to Gen1 rates with an explicit caveat rather than erroring —
+  since Gen2 is now the default for new standard warehouses in most regions, an
+  undetectable generation means the real cost may be higher than this estimate. This was
+  implemented and unit-tested with mocked Snowflake responses only; live verification
+  against a real Gen2 warehouse is still an open follow-up.
 - BigQuery Editions/capacity-billed projects cannot get a dollar estimate — only a byte count (capacity billing has no fixed $/byte rate).
+- BigQuery dry runs always report 0 bytes processed for tables protected by row-level security, by design, to prevent a side-channel — `dry_run` adds a caveat when it sees 0 bytes against a non-empty `referenced_tables` list, but a $0.00 estimate on such a query must never be treated as proof the query is free to run.
+- BigQuery remote functions and BigQuery ML remote-model inference (e.g. `ML.GENERATE_TEXT`) incur separate Cloud Run/Vertex AI billing that this byte-based dollar estimate does not include — `dry_run` flags this with a conservative text-based heuristic (`ML.GENERATE_TEXT` or `CREATE FUNCTION` + `REMOTE` in the query text) rather than the dry-run response's `referencedRoutines` field, which would need live-credential verification not available at the time this caveat was added.
 - `run_query_bounded` gives up on a still-running query after 120 seconds and cancels it (BigQuery: `QueryJob.cancel()`; Snowflake: `SYSTEM$CANCEL_QUERY`; Databricks: `Cursor.cancel()` from a watchdog thread) rather than waiting indefinitely — a query stuck behind slot contention or a cold/suspended warehouse would otherwise block the tool call, and keep burning warehouse-seconds the whole time, defeating the point of a "bounded" tool.
 - The underlying `mcp` SDK can drop an in-flight tool-call response if the client closes stdin before the tool finishes (upstream issue [modelcontextprotocol/python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678), open since 2026-05, unresolved after several attempted fixes) — no known real-world exposure for well-behaved clients that keep stdin open for the session, but worth knowing about given this server's tool calls can run up to 120 seconds.
+- A client-sent MCP cancellation notification against an in-flight `run_query_bounded` call now detaches promptly at the MCP bookkeeping level, but the warehouse-side query itself keeps running in the abandoned background thread until the existing per-engine watchdog (~120s, see above) fires on its own — this fix does not by itself stop the warehouse from billing for that abandoned query any sooner.
 
 ## More docs
 

@@ -13,7 +13,7 @@ def test_server_lists_all_four_registered_tools():
     # isinstance(tools, list), which passes whether 0 or 4 tools are registered - it
     # provided zero signal on actual tool registration. This asserts the real, current
     # tool set by name.
-    tools = asyncio.get_event_loop().run_until_complete(mcp.list_tools())
+    tools = asyncio.run(mcp.list_tools())
     tool_names = {t.name for t in tools}
     assert tool_names == {
         "check_credentials",
@@ -24,7 +24,15 @@ def test_server_lists_all_four_registered_tools():
 
 
 def _call_tool(name, arguments):
-    return asyncio.get_event_loop().run_until_complete(mcp.call_tool(name, arguments))
+    # asyncio.run() (not the deprecated asyncio.get_event_loop().run_until_complete()
+    # pattern this used to use) - get_event_loop() raises "There is no current event loop"
+    # once anything elsewhere in the same pytest session (any pytest-asyncio-managed async
+    # test, including this project's own MCP-cancellation regression test) has called
+    # asyncio.set_event_loop(None) during its own teardown, which flips asyncio's internal
+    # _set_called flag and disables get_event_loop()'s legacy auto-create fallback for the
+    # rest of the process - a real ordering hazard this test file was previously exposed to
+    # only by accident, since no async test used to sort alphabetically before this file.
+    return asyncio.run(mcp.call_tool(name, arguments))
 
 
 def test_call_tool_describe_engine_capabilities_end_to_end():
@@ -82,12 +90,42 @@ def test_call_tool_run_query_bounded_end_to_end(mock_bq_module, _mock_capacity):
     assert result.structured_content["row_count"] == 1
 
 
+@patch("cost_guard_mcp.server._bootstrap_opentelemetry")
 @patch("cost_guard_mcp.server.mcp")
-def test_main_calls_mcp_run(mock_mcp):
+def test_main_calls_mcp_run(mock_mcp, mock_bootstrap):
     from cost_guard_mcp.server import main
 
     main()
+    mock_bootstrap.assert_called_once()
     mock_mcp.run.assert_called_once()
+
+
+def test_bootstrap_opentelemetry_is_a_noop_without_the_endpoint_env_var(monkeypatch):
+    # No OTEL_EXPORTER_OTLP_ENDPOINT set - must return without importing/touching the
+    # opentelemetry SDK at all, so a deployment that never opts in never needs it installed.
+    from cost_guard_mcp.server import _bootstrap_opentelemetry
+
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+    with patch("opentelemetry.trace.set_tracer_provider") as mock_set_provider:
+        _bootstrap_opentelemetry()
+
+    mock_set_provider.assert_not_called()
+
+
+def test_bootstrap_opentelemetry_registers_a_tracer_provider_when_endpoint_is_set(monkeypatch):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from cost_guard_mcp.server import _bootstrap_opentelemetry
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+
+    with patch("opentelemetry.trace.set_tracer_provider") as mock_set_provider:
+        _bootstrap_opentelemetry()
+
+    mock_set_provider.assert_called_once()
+    registered_provider = mock_set_provider.call_args.args[0]
+    assert isinstance(registered_provider, TracerProvider)
 
 
 @patch("cost_guard_mcp.engines.bigquery.bigquery")

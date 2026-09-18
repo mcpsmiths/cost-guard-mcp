@@ -1,9 +1,13 @@
+import logging
+
 from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines import databricks as databricks_engine
 from cost_guard_mcp.engines import snowflake as snowflake_engine
 from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
+
+logger = logging.getLogger(__name__)
 
 
 def run_query_bounded(
@@ -25,6 +29,11 @@ def run_query_bounded(
 
     if max_estimated_cost_usd is not None:
         if estimate.estimated_cost_usd is None:
+            logger.info(
+                "engine=%s run_query_bounded refused reason=%s detail=no_cost_estimate_available",
+                engine,
+                RefusalReason.COST_CAP_EXCEEDED.value,
+            )
             return BoundedQueryResult(
                 status="refused",
                 reason=RefusalReason.COST_CAP_EXCEEDED,
@@ -36,6 +45,14 @@ def run_query_bounded(
                 ),
             )
         if estimate.estimated_cost_usd > max_estimated_cost_usd:
+            logger.info(
+                "engine=%s run_query_bounded refused reason=%s "
+                "estimated_cost_usd=%s max_estimated_cost_usd=%s",
+                engine,
+                RefusalReason.COST_CAP_EXCEEDED.value,
+                estimate.estimated_cost_usd,
+                max_estimated_cost_usd,
+            )
             return BoundedQueryResult(
                 status="refused",
                 reason=RefusalReason.COST_CAP_EXCEEDED,
@@ -49,6 +66,11 @@ def run_query_bounded(
 
     if max_bytes_billed is not None:
         if estimate.estimated_bytes is None:
+            logger.info(
+                "engine=%s run_query_bounded refused reason=%s detail=no_byte_estimate_available",
+                engine,
+                RefusalReason.BYTE_CAP_EXCEEDED.value,
+            )
             return BoundedQueryResult(
                 status="refused",
                 reason=RefusalReason.BYTE_CAP_EXCEEDED,
@@ -59,6 +81,14 @@ def run_query_bounded(
                 ),
             )
         if estimate.estimated_bytes > max_bytes_billed:
+            logger.info(
+                "engine=%s run_query_bounded refused reason=%s "
+                "estimated_bytes=%s max_bytes_billed=%s",
+                engine,
+                RefusalReason.BYTE_CAP_EXCEEDED.value,
+                estimate.estimated_bytes,
+                max_bytes_billed,
+            )
             return BoundedQueryResult(
                 status="refused",
                 reason=RefusalReason.BYTE_CAP_EXCEEDED,
@@ -85,6 +115,13 @@ def run_query_bounded(
         raise UserVisibleError(f"run_query_bounded: engine '{engine}' is not yet supported.")
 
     if row_cap_hit:
+        logger.info(
+            "engine=%s run_query_bounded refused reason=%s max_rows=%s row_count=%s",
+            engine,
+            RefusalReason.ROW_CAP_EXCEEDED.value,
+            max_rows,
+            row_count,
+        )
         return BoundedQueryResult(
             status="refused",
             reason=RefusalReason.ROW_CAP_EXCEEDED,

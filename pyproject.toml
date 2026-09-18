@@ -9,7 +9,7 @@ dependencies = [
     "mcp>=2.0.0",
     "google-cloud-bigquery>=3.25.0",
     "google-cloud-bigquery-reservation>=1.15.0",
-    "snowflake-connector-python>=3.12.0",
+    "snowflake-connector-python>=4.7.1",
     "databricks-sql-connector>=4.0.0",
     "databricks-sdk>=0.20.0",
     "pydantic>=2.9.0",
@@ -25,6 +25,16 @@ dev = [
     "pytest-cov>=5.0.0",
     "ruff>=0.7.0",
     "mypy>=1.14.0",
+]
+# Opt-in only - see server.py's _bootstrap_opentelemetry(). `opentelemetry-api` is already
+# a transitive dependency of `mcp` itself (its OpenTelemetryMiddleware ships on by default
+# for every server, per mcp/server/lowlevel/server.py - just a documented no-op until a
+# TracerProvider with a real exporter is registered as the global provider). This group
+# adds only what that registration itself needs - the SDK and an OTLP exporter - so a
+# deployment that never sets OTEL_EXPORTER_OTLP_ENDPOINT never needs to install it.
+otel = [
+    "opentelemetry-sdk>=1.27.0",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.27.0",
 ]
 
 [build-system]

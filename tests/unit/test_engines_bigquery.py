@@ -55,10 +55,11 @@ def test_is_capacity_billed_rejects_invalid_project_id(mock_reservation_module):
     mock_reservation_module.ReservationServiceClient.assert_not_called()
 
 
-def _mock_query_job(total_bytes_processed: int, accuracy: str = "PRECISE"):
+def _mock_query_job(total_bytes_processed: int, accuracy: str = "PRECISE", referenced_tables=None):
     job = MagicMock()
     job.total_bytes_processed = total_bytes_processed
     job._properties = {"statistics": {"query": {"totalBytesProcessedAccuracy": accuracy}}}
+    job.referenced_tables = [] if referenced_tables is None else referenced_tables
     return job
 
 
@@ -158,6 +159,104 @@ def test_dry_run_degrades_gracefully_when_capacity_check_fails(mock_bq_module, _
     assert estimate.estimated_bytes == 1024**4  # byte estimate still returned
     assert estimate.estimated_cost_usd is None  # but no dollar figure - billing model unknown
     assert any("billing model" in c.lower() for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_warns_about_rls_when_zero_bytes_but_tables_referenced(
+    mock_bq_module, _mock_capacity
+):
+    # BigQuery's own documented behavior: a dry run against a row-level-security-protected
+    # table always reports 0 bytes processed, by design, to prevent a side-channel. A naive
+    # reading of that 0 would tag this PRECISE and $0.00 - exactly the "silently defeats the
+    # cost cap" case this caveat exists to prevent.
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(
+        total_bytes_processed=0,
+        accuracy="PRECISE",
+        referenced_tables=[MagicMock()],
+    )
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT * FROM rls_protected_table")
+
+    assert estimate.estimated_bytes == 0
+    assert estimate.estimated_cost_usd == 0.0
+    assert any(
+        "row-level security" in c.lower() and "must not" in c.lower() for c in estimate.caveats
+    )
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_no_rls_caveat_when_zero_bytes_and_no_tables_referenced(
+    mock_bq_module, _mock_capacity
+):
+    # A trivial query like `SELECT 1` legitimately has 0 bytes processed and touches no
+    # tables at all - that is not the RLS side-channel case, so no caveat should fire.
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(
+        total_bytes_processed=0, accuracy="PRECISE", referenced_tables=[]
+    )
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT 1")
+
+    assert estimate.estimated_bytes == 0
+    assert not any("row-level security" in c.lower() for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_warns_about_remote_model_billing_for_ml_generate_text(
+    mock_bq_module, _mock_capacity
+):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(total_bytes_processed=500)
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT ml.generate_text(prompt) FROM t")  # lowercase - case-insensitive
+
+    assert any("remote" in c.lower() and "cloud run" in c.lower() for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_warns_about_remote_model_billing_for_remote_function(
+    mock_bq_module, _mock_capacity
+):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(total_bytes_processed=500)
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run(
+        "create function My_Func(x INT64) returns INT64 remote with connection `proj.us.conn` "
+        "options (endpoint = 'https://example.com')"
+    )
+
+    assert any("remote" in c.lower() and "cloud run" in c.lower() for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_no_remote_billing_caveat_for_ordinary_query(mock_bq_module, _mock_capacity):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(total_bytes_processed=500)
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT * FROM t WHERE created_function = 'remote work'")
+
+    assert not any("cloud run" in c.lower() for c in estimate.caveats)
 
 
 @patch("cost_guard_mcp.engines.bigquery.bigquery")

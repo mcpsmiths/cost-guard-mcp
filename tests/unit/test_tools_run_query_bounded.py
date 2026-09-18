@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import patch
 
 import pytest
@@ -5,6 +6,8 @@ import pytest
 from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, RefusalReason
+
+_RUN_QUERY_BOUNDED_LOGGER_NAME = "cost_guard_mcp.tools.run_query_bounded"
 
 
 def _estimate(cost=None, bytes_=None):
@@ -17,13 +20,24 @@ def _estimate(cost=None, bytes_=None):
 
 
 @patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
-def test_refuses_when_cost_cap_exceeded(mock_estimate):
+def test_refuses_when_cost_cap_exceeded(mock_estimate, caplog):
     mock_estimate.return_value = _estimate(cost=10.00)
-    result = run_query_bounded("bigquery", "SELECT * FROM huge_table", max_estimated_cost_usd=1.00)
+    with caplog.at_level(logging.INFO, logger=_RUN_QUERY_BOUNDED_LOGGER_NAME):
+        result = run_query_bounded(
+            "bigquery", "SELECT * FROM huge_table", max_estimated_cost_usd=1.00
+        )
     assert result.status == "refused"
     assert result.reason == RefusalReason.COST_CAP_EXCEEDED
     assert result.estimate.estimated_cost_usd == 10.00
     assert "1.0" in result.hint or "1.00" in result.hint
+
+    # "Refusal path" logging case: exactly one INFO record naming the engine and the
+    # actual refusal reason, with no secret-looking content in it.
+    records = [r for r in caplog.records if r.name == _RUN_QUERY_BOUNDED_LOGGER_NAME]
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    assert "engine=bigquery" in records[0].message
+    assert "reason=cost_cap_exceeded" in records[0].message
 
 
 @patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")

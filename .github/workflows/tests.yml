@@ -11,7 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4  # v10.1.0
-      - run: uv sync
+      # --all-groups (not plain `uv sync`): the `otel` dependency-group is deliberately not
+      # in tool.uv's default-groups (production/Docker never installs it), but the unit
+      # suite has a real-import test for it (test_server.py's
+      # test_bootstrap_opentelemetry_registers_a_tracer_provider_when_endpoint_is_set), so
+      # this job specifically needs it present.
+      - run: uv sync --all-groups
       - run: uv run ruff check src tests
       - run: uv run mypy src
       - run: uv run pytest tests/unit -v --cov=cost_guard_mcp --cov-report=term-missing --cov-fail-under=80
