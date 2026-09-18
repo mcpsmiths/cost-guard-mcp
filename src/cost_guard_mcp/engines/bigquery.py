@@ -58,11 +58,25 @@ def _references_remote_billing(sql: str) -> bool:
     """Conservative textual heuristic for queries that likely trigger BigQuery remote
     functions or BigQuery ML remote-model inference (`ML.GENERATE_TEXT`), both of which
     incur separate Cloud Run/Vertex AI billing that a byte-based dollar estimate cannot
-    see. Deliberately unconditional and text-based, not derived from the dry-run
-    response's `referencedRoutines` field: that would be a more precise signal, but
-    confirming its exact shape requires a live BigQuery dry-run response against real
-    credentials, which is out of scope here - left as an explicit follow-up for the
-    maintainer to verify separately.
+    see.
+
+    Deliberately unconditional and text-based rather than derived from the dry-run
+    response's `statistics.query.referencedRoutines` field (researched 2026-09-18):
+    that field is real and documented (BigQuery's own v2 Discovery Document -
+    googleapis.com/discovery/v1/apis/bigquery/v2/rest - `JobStatistics2.referencedRoutines`,
+    an array of `{projectId, datasetId, routineId}`), but no Google source states whether
+    it populates on a *dry run* specifically, only that `referencedTables` (its sibling
+    field, already read above for the RLS caveat) does. More importantly,
+    `referencedRoutines` can NEVER detect `ML.GENERATE_TEXT` at all - BQML remote-model
+    inference references a `ModelReference`, and `JobStatistics2` has no
+    `referencedModels`-equivalent field - so a structured read could only ever supplement,
+    never replace, this text check for the remote-function half. Next concrete step for a
+    maintainer with real BigQuery credentials: run a dry-run query that invokes an
+    existing remote function (no `CREATE FUNCTION` DDL) and inspect
+    `query_job._properties["statistics"]["query"].get("referencedRoutines")` - if it's
+    populated, add a supplemental read there (each returned routine still needs a
+    `routines.get` call, since the reference alone carries no `remoteFunctionOptions`),
+    OR'd with this text check rather than replacing it.
     """
     upper_sql = sql.upper()
     if "ML.GENERATE_TEXT" in upper_sql:

@@ -3,7 +3,7 @@
 Source: https://www.databricks.com/product/pricing/databricks-lakehouse (DBU-per-hour
 table cross-checked against https://azure.microsoft.com/en-us/pricing/details/databricks,
 both confirmed identical across Classic/Pro/Serverless — only the $/DBU dollar rate
-differs by tier). Live-verified 2026-09-14. Re-fetch and update before each release;
+differs by tier). Live-verified 2026-09-18. Re-fetch and update before each release;
 Databricks has changed these before.
 
 5X-Large: NOT on the primary GA pricing table above (it's still Public Preview per
@@ -16,6 +16,11 @@ worked TCO example states "Hourly rate | 528 DBU/hr | 1,042 DBU/hr" for 4XL vs 5
 528 figure matches this table's confirmed 4X-Large value exactly, which is why the 1,042
 figure for 5XL is trusted here despite not (yet) appearing on the GA price list. Re-verify
 against the primary pricing page once 5X-Large exits Public Preview.
+Re-confirmed 2026-09-18: docs.databricks.com/aws/en/compute/sql-warehouse/warehouse-behavior
+still states 5X-Large is Public Preview, and Azure's own Databricks pricing page
+(azure.microsoft.com/en-us/pricing/details/databricks) still has no 5X-Large row in its
+Serverless SQL DBU table — two independent, primary-adjacent sources both consistent with
+5X-Large still being unpriced on the GA table. No rate change; re-verify trigger unchanged.
 
 LIMITATION (documented, not fixed in v1): only Serverless SQL warehouse pricing is
 modeled. Classic and Pro warehouses use lower DBU rates ($0.22 and $0.55 respectively,
