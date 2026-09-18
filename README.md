@@ -166,6 +166,21 @@ DATABRICKS_TOKEN = "your-personal-access-token"
     warehouse-client exception message — the same `redact_secrets` helper that sanitizes
     what a tool caller sees is applied before anything is logged.
 
+- **OpenTelemetry tracing (opt-in, off by default)** — the underlying `mcp` SDK ships an
+  `OpenTelemetryMiddleware` on by default for every server, wrapping each inbound message
+  in a SERVER span, but that middleware is a documented no-op until a real exporter is
+  registered — this project registers none unless you ask for it. Set
+  `OTEL_EXPORTER_OTLP_ENDPOINT` to your OTel Collector's endpoint (e.g.
+  `http://localhost:4317`) to turn it on: at that point `cost-guard-mcp` constructs a
+  `TracerProvider` with a gRPC OTLP exporter pointed at that endpoint and registers it as
+  the global tracer provider before the server starts running. Leave the env var unset and
+  nothing changes — no exporter is constructed, and the two extra dependencies below never
+  need to be installed. Requires the `otel` extra:
+  ```bash
+  uv sync --extra otel
+  # or: pip install "cost-guard-mcp[otel]"
+  ```
+
 ## Known limitations
 
 - Snowflake cost estimates are calibrated from the caller's own recent query history

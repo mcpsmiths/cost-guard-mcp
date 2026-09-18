@@ -82,12 +82,42 @@ def test_call_tool_run_query_bounded_end_to_end(mock_bq_module, _mock_capacity):
     assert result.structured_content["row_count"] == 1
 
 
+@patch("cost_guard_mcp.server._bootstrap_opentelemetry")
 @patch("cost_guard_mcp.server.mcp")
-def test_main_calls_mcp_run(mock_mcp):
+def test_main_calls_mcp_run(mock_mcp, mock_bootstrap):
     from cost_guard_mcp.server import main
 
     main()
+    mock_bootstrap.assert_called_once()
     mock_mcp.run.assert_called_once()
+
+
+def test_bootstrap_opentelemetry_is_a_noop_without_the_endpoint_env_var(monkeypatch):
+    # No OTEL_EXPORTER_OTLP_ENDPOINT set - must return without importing/touching the
+    # opentelemetry SDK at all, so a deployment that never opts in never needs it installed.
+    from cost_guard_mcp.server import _bootstrap_opentelemetry
+
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_ENDPOINT", raising=False)
+
+    with patch("opentelemetry.trace.set_tracer_provider") as mock_set_provider:
+        _bootstrap_opentelemetry()
+
+    mock_set_provider.assert_not_called()
+
+
+def test_bootstrap_opentelemetry_registers_a_tracer_provider_when_endpoint_is_set(monkeypatch):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from cost_guard_mcp.server import _bootstrap_opentelemetry
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+
+    with patch("opentelemetry.trace.set_tracer_provider") as mock_set_provider:
+        _bootstrap_opentelemetry()
+
+    mock_set_provider.assert_called_once()
+    registered_provider = mock_set_provider.call_args.args[0]
+    assert isinstance(registered_provider, TracerProvider)
 
 
 @patch("cost_guard_mcp.engines.bigquery.bigquery")
