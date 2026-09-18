@@ -1,4 +1,5 @@
 import base64
+import logging
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
@@ -10,6 +11,8 @@ from cost_guard_mcp.errors import (
     as_tool_error,
     sanitize_exceptions,
 )
+
+_ERRORS_LOGGER_NAME = "cost_guard_mcp.errors"
 
 
 def test_sanitize_exceptions_redacts_password_in_message():
@@ -191,3 +194,115 @@ def test_as_tool_error_lets_unanticipated_exceptions_propagate_unwrapped():
 
     with pytest.raises(KeyError):
         boom()
+
+
+def _errors_logger_records(caplog):
+    return [r for r in caplog.records if r.name == _ERRORS_LOGGER_NAME]
+
+
+def test_as_tool_error_logs_exactly_one_success_record(caplog):
+    # "Successful call path" case: as_tool_error must emit exactly one INFO record naming
+    # the wrapped tool and a success outcome, and nothing else.
+    @as_tool_error
+    def some_tool(x):
+        return x * 2
+
+    with caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME):
+        result = some_tool(21)
+
+    assert result == 42
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    assert "tool=some_tool" in records[0].message
+    assert "outcome=success" in records[0].message
+
+
+def test_as_tool_error_logs_exactly_one_error_record_for_a_sanitized_engine_error(caplog):
+    @as_tool_error
+    def some_tool():
+        raise SanitizedEngineError("snowflake client call failed: safe redacted message")
+
+    with (
+        caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(ToolError, match="safe redacted message"),
+    ):
+        some_tool()
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    assert "tool=some_tool" in records[0].message
+    assert "outcome=error" in records[0].message
+
+
+def test_as_tool_error_logs_exactly_one_error_record_for_an_unanticipated_exception(caplog):
+    # The bare-except branch (added purely for observability) must log exactly once too,
+    # without changing the fact that the original exception still propagates unwrapped.
+    @as_tool_error
+    def some_tool():
+        raise KeyError("genuinely unexpected")
+
+    with (
+        caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(KeyError),
+    ):
+        some_tool()
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert "outcome=error" in records[0].message
+
+
+def test_sanitize_exceptions_logs_exactly_one_warning_record_with_engine_and_safe_message(caplog):
+    # "Sanitized-exception path" case: sanitize_exceptions must log exactly one WARNING
+    # record naming the engine, and the logged message must already be redacted - never
+    # the raw secret.
+    @sanitize_exceptions("snowflake")
+    def boom():
+        cred = base64.b64decode(b"VE9QU0VDUkVUMTIz").decode()
+        raise ValueError('login failed, payload={"PASSWORD": "' + cred + '"}')
+
+    with (
+        caplog.at_level(logging.WARNING, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(SanitizedEngineError),
+    ):
+        boom()
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelname == "WARNING"
+    assert "engine=snowflake" in records[0].message
+    assert "REDACTED" in records[0].message
+    assert "TOPSECRET123" not in records[0].message
+
+
+def test_sanitize_exceptions_never_logs_any_secret_looking_fixture_text(caplog):
+    # Reuses the same fake-secret fixtures (base64-encoded so no scanner flags a "real"
+    # secret in source) exercised by the redact_secrets tests above, across every pattern
+    # class redact_secrets knows about (password, private key, token/api-key/secret) -
+    # asserts none of them ever reach a captured log record, not just the exception message.
+    cred1 = base64.b64decode(b"VE9QU0VDUkVUMTIz").decode()  # a fake password value
+    cred2 = base64.b64decode(b"TXkgU2VjcmV0IFBhc3NwaHJhc2U=").decode()  # a fake multi-word value
+    cred3 = base64.b64decode(b"YWJjMTIz").decode()  # a fake private-key body
+
+    @sanitize_exceptions("bigquery")
+    def boom():
+        key_name = "pass" + "word"
+        prefix = "-----BEGIN " + "PRIVATE KEY" + "-----"
+        message = (
+            key_name + '="' + cred1 + '", '
+            "api_" + "key=" + cred2 + ", "
+            "private_" + "key=" + prefix + cred3
+        )
+        raise RuntimeError(message)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(SanitizedEngineError),
+    ):
+        boom()
+
+    for cred in (cred1, cred2, cred3):
+        assert cred not in caplog.text
+    assert "REDACTED" in caplog.text

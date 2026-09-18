@@ -1,5 +1,7 @@
 import functools
+import logging
 import re
+import time
 from collections.abc import Callable
 from typing import ParamSpec, TypeVar
 
@@ -9,6 +11,8 @@ from cost_guard_mcp.config import ConfigError
 
 P = ParamSpec("P")
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 # Shared value-matching fragment for the password/token patterns below. A bare (unquoted)
 # value is allowed to contain internal single spaces (real passwords legitimately can -
@@ -75,6 +79,17 @@ def redact_secrets(text: str) -> str:
     return redacted
 
 
+def _log_tool_outcome(tool_name: str, start_monotonic: float, outcome: str) -> None:
+    """Log a single, secrets-free record for one as_tool_error-wrapped tool call.
+
+    Never receives (or logs) the exception message itself - only the tool name, a
+    coarse outcome label, and elapsed wall time - so this can't leak whatever a future
+    unaudited exception's text might contain.
+    """
+    elapsed_ms = (time.monotonic() - start_monotonic) * 1000
+    logger.info("tool=%s outcome=%s elapsed_ms=%.1f", tool_name, outcome, elapsed_ms)
+
+
 def as_tool_error[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     """Wrap an @mcp.tool()-decorated function so its known, already-safe exceptions reach
     the MCP client's model instead of being silently discarded.
@@ -95,12 +110,26 @@ def as_tool_error[**P, T](func: Callable[P, T]) -> Callable[P, T]:
 
     @functools.wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+        tool_name = func.__name__
+        start = time.monotonic()
         try:
-            return func(*args, **kwargs)
+            result = func(*args, **kwargs)
         except ToolError:
+            _log_tool_outcome(tool_name, start, "error")
             raise
         except (SanitizedEngineError, ConfigError, UserVisibleError) as exc:
+            _log_tool_outcome(tool_name, start, "error")
             raise ToolError(str(exc)) from exc
+        except Exception:
+            # Bare re-raise below - ruff's BLE001 (blind-except) deliberately exempts this
+            # pattern, since the exception itself is untouched and propagates exactly as it
+            # would without this decorator; this branch exists purely to log the outcome for
+            # every previously-uncaught exception type too.
+            _log_tool_outcome(tool_name, start, "error")
+            raise
+        else:
+            _log_tool_outcome(tool_name, start, "success")
+            return result
 
     return wrapper
 
@@ -117,6 +146,9 @@ def sanitize_exceptions(engine: str) -> Callable[[Callable[P, T]], Callable[P, T
                 raise
             except Exception as exc:  # noqa: BLE001 - intentionally catching all exceptions to sanitize
                 safe_message = redact_secrets(str(exc))
+                logger.warning(
+                    "engine=%s warehouse_client_call_failed message=%s", engine, safe_message
+                )
                 raise SanitizedEngineError(f"{engine} client call failed: {safe_message}") from None
 
         return wrapper
