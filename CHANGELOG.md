@@ -6,6 +6,12 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-18
+
+A CRITICAL Snowflake connector CVE fix, a Gen2 warehouse pricing-correctness fix, a working
+MCP cancellation fix, opt-in structured logging/OpenTelemetry, and signed release artifacts.
+Full detail: [`changelog/v0.3.0.md`](changelog/v0.3.0.md).
+
 ## [0.2.0] - 2026-09-17
 
 Databricks engine, byte-scaled and warehouse-history cost calibration, a critical
@@ -22,7 +28,8 @@ Harness/governance docs, CI security tooling, and PyPI Trusted Publishing. Full 
 Initial release: BigQuery (`PRECISE`) + Snowflake (`UPPER_BOUND`) pre-flight cost
 guardrails. Full detail: [`changelog/v0.1.0.md`](changelog/v0.1.0.md).
 
-[Unreleased]: https://github.com/mcpsmiths/cost-guard-mcp/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/mcpsmiths/cost-guard-mcp/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.2.0
 [0.1.1]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.1.1
 [0.1.0]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.1.0
