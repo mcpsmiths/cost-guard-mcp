@@ -1,4 +1,5 @@
 import base64
+import inspect
 import logging
 
 import pytest
@@ -306,3 +307,56 @@ def test_sanitize_exceptions_never_logs_any_secret_looking_fixture_text(caplog):
     for cred in (cred1, cred2, cred3):
         assert cred not in caplog.text
     assert "REDACTED" in caplog.text
+
+
+# Regression tests for async-function support (needed by server.py's run_query_bounded,
+# which must be an async tool body so it can hand its blocking call to
+# anyio.to_thread.run_sync(abandon_on_cancel=True) itself - see server.py for why).
+
+
+def test_as_tool_error_keeps_an_async_func_a_coroutine_function():
+    # This is the actual regression this exists to prevent: the mcp SDK decides whether to
+    # run a tool on the event loop or hand it to its own implicit-sync-wrapping thread pool
+    # by checking inspect.iscoroutinefunction() (via is_async_callable) on the wrapped
+    # callable it registers - a wrapper that lost the "async" shape would silently defeat an
+    # async tool body's whole purpose.
+    @as_tool_error
+    async def coro():
+        return 1
+
+    assert inspect.iscoroutinefunction(coro)
+
+
+async def test_as_tool_error_passes_through_return_value_for_async_func():
+    @as_tool_error
+    async def add(a, b):
+        return a + b
+
+    assert await add(2, 3) == 5
+
+
+async def test_as_tool_error_converts_sanitized_engine_error_for_async_func():
+    @as_tool_error
+    async def boom():
+        raise SanitizedEngineError("snowflake client call failed: safe redacted message")
+
+    with pytest.raises(ToolError, match="safe redacted message"):
+        await boom()
+
+
+async def test_as_tool_error_does_not_double_wrap_an_existing_tool_error_for_async_func():
+    @as_tool_error
+    async def boom():
+        raise ToolError("already a tool error")
+
+    with pytest.raises(ToolError, match="already a tool error"):
+        await boom()
+
+
+async def test_as_tool_error_lets_unanticipated_exceptions_propagate_unwrapped_for_async_func():
+    @as_tool_error
+    async def boom():
+        raise KeyError("genuinely unexpected")
+
+    with pytest.raises(KeyError):
+        await boom()

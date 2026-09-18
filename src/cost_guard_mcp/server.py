@@ -7,6 +7,7 @@ for Python's `logging` module when no handler is configured, and for `print(...,
 
 import os
 
+import anyio.to_thread
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 
@@ -73,7 +74,7 @@ def estimate_query_cost(
 
 @mcp.tool(annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True))
 @as_tool_error
-def run_query_bounded(
+async def run_query_bounded(
     engine: Engine,
     sql: str,
     max_bytes_billed: int | None = None,
@@ -91,7 +92,18 @@ def run_query_bounded(
     warehouse_size/edition (see estimate_query_cost) default to the smallest/standard tier
     if omitted - set them to match the warehouse you actually run on, since max_estimated_cost_usd
     is checked against the estimate they produce."""
-    return _run_query_bounded(
+    # This tool is deliberately async so it can hand the actual blocking warehouse call to
+    # anyio.to_thread.run_sync() itself with abandon_on_cancel=True, instead of relying on
+    # the mcp SDK's own implicit sync-wrapping (which calls anyio.to_thread.run_sync() with
+    # its default abandon_on_cancel=False and would shield this call from an MCP client's
+    # `notifications/cancelled` until the underlying warehouse call finished on its own -
+    # verified directly against the installed mcp SDK's
+    # mcp.server.mcpserver.utilities.func_metadata.FuncMetadata.call_fn). abandon_on_cancel=True
+    # makes cancellation prompt at the MCP bookkeeping level only - the abandoned thread (and
+    # the warehouse-side query it's running) keeps going until the existing per-engine
+    # watchdog (~120s) cancels it; see README's Known limitations.
+    return await anyio.to_thread.run_sync(
+        _run_query_bounded,
         engine,
         sql,
         max_bytes_billed,
@@ -100,6 +112,7 @@ def run_query_bounded(
         warehouse,
         warehouse_size,
         edition,
+        abandon_on_cancel=True,
     )
 
 

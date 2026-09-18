@@ -1,9 +1,10 @@
 import functools
+import inspect
 import logging
 import re
 import time
-from collections.abc import Callable
-from typing import ParamSpec, TypeVar
+from collections.abc import Awaitable, Callable
+from typing import ParamSpec, TypeVar, cast
 
 from mcp.server.mcpserver.exceptions import ToolError
 
@@ -106,7 +107,28 @@ def as_tool_error[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     actually see (and act on) the hint/reason text instead of a black box. Deliberately NOT
     catching the bare `ValueError` type: that would forward the message of any ValueError
     from anywhere in the call chain — including a future, unaudited one — to the client.
+
+    Supports both sync and async `func`. An async `func` gets an async wrapper back, so the
+    mcp SDK's own `is_async_callable` check (see `mcp.server.mcpserver.tools.base.Tool`)
+    still sees a coroutine function and awaits it directly on the event loop, instead of
+    silently handing a sync-looking wrapper to the SDK's implicit-sync-wrapping thread pool -
+    which would both defeat the point of an async tool body and never actually run it (a sync
+    wrapper calling an async `func` would just produce an unawaited coroutine object).
     """
+
+    if inspect.iscoroutinefunction(func):
+        async_func = cast(Callable[P, Awaitable[T]], func)
+
+        @functools.wraps(func)
+        async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            try:
+                return await async_func(*args, **kwargs)
+            except ToolError:
+                raise
+            except (SanitizedEngineError, ConfigError, UserVisibleError) as exc:
+                raise ToolError(str(exc)) from exc
+
+        return cast(Callable[P, T], async_wrapper)
 
     @functools.wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:

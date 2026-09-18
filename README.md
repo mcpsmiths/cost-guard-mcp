@@ -205,9 +205,22 @@ DATABRICKS_TOKEN = "your-personal-access-token"
 - Databricks has no per-query warehouse override - the SQL warehouse is fixed by
   `DATABRICKS_HTTP_PATH` at connect time.
 - Snowflake's `UPPER_BOUND` estimate excludes Cortex AI Function ("AI Credits") cost.
+- Snowflake warehouse generation (Gen1 vs. the newer, pricier Gen2) is detected on a
+  best-effort basis via `SHOW WAREHOUSES` and `CURRENT_REGION()` (both ordinary,
+  non-privileged SQL) to pick the correct credit rate — Gen2 bills ~1.35x Gen1 on AWS/GCP
+  and ~1.25x on Azure. Detection needs a `warehouse` to be specified; if it isn't, or the
+  lookup fails for any reason (permission, timeout, unrecognized response shape), the
+  estimate safely falls back to Gen1 rates with an explicit caveat rather than erroring —
+  since Gen2 is now the default for new standard warehouses in most regions, an
+  undetectable generation means the real cost may be higher than this estimate. This was
+  implemented and unit-tested with mocked Snowflake responses only; live verification
+  against a real Gen2 warehouse is still an open follow-up.
 - BigQuery Editions/capacity-billed projects cannot get a dollar estimate — only a byte count (capacity billing has no fixed $/byte rate).
+- BigQuery dry runs always report 0 bytes processed for tables protected by row-level security, by design, to prevent a side-channel — `dry_run` adds a caveat when it sees 0 bytes against a non-empty `referenced_tables` list, but a $0.00 estimate on such a query must never be treated as proof the query is free to run.
+- BigQuery remote functions and BigQuery ML remote-model inference (e.g. `ML.GENERATE_TEXT`) incur separate Cloud Run/Vertex AI billing that this byte-based dollar estimate does not include — `dry_run` flags this with a conservative text-based heuristic (`ML.GENERATE_TEXT` or `CREATE FUNCTION` + `REMOTE` in the query text) rather than the dry-run response's `referencedRoutines` field, which would need live-credential verification not available at the time this caveat was added.
 - `run_query_bounded` gives up on a still-running query after 120 seconds and cancels it (BigQuery: `QueryJob.cancel()`; Snowflake: `SYSTEM$CANCEL_QUERY`; Databricks: `Cursor.cancel()` from a watchdog thread) rather than waiting indefinitely — a query stuck behind slot contention or a cold/suspended warehouse would otherwise block the tool call, and keep burning warehouse-seconds the whole time, defeating the point of a "bounded" tool.
 - The underlying `mcp` SDK can drop an in-flight tool-call response if the client closes stdin before the tool finishes (upstream issue [modelcontextprotocol/python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678), open since 2026-05, unresolved after several attempted fixes) — no known real-world exposure for well-behaved clients that keep stdin open for the session, but worth knowing about given this server's tool calls can run up to 120 seconds.
+- A client-sent MCP cancellation notification against an in-flight `run_query_bounded` call now detaches promptly at the MCP bookkeeping level, but the warehouse-side query itself keeps running in the abandoned background thread until the existing per-engine watchdog (~120s, see above) fires on its own — this fix does not by itself stop the warehouse from billing for that abandoned query any sooner.
 
 ## More docs
 

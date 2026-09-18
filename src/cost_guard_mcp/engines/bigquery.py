@@ -54,6 +54,22 @@ _BQ_ACCURACY_TO_TIER = {
 }
 
 
+def _references_remote_billing(sql: str) -> bool:
+    """Conservative textual heuristic for queries that likely trigger BigQuery remote
+    functions or BigQuery ML remote-model inference (`ML.GENERATE_TEXT`), both of which
+    incur separate Cloud Run/Vertex AI billing that a byte-based dollar estimate cannot
+    see. Deliberately unconditional and text-based, not derived from the dry-run
+    response's `referencedRoutines` field: that would be a more precise signal, but
+    confirming its exact shape requires a live BigQuery dry-run response against real
+    credentials, which is out of scope here - left as an explicit follow-up for the
+    maintainer to verify separately.
+    """
+    upper_sql = sql.upper()
+    if "ML.GENERATE_TEXT" in upper_sql:
+        return True
+    return "CREATE FUNCTION" in upper_sql and "REMOTE" in upper_sql
+
+
 @sanitize_exceptions("bigquery")
 def dry_run(sql: str, project: str | None = None) -> CostEstimate:
     """Estimate BigQuery query cost via a dry run. Tagged PRECISE unless BigQuery's own
@@ -75,6 +91,26 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
         caveats.append(
             f"BigQuery reported this estimate's own accuracy as '{raw_accuracy}', not "
             "PRECISE — treating it conservatively as UPPER_BOUND."
+        )
+
+    # BigQuery's dry-run response always reports 0 bytes processed for tables protected by
+    # row-level security, by design, to prevent a side-channel that would let a query's byte
+    # cost reveal information about rows the caller can't see. Without this caveat, an
+    # RLS-protected query would get tagged PRECISE with a $0.00 estimate and sail through any
+    # cost cap in run_query_bounded (which only fail-closes on a None estimate, never a
+    # suspiciously-low one) before running for real.
+    if total_bytes_processed == 0 and query_job.referenced_tables:
+        caveats.append(
+            "BigQuery dry runs always report 0 bytes processed for tables protected by "
+            "row-level security, by design, to prevent a side-channel — a $0.00 estimate "
+            "here must NOT be trusted as proof this query is free to run."
+        )
+
+    if _references_remote_billing(sql):
+        caveats.append(
+            "This query appears to invoke a BigQuery remote function or ML.GENERATE_TEXT "
+            "(BigQuery ML remote-model inference) — both incur separate Cloud Run/Vertex AI "
+            "billing that this byte-based dollar estimate does not include."
         )
 
     try:
