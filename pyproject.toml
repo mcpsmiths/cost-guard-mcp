@@ -18,7 +18,7 @@ dependencies = [
 [project.scripts]
 cost-guard-mcp = "cost_guard_mcp.server:main"
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=8.3.0",
     "pytest-asyncio>=0.24.0",

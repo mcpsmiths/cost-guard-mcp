@@ -31,7 +31,11 @@ from cost_guard_mcp.types import (
 mcp = MCPServer("cost-guard-mcp")
 
 
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Check Credentials", read_only_hint=True, open_world_hint=True
+    )
+)
 @as_tool_error
 def check_credentials(engine: Engine, warehouse: str | None = None) -> CredentialCheckResult:
     """Verify credentials/connectivity for an engine without running any real query or
@@ -41,7 +45,11 @@ def check_credentials(engine: Engine, warehouse: str | None = None) -> Credentia
     return _check_credentials(engine, warehouse)
 
 
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Describe Engine Capabilities", read_only_hint=True, open_world_hint=True
+    )
+)
 @as_tool_error
 def describe_engine_capabilities(engine: Engine) -> EngineCapabilities:
     """Declare which cost signals are exact vs. approximate for the given warehouse engine.
@@ -52,7 +60,11 @@ def describe_engine_capabilities(engine: Engine) -> EngineCapabilities:
     return _describe_engine_capabilities(engine)
 
 
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=True, open_world_hint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Estimate Query Cost", read_only_hint=True, open_world_hint=True
+    )
+)
 @as_tool_error
 def estimate_query_cost(
     engine: Engine,
@@ -72,7 +84,11 @@ def estimate_query_cost(
     return _estimate_query_cost(engine, sql, warehouse, warehouse_size, edition)
 
 
-@mcp.tool(annotations=ToolAnnotations(read_only_hint=False, open_world_hint=True))
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Run Query Bounded", read_only_hint=False, open_world_hint=True
+    )
+)
 @as_tool_error
 async def run_query_bounded(
     engine: Engine,

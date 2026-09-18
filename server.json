@@ -1,6 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mcpsmiths/cost-guard-mcp",
+  "title": "Cost Guard MCP",
   "description": "Pre-flight query cost and result-size guardrails for AI agents on BigQuery, Snowflake, Databricks",
   "repository": {
     "url": "https://github.com/mcpsmiths/cost-guard-mcp",
@@ -14,7 +15,81 @@
       "version": "0.2.0",
       "transport": {
         "type": "stdio"
-      }
+      },
+      "environmentVariables": [
+        {
+          "name": "GOOGLE_APPLICATION_CREDENTIALS",
+          "description": "BigQuery: path to a service-account key file (Application Default Credentials). Required to use the bigquery engine.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SNOWFLAKE_ACCOUNT",
+          "description": "Snowflake: account identifier. Required to use the snowflake engine.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SNOWFLAKE_USER",
+          "description": "Snowflake: username. Required to use the snowflake engine.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SNOWFLAKE_ROLE",
+          "description": "Snowflake: role to assume. Required to use the snowflake engine; has no default and must never be ACCOUNTADMIN.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SNOWFLAKE_PRIVATE_KEY_PATH",
+          "description": "Snowflake: path to an RSA private key file for key-pair auth (preferred over SNOWFLAKE_PASSWORD). Either this or SNOWFLAKE_PASSWORD is required to use the snowflake engine.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+          "description": "Snowflake: passphrase for an encrypted SNOWFLAKE_PRIVATE_KEY_PATH key file, if the key is encrypted.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "SNOWFLAKE_PASSWORD",
+          "description": "Snowflake: password (discouraged; prefer SNOWFLAKE_PRIVATE_KEY_PATH). Either this or SNOWFLAKE_PRIVATE_KEY_PATH is required to use the snowflake engine.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "DATABRICKS_SERVER_HOSTNAME",
+          "description": "Databricks: SQL warehouse server hostname (e.g. my-workspace.cloud.databricks.com, no scheme, no trailing slash). Required to use the databricks engine.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "DATABRICKS_HTTP_PATH",
+          "description": "Databricks: SQL warehouse HTTP path (from the warehouse's Connection Details tab, e.g. /sql/1.0/warehouses/<warehouse-id>). Required to use the databricks engine.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "DATABRICKS_TOKEN",
+          "description": "Databricks: personal access token (simplest auth option). Either this or DATABRICKS_CLIENT_ID + DATABRICKS_CLIENT_SECRET is required to use the databricks engine.",
+          "isRequired": false,
+          "isSecret": true
+        },
+        {
+          "name": "DATABRICKS_CLIENT_ID",
+          "description": "Databricks: OAuth machine-to-machine service-principal client ID (preferred for automated use). Requires DATABRICKS_CLIENT_SECRET as well.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "DATABRICKS_CLIENT_SECRET",
+          "description": "Databricks: OAuth machine-to-machine service-principal client secret. Requires DATABRICKS_CLIENT_ID as well.",
+          "isRequired": false,
+          "isSecret": true
+        }
+      ]
     }
   ]
 }
