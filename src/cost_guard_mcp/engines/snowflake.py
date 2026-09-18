@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import time
 import uuid
@@ -15,6 +16,8 @@ from cost_guard_mcp.types import (
     CredentialCheckResult,
     HistoricalRuntimeSignal,
 )
+
+logger = logging.getLogger(__name__)
 
 # The connector's own defaults leave this tool exposed to indefinite hangs: login_timeout
 # falls back to snowflake.connector.auth.by_plugin.DEFAULT_AUTH_CLASS_TIMEOUT (120s) only if
@@ -375,6 +378,12 @@ def execute_bounded(
             while conn.is_still_running(status):
                 if elapsed_seconds >= _MAX_EXECUTION_WAIT_SECONDS:
                     _cancel_query(conn, query_id)
+                    logger.warning(
+                        "engine=snowflake execute_bounded timed out after %ss, "
+                        "cancelled query_id=%s",
+                        _MAX_EXECUTION_WAIT_SECONDS,
+                        query_id,
+                    )
                     raise TimeoutError(
                         f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
                         f"(query_id={query_id})."

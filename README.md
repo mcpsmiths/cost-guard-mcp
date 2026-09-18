@@ -145,6 +145,42 @@ DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/your-warehouse-id"
 DATABRICKS_TOKEN = "your-personal-access-token"
 ```
 
+## Observability
+
+- **Structured logging (always on, no configuration needed)** — every tool call and
+  warehouse-client failure is logged via Python's standard `logging` module. Since stdout
+  is the MCP transport channel in stdio mode, `logging`'s default (stderr) is what this
+  server relies on — never redirect these loggers to stdout. What gets logged:
+  - Every tool call (`check_credentials`, `describe_engine_capabilities`,
+    `estimate_query_cost`, `run_query_bounded`) logs one INFO record on completion:
+    `tool=<name> outcome=<success|error> elapsed_ms=<n>`.
+  - Every warehouse-client failure (BigQuery/Snowflake/Databricks) logs one WARNING record:
+    `engine=<engine> warehouse_client_call_failed message=<redacted>` — `message` is always
+    the same secret-redacted text the caller gets back, never the raw exception.
+  - Every `run_query_bounded` refusal logs one INFO record naming the engine and the
+    specific refusal reason (`cost_cap_exceeded`, `byte_cap_exceeded`, or
+    `row_cap_exceeded`).
+  - Each engine's 120-second execution watchdog logs one WARNING record before cancelling a
+    still-running query.
+  - None of the above ever logs a credential, connection string, or raw (unredacted)
+    warehouse-client exception message — the same `redact_secrets` helper that sanitizes
+    what a tool caller sees is applied before anything is logged.
+
+- **OpenTelemetry tracing (opt-in, off by default)** — the underlying `mcp` SDK ships an
+  `OpenTelemetryMiddleware` on by default for every server, wrapping each inbound message
+  in a SERVER span, but that middleware is a documented no-op until a real exporter is
+  registered — this project registers none unless you ask for it. Set
+  `OTEL_EXPORTER_OTLP_ENDPOINT` to your OTel Collector's endpoint (e.g.
+  `http://localhost:4317`) to turn it on: at that point `cost-guard-mcp` constructs a
+  `TracerProvider` with a gRPC OTLP exporter pointed at that endpoint and registers it as
+  the global tracer provider before the server starts running. Leave the env var unset and
+  nothing changes — no exporter is constructed, and the two extra dependencies below never
+  need to be installed. Requires the `otel` extra:
+  ```bash
+  uv sync --extra otel
+  # or: pip install "cost-guard-mcp[otel]"
+  ```
+
 ## Known limitations
 
 - Snowflake cost estimates are calibrated from the caller's own recent query history

@@ -1,4 +1,5 @@
 import concurrent.futures
+import logging
 import re
 
 from google.cloud import bigquery, bigquery_reservation_v1
@@ -6,6 +7,8 @@ from google.cloud import bigquery, bigquery_reservation_v1
 from cost_guard_mcp.errors import SanitizedEngineError, redact_secrets, sanitize_exceptions
 from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
+
+logger = logging.getLogger(__name__)
 
 # GCP project ID format: lowercase letter, then lowercase letters/digits/hyphens, 6-30 chars
 # total, cannot end with a hyphen. `project` is not currently reachable from an MCP tool
@@ -195,6 +198,11 @@ def execute_bounded(
         except Exception:  # noqa: BLE001, S110 - best-effort cancel; the TimeoutError below is
             # the message that matters to the caller, a failed cancel must not mask it
             pass
+        logger.warning(
+            "engine=bigquery execute_bounded timed out after %ss, cancelled job_id=%s",
+            _MAX_EXECUTION_WAIT_SECONDS,
+            query_job.job_id,
+        )
         raise TimeoutError(
             f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
             f"(job_id={query_job.job_id})."
