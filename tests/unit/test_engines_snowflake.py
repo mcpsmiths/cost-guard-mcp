@@ -6,11 +6,13 @@ import pytest
 
 from cost_guard_mcp.engines.snowflake import (
     _ASSUMED_RUNTIME_HOURS,
+    _GENERATION_LOOKUP_TIMEOUT_SECONDS,
     _HISTORY_LOOKUP_TIMEOUT_SECONDS,
     _LOGIN_TIMEOUT_SECONDS,
     _NETWORK_TIMEOUT_SECONDS,
     _connect,
     _lookup_historical_runtime,
+    _lookup_warehouse_generation,
     _normalize_sql_for_matching,
     check_credentials,
     execute_bounded,
@@ -387,6 +389,233 @@ def test_lookup_historical_runtime_bounds_the_query_with_a_timeout(mock_connect)
 
     _, kwargs = mock_cursor.execute.call_args
     assert kwargs.get("timeout") == _HISTORY_LOOKUP_TIMEOUT_SECONDS
+
+
+# --- _lookup_warehouse_generation (Gen1/Gen2 detection) ------------------------------------
+
+
+def test_lookup_warehouse_generation_returns_none_when_warehouse_is_none():
+    mock_conn = MagicMock()
+
+    assert _lookup_warehouse_generation(mock_conn, None) is None
+    mock_conn.cursor.assert_not_called()
+
+
+def test_lookup_warehouse_generation_finds_gen2_and_cloud_provider():
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [("2",), ("AWS_US_WEST_2",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") == ("2", "AWS")
+
+
+def test_lookup_warehouse_generation_finds_gen1_and_cloud_provider():
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [("1",), ("AZURE_EAST_US_2",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") == ("1", "AZURE")
+
+
+def test_lookup_warehouse_generation_handles_region_group_prefixed_region():
+    # Accounts whose organization spans multiple region groups get "<group>.<CLOUD>_<REGION>"
+    # (e.g. "PUBLIC.AWS_US_WEST_2") from CURRENT_REGION() instead of the plain form - both
+    # shapes are documented examples in Snowflake's own CURRENT_REGION() reference.
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [("2",), ("PUBLIC.AWS_US_WEST_2",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") == ("2", "AWS")
+
+
+def test_lookup_warehouse_generation_returns_none_for_invalid_warehouse_name():
+    mock_conn = MagicMock()
+
+    assert _lookup_warehouse_generation(mock_conn, "WH1; malicious") is None
+    mock_conn.cursor.assert_not_called()
+
+
+def test_lookup_warehouse_generation_returns_none_on_exception():
+    mock_conn = MagicMock()
+    mock_conn.cursor.side_effect = RuntimeError("permission denied")
+
+    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+
+
+def test_lookup_warehouse_generation_returns_none_when_generation_row_is_none():
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [None, ("AWS_US_WEST_2",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+
+
+def test_lookup_warehouse_generation_returns_none_for_unrecognized_generation_value():
+    # A future/unexpected generation string (e.g. "3") must degrade safely, not crash or be
+    # silently treated as Gen1/Gen2.
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [("3",), ("AWS_US_WEST_2",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+
+
+def test_lookup_warehouse_generation_returns_none_when_region_row_is_none():
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [("2",), None]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+
+
+def test_lookup_warehouse_generation_returns_none_for_unrecognized_cloud_provider():
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [("2",), ("ORACLE_US_EAST",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+
+
+def test_lookup_warehouse_generation_filters_show_warehouses_by_validated_name():
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [("2",), ("AWS_US_WEST_2",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    _lookup_warehouse_generation(mock_conn, "COMPUTE_WH")
+
+    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert "SHOW WAREHOUSES LIKE 'COMPUTE_WH'" in executed_sql[0]
+    assert "RESULT_SCAN(LAST_QUERY_ID(-1))" in executed_sql[1]
+    assert "CURRENT_REGION()" in executed_sql[2]
+
+
+def test_lookup_warehouse_generation_bounds_every_query_with_a_timeout():
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = [("2",), ("AWS_US_WEST_2",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    _lookup_warehouse_generation(mock_conn, "COMPUTE_WH")
+
+    for call in mock_cursor.execute.call_args_list:
+        assert call.kwargs.get("timeout") == _GENERATION_LOOKUP_TIMEOUT_SECONDS
+
+
+# --- explain_estimate wiring for Gen1/Gen2 detection ---------------------------------------
+
+
+@patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
+@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_generation")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_uses_gen2_rate_when_generation_detected(
+    mock_connect, mock_lookup_generation, mock_lookup_historical
+):
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    mock_lookup_generation.return_value = ("2", "AWS")
+    mock_lookup_historical.return_value = None
+
+    estimate = explain_estimate("SELECT 1", warehouse="WH", warehouse_size="MEDIUM")
+
+    expected_rate = credits_per_hour("MEDIUM", generation="2", cloud_provider="AWS")
+    expected_cost = round(expected_rate * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6)
+    assert estimate.estimated_cost_usd == expected_cost
+    assert any("Gen2 on AWS" in c for c in estimate.caveats)
+    assert not any("could not be determined" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
+@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_generation")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_uses_gen1_rate_when_generation_detected_as_gen1(
+    mock_connect, mock_lookup_generation, mock_lookup_historical
+):
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    mock_lookup_generation.return_value = ("1", "AZURE")
+    mock_lookup_historical.return_value = None
+
+    estimate = explain_estimate("SELECT 1", warehouse="WH", warehouse_size="MEDIUM")
+
+    expected_rate = credits_per_hour("MEDIUM", generation="1", cloud_provider="AZURE")
+    expected_cost = round(expected_rate * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6)
+    assert estimate.estimated_cost_usd == expected_cost
+    assert any("Gen1 on AZURE" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
+@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_generation")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_falls_back_to_gen1_rate_when_generation_lookup_fails(
+    mock_connect, mock_lookup_generation, mock_lookup_historical
+):
+    # Plan requirement: "lookup fails (falls back to Gen1 plus an explicit caveat)".
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    mock_lookup_generation.return_value = None
+    mock_lookup_historical.return_value = None
+
+    estimate = explain_estimate("SELECT 1", warehouse="WH", warehouse_size="MEDIUM")
+
+    expected_cost = round(
+        credits_per_hour("MEDIUM") * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
+    )
+    assert estimate.estimated_cost_usd == expected_cost
+    assert any("could not be determined" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_falls_back_to_gen1_rate_when_warehouse_not_provided(
+    mock_connect, mock_lookup_historical
+):
+    # Plan requirement: "warehouse argument is not provided (falls back to Gen1 plus an
+    # explicit caveat)". Deliberately does NOT mock _lookup_warehouse_generation - exercises
+    # the real function's own warehouse=None short-circuit, wired end-to-end.
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    mock_lookup_historical.return_value = None
+
+    estimate = explain_estimate("SELECT 1", warehouse=None, warehouse_size="MEDIUM")
+
+    expected_cost = round(
+        credits_per_hour("MEDIUM") * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
+    )
+    assert estimate.estimated_cost_usd == expected_cost
+    assert any("could not be determined" in c for c in estimate.caveats)
+    assert any("no warehouse specified" in c for c in estimate.caveats)
 
 
 @patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
