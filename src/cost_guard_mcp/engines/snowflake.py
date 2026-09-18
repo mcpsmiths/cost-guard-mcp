@@ -81,6 +81,16 @@ _ASSUMED_RUNTIME_HOURS = 30 / 3600
 _HISTORY_LOOKUP_TIMEOUT_SECONDS = 5
 _HISTORY_LOOKUP_RESULT_LIMIT = 500
 
+# Warehouse-generation detection (see docs/superpowers/plans/2026-09-18-next-upgrade-plan.md
+# Phase 4): explain_estimate() used to silently assume every warehouse was Gen1, but Gen2
+# standard warehouses are now the default for new warehouses in most regions and bill at a
+# different, cloud-provider-dependent rate (Snowflake's own Service Consumption Table,
+# confirmed live 2026-09-18 — see snowflake_pricing.py's module docstring for the exact
+# source/rates). This mirrors _lookup_historical_runtime's own try/except-degrade-to-None
+# contract exactly, including its own short timeout bound.
+_GENERATION_LOOKUP_TIMEOUT_SECONDS = 5
+_CLOUD_PROVIDERS = ("AWS", "AZURE", "GCP")
+
 
 def _normalize_sql_for_matching(sql_text: str) -> str:
     """Collapse whitespace runs to single spaces and strip - deliberately NOT case-folded,
@@ -150,6 +160,71 @@ def _lookup_historical_runtime(
         return None
 
 
+def _lookup_warehouse_generation(
+    conn: "snowflake.connector.SnowflakeConnection", warehouse: str | None
+) -> tuple[str, str] | None:
+    """Best-effort, non-privileged lookup of a warehouse's generation ("1" or "2") and the
+    account's cloud provider ("AWS"/"AZURE"/"GCP"), used by explain_estimate() to pick the
+    correct Gen1/Gen2 credit rate instead of always assuming Gen1. Mirrors
+    _lookup_historical_runtime's contract exactly: any failure at all — no warehouse given,
+    permission, network, malformed/unrecognized response shape, timeout — returns None, never
+    raises. explain_estimate() degrades to the pre-existing Gen1-assumed rate plus an explicit
+    caveat whenever this returns None; no exception from this function ever propagates out of
+    explain_estimate.
+
+    Both `SHOW WAREHOUSES` and `CURRENT_REGION()` are ordinary, non-privileged SQL — no
+    ACCOUNTADMIN or elevated grant is required (unlike ACCOUNT_USAGE views), consistent with
+    this project's least-privilege stance (AGENTS.md / DECISIONS.md #7). `generation` is a
+    real `SHOW WAREHOUSES` output column added by Snowflake behavior-change bundle
+    2025_07/bcr-2110 ("A positive integer, currently either `1` or `2`"); it's read back via
+    the documented `RESULT_SCAN(LAST_QUERY_ID(-1))` pattern since a `SHOW` command's own
+    output can't be wrapped directly in a `SELECT`.
+
+    No live Snowflake account was available to verify this against a real Gen2 warehouse
+    while implementing this (see this repo's isolated-worktree constraints) — treat the exact
+    SQL shape here as a documented-but-not-live-verified best effort; a real Gen2 warehouse
+    live-verification pass is an explicit follow-up for whoever has credentials.
+    """
+    if warehouse is None:
+        return None
+    try:
+        validated_warehouse = _validate_warehouse(warehouse)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SHOW WAREHOUSES LIKE '{validated_warehouse}'",
+                timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS,
+            )
+            cur.execute(
+                'SELECT "generation" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID(-1)))',
+                timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS,
+            )
+            generation_row = cur.fetchone()
+
+            cur.execute("SELECT CURRENT_REGION()", timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS)
+            region_row = cur.fetchone()
+    except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
+        return None
+
+    if generation_row is None or not isinstance(generation_row[0], str):
+        return None
+    generation = generation_row[0].strip()
+    if generation not in ("1", "2"):
+        return None
+
+    if region_row is None or not isinstance(region_row[0], str):
+        return None
+    # CURRENT_REGION() returns "<CLOUD>_<REGION>" (e.g. "AWS_US_WEST_2") for most accounts, or
+    # "<region-group>.<CLOUD>_<REGION>" (e.g. "PUBLIC.AWS_US_WEST_2") for accounts whose
+    # organization spans multiple region groups - both shapes are documented examples in
+    # Snowflake's own CURRENT_REGION() reference.
+    region = region_row[0].rsplit(".", 1)[-1]
+    cloud_provider = region.split("_", 1)[0].upper()
+    if cloud_provider not in _CLOUD_PROVIDERS:
+        return None
+
+    return generation, cloud_provider
+
+
 @sanitize_exceptions("snowflake")
 def explain_estimate(
     sql: str,
@@ -176,7 +251,31 @@ def explain_estimate(
         global_stats = plan["GlobalStats"]
         bytes_assigned = global_stats["bytesAssigned"]
 
-        rate = credits_per_hour(warehouse_size)
+        generation_info = _lookup_warehouse_generation(conn, warehouse)
+        if generation_info is not None:
+            generation, cloud_provider = generation_info
+            rate = credits_per_hour(
+                warehouse_size, generation=generation, cloud_provider=cloud_provider
+            )
+            if generation == "2":
+                generation_caveat = (
+                    f"Warehouse generation detected as Gen2 on {cloud_provider} — billed at "
+                    "Gen2's higher per-hour credit rate (per Snowflake's Service Consumption "
+                    "Table), not Gen1's."
+                )
+            else:
+                generation_caveat = (
+                    f"Warehouse generation detected as Gen1 on {cloud_provider} — billed at "
+                    "Gen1's per-hour credit rate."
+                )
+        else:
+            rate = credits_per_hour(warehouse_size)
+            generation_caveat = (
+                "Warehouse generation could not be determined (no warehouse specified, or "
+                "the generation/cloud-provider lookup failed) — assuming Gen1 credit rates; "
+                "actual cost will be higher than this estimate if the warehouse is really "
+                "Gen2."
+            )
         price = usd_per_credit(edition)
 
         historical = _lookup_historical_runtime(conn, sql)
@@ -210,6 +309,7 @@ def explain_estimate(
                     "bytesAssigned only reflects warehouse compute/scan, not AI-inference calls "
                     "inside the SQL."
                 ),
+                generation_caveat,
                 runtime_caveat,
             ],
         )
