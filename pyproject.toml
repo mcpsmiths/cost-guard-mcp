@@ -1,6 +1,6 @@
 [project]
 name = "cost-guard-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "Pre-flight query cost & result-size guardrails for AI agents across BigQuery, Snowflake, and Databricks"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -14,6 +14,12 @@ dependencies = [
     "databricks-sdk>=0.20.0",
     "pydantic>=2.9.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mcpsmiths/cost-guard-mcp"
+Repository = "https://github.com/mcpsmiths/cost-guard-mcp"
+Issues = "https://github.com/mcpsmiths/cost-guard-mcp/issues"
+Changelog = "https://github.com/mcpsmiths/cost-guard-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
 cost-guard-mcp = "cost_guard_mcp.server:main"
