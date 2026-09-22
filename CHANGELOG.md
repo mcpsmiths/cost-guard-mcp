@@ -6,6 +6,12 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-22
+
+Fixed: PyPI package metadata had no `project.urls`, so the PyPI package page showed no
+link back to GitHub (flagged by an MCP marketplace listing's automated scanner as a
+"package-verification" finding). Full detail: [`changelog/v0.3.1.md`](changelog/v0.3.1.md).
+
 ## [0.3.0] - 2026-09-18
 
 A CRITICAL Snowflake connector CVE fix, a Gen2 warehouse pricing-correctness fix, a working
@@ -28,7 +34,8 @@ Harness/governance docs, CI security tooling, and PyPI Trusted Publishing. Full 
 Initial release: BigQuery (`PRECISE`) + Snowflake (`UPPER_BOUND`) pre-flight cost
 guardrails. Full detail: [`changelog/v0.1.0.md`](changelog/v0.1.0.md).
 
-[Unreleased]: https://github.com/mcpsmiths/cost-guard-mcp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/mcpsmiths/cost-guard-mcp/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.3.1
 [0.3.0]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.3.0
 [0.2.0]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.2.0
 [0.1.1]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.1.1
