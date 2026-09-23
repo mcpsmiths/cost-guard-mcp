@@ -68,6 +68,21 @@ def test_load_snowflake_config_succeeds_with_key_pair(monkeypatch):
     assert config.password is None
 
 
+def test_load_snowflake_config_treats_empty_passphrase_env_as_none(monkeypatch):
+    # Regression test: GitHub Actions sets a workflow env var referencing a non-existent
+    # secret to an empty string, not unset - confirmed live against integration.yml's
+    # snowflake job, which raised "Password was given but private key is not encrypted"
+    # because "" was passed straight through as a real passphrase.
+    monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "abc123")
+    monkeypatch.setenv("SNOWFLAKE_USER", "svc_user")
+    monkeypatch.setenv("SNOWFLAKE_ROLE", "COST_GUARD_READER")
+    monkeypatch.setenv("SNOWFLAKE_PRIVATE_KEY_PATH", "/tmp/rsa_key.p8")
+    monkeypatch.setenv("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE", "")
+    monkeypatch.delenv("SNOWFLAKE_PASSWORD", raising=False)
+    config = load_snowflake_config()
+    assert config.private_key_passphrase is None
+
+
 def test_snowflake_config_does_not_leak_secrets_in_repr():
     passphrase_value = "test_passphrase_data_xyz"
     password_value = "test_password_data_xyz"
