@@ -1,10 +1,18 @@
 [project]
 name = "cost-guard-mcp"
-version = "0.3.0"
+version = "0.3.2"
 description = "Pre-flight query cost & result-size guardrails for AI agents across BigQuery, Snowflake, and Databricks"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
+# Only 3.12 is claimed - it's the only version pinned in .python-version, tested in CI
+# (tests.yml), and used in the Dockerfile base image. requires-python >=3.12 permits
+# newer interpreters, but nothing here actually verifies 3.13/3.14, so they are
+# deliberately not classified as supported.
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "mcp>=2.0.0",
     "google-cloud-bigquery>=3.25.0",
@@ -14,6 +22,12 @@ dependencies = [
     "databricks-sdk>=0.20.0",
     "pydantic>=2.9.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/mcpsmiths/cost-guard-mcp"
+Repository = "https://github.com/mcpsmiths/cost-guard-mcp"
+Issues = "https://github.com/mcpsmiths/cost-guard-mcp/issues"
+Changelog = "https://github.com/mcpsmiths/cost-guard-mcp/blob/main/CHANGELOG.md"
 
 [project.scripts]
 cost-guard-mcp = "cost_guard_mcp.server:main"
