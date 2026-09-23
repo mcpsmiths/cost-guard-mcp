@@ -4,14 +4,14 @@
 # public repos) for autofix + scheduled autoupdate - no GitHub Action needed.
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.16.7
+    rev: v0.16.8
     hooks:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
 
   - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: "0.12.13"
+    rev: "0.12.17"
     hooks:
       - id: uv-lock
       # uv-audit (runs `uv audit`) deliberately not included: `uv audit` isn't
