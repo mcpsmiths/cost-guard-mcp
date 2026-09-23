@@ -42,6 +42,15 @@ uv run pytest tests/integration/test_bigquery_live.py -v
 uv run pytest tests/integration/test_snowflake_live.py -v
 ```
 
+These also run in CI (`.github/workflows/integration.yml`) — weekly on a schedule, or
+on demand via `gh workflow run integration.yml` — against real accounts, using secrets
+configured in the `live-integration` GitHub Environment
+(`BIGQUERY_SA_KEY_JSON`/`BIGQUERY_PROJECT`, `SNOWFLAKE_ACCOUNT`/`USER`/`ROLE`/
+`PRIVATE_KEY`). No Databricks job exists there yet — only BigQuery and Snowflake. Not a
+required check; failures here don't block PRs, but a real one shouldn't be ignored. See
+`DECISIONS.md` for why real credentials live in a public repo's CI secrets and what
+scopes them down.
+
 ## Package manager
 
 Use `uv` only. Never `pip install` directly into this project — dependencies go in
