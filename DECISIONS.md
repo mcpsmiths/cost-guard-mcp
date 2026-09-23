@@ -125,3 +125,36 @@ after this migration — a real reduction in what a compromised CI run or leaked
 could do. Requires a one-time PyPI-side setup (Trusted Publisher config naming this repo
 and workflow file) before the first Trusted-Publishing release; see the comment at the
 top of `release.yml`.
+
+## 9. Real BigQuery/Snowflake credentials live in GitHub Actions secrets, scoped down
+
+**Context:** `integration.yml`'s scheduled live-account tests had been failing since
+creation (2026-09-14) because the `live-integration` GitHub Environment had zero secrets
+configured — nobody had ever provisioned them. Fixing that for real means putting actual
+production-adjacent cloud credentials into a **public** repo's CI secret store, which is
+a genuinely different risk profile than a local `.env` file.
+
+**Decision:** Scoped every credential down before adding it:
+- BigQuery: a dedicated service account (`cost-guard-ci`) with only `BigQuery Job User`
+  (`roles/bigquery.jobUser`) plus `BigQuery Resource Viewer`
+  (`roles/bigquery.resourceViewer`, needed only so `is_capacity_billed()`'s Reservations
+  API check can succeed) — confirmed live that it correctly cannot create datasets or
+  routines, which is intentional, not a bug to route around.
+- Snowflake: the same least-privilege, non-`ACCOUNTADMIN` role this project already
+  requires everywhere else (decision #7), reused rather than special-cased for CI.
+- Both secret sets live in the `live-integration` GitHub Environment (not repository-wide
+  secrets), so they're invisible to every other workflow in the repo.
+- No environment protection rules (required reviewers, branch restrictions) were added.
+  Deliberate, not an oversight: `integration.yml` only triggers on `schedule` (always runs
+  against the default branch's own workflow definition) and `workflow_dispatch` (already
+  gated by GitHub's own requirement that the triggering actor have write access) — never
+  on `pull_request`, so there is no fork-PR path that could exfiltrate these secrets by
+  proposing a modified workflow. A protection rule would add a manual-approval step with
+  no corresponding security benefit for these trigger types.
+
+**Consequences:** `integration.yml` now actually proves BigQuery/Snowflake connectivity
+weekly against real accounts instead of failing on missing secrets every time — but the
+scoped-down BigQuery service account genuinely cannot create its own test fixtures (see
+README's "Known limitations" - the `referencedRoutines` research question stays
+unresolved for exactly this reason). Any future addition to `integration.yml` needing
+broader access should get its own narrowly-scoped grant, not a widened role on this one.
