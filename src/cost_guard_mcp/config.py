@@ -70,7 +70,14 @@ def load_snowflake_config() -> SnowflakeConfig:
         user=user,
         role=role,
         private_key_path=private_key_path,
-        private_key_passphrase=os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE"),
+        # `or None` (not a bare os.environ.get()): GitHub Actions sets a workflow env var
+        # to an empty string, not unset, when the secret it references does not exist -
+        # confirmed live in CI (integration.yml's snowflake job) - and
+        # snowflake-connector-python treats an empty-but-non-None private_key_file_pwd as
+        # "a password was given", raising "Password was given but private key is not
+        # encrypted" against a real, unencrypted key. An empty passphrase is never
+        # meaningfully different from no passphrase.
+        private_key_passphrase=os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None,
         password=password,
     )
 

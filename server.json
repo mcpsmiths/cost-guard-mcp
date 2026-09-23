@@ -7,12 +7,12 @@
     "url": "https://github.com/mcpsmiths/cost-guard-mcp",
     "source": "github"
   },
-  "version": "0.3.0",
+  "version": "0.3.2",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "cost-guard-mcp",
-      "version": "0.3.0",
+      "version": "0.3.2",
       "transport": {
         "type": "stdio"
       },
