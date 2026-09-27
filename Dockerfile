@@ -6,7 +6,7 @@
 # patched in bookworm-security - astral-sh's image simply hadn't rebuilt to pick them up,
 # with no scheduled rebuild cadence to rely on (their images only rebuild as a side effect
 # of a new uv release, not the OS package's own patch cycle).
-FROM ghcr.io/astral-sh/uv:python3.12-trixie-slim@sha256:9a59bb7206905ccaae4f7dab222fbac47c125a21e5fc16f43f427cd6c940ade3
+FROM ghcr.io/astral-sh/uv:python3.12-trixie-slim@sha256:10b94fe3550b7a96e3982860bb82cdefba6300264a7a40bb9334acf21a450974
 
 WORKDIR /app
 
