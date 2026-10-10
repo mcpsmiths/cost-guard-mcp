@@ -13,7 +13,7 @@ component/data-flow map and `DECISIONS.md` for why the design looks the way it d
 ## Setup
 
 ```bash
-uv sync --all-extras
+uv sync --all-groups   # the otel dependency-group is needed for mypy and tests/unit/test_server.py
 ```
 
 ## Build, lint, test

@@ -30,85 +30,42 @@ from cost_guard_mcp.types import (
 
 mcp = MCPServer("cost-guard-mcp")
 
-
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Check Credentials", read_only_hint=True, open_world_hint=True
-    )
+# Registration shape matters beyond Python: the mcprush.com marketplace reads this
+# project's tool list statically from the repository (its "Read the tools again" control),
+# and that reader only recognises a single-line `@mcp.tool(...)` placed directly above the
+# `def` - the previous multi-line decorator with `@as_tool_error` stacked under it came
+# back as "found no tool declarations" (2026-10-10). So the annotations live in constants
+# and as_tool_error wraps the implementation functions instead; the registered tools, their
+# signatures and docstrings are unchanged (tools/list is byte-identical).
+_CHECK_CREDENTIALS_ANNOTATIONS = ToolAnnotations(
+    title="Check Credentials", read_only_hint=True, open_world_hint=True
 )
-@as_tool_error
-def check_credentials(engine: Engine, warehouse: str | None = None) -> CredentialCheckResult:
-    """Verify credentials/connectivity for an engine without running any real query or
-    dry-run estimate. Call this once after configuring a new engine (or when a real tool
-    call fails) to get a fast, clear yes/no signal instead of debugging via trial queries.
-    """
-    return _check_credentials(engine, warehouse)
-
-
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Describe Engine Capabilities", read_only_hint=True, open_world_hint=True
-    )
+_DESCRIBE_ENGINE_CAPABILITIES_ANNOTATIONS = ToolAnnotations(
+    title="Describe Engine Capabilities", read_only_hint=True, open_world_hint=True
 )
-@as_tool_error
-def describe_engine_capabilities(engine: Engine) -> EngineCapabilities:
-    """Declare which cost signals are exact vs. approximate for the given warehouse engine.
-
-    Call this before estimate_query_cost or run_query_bounded to understand how much to
-    trust the accuracy_tier on their responses for this engine.
-    """
-    return _describe_engine_capabilities(engine)
-
-
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Estimate Query Cost", read_only_hint=True, open_world_hint=True
-    )
+_ESTIMATE_QUERY_COST_ANNOTATIONS = ToolAnnotations(
+    title="Estimate Query Cost", read_only_hint=True, open_world_hint=True
 )
-@as_tool_error
-def estimate_query_cost(
+_RUN_QUERY_BOUNDED_ANNOTATIONS = ToolAnnotations(
+    title="Run Query Bounded", read_only_hint=False, open_world_hint=True
+)
+
+_check_credentials_safe = as_tool_error(_check_credentials)
+_describe_engine_capabilities_safe = as_tool_error(_describe_engine_capabilities)
+_estimate_query_cost_safe = as_tool_error(_estimate_query_cost)
+
+
+async def _run_query_bounded_in_thread(
     engine: Engine,
     sql: str,
-    warehouse: str | None = None,
-    warehouse_size: str | None = None,
-    edition: str | None = None,
-) -> CostEstimate:
-    """Estimate the cost of a SQL query before running it. ALWAYS call this before running
-    an expensive-looking query. The response's accuracy_tier tells you how much to trust
-    the number: PRECISE (exact), UPPER_BOUND (real cap, may overstate), HEURISTIC (rough).
-
-    warehouse_size (Snowflake/Databricks only, e.g. "SMALL", "X-Large") and edition
-    (Snowflake only, e.g. "enterprise") default to the smallest/standard tier if omitted —
-    set them to match the warehouse you actually run this query on, or the dollar figure
-    will understate cost on a larger warehouse."""
-    return _estimate_query_cost(engine, sql, warehouse, warehouse_size, edition)
-
-
-@mcp.tool(
-    annotations=ToolAnnotations(
-        title="Run Query Bounded", read_only_hint=False, open_world_hint=True
-    )
-)
-@as_tool_error
-async def run_query_bounded(
-    engine: Engine,
-    sql: str,
-    max_bytes_billed: int | None = None,
-    max_rows: int | None = None,
-    max_estimated_cost_usd: float | None = None,
-    warehouse: str | None = None,
-    warehouse_size: str | None = None,
-    edition: str | None = None,
+    max_bytes_billed: int | None,
+    max_rows: int | None,
+    max_estimated_cost_usd: float | None,
+    warehouse: str | None,
+    warehouse_size: str | None,
+    edition: str | None,
 ) -> BoundedQueryResult:
-    """Run a query only if its pre-flight cost estimate is within your given bounds; refuses
-    otherwise (check result.status — "refused" means it did NOT run and result.hint explains
-    why). NOTE: unlike estimate_query_cost, a successful call here has a real monetary/quota
-    side effect — don't call this repeatedly without inspecting the result of each call.
-
-    warehouse_size/edition (see estimate_query_cost) default to the smallest/standard tier
-    if omitted - set them to match the warehouse you actually run on, since max_estimated_cost_usd
-    is checked against the estimate they produce."""
-    # This tool is deliberately async so it can hand the actual blocking warehouse call to
+    # Deliberately async so it can hand the actual blocking warehouse call to
     # anyio.to_thread.run_sync() itself with abandon_on_cancel=True, instead of relying on
     # the mcp SDK's own implicit sync-wrapping (which calls anyio.to_thread.run_sync() with
     # its default abandon_on_cancel=False and would shield this call from an MCP client's
@@ -129,6 +86,80 @@ async def run_query_bounded(
         warehouse_size,
         edition,
         abandon_on_cancel=True,
+    )
+
+
+# Wrapping the async helper (not the sync implementation) keeps as_tool_error's async code
+# path, exactly as when it was stacked on the async tool itself.
+_run_query_bounded_safe = as_tool_error(_run_query_bounded_in_thread)
+
+
+@mcp.tool(annotations=_CHECK_CREDENTIALS_ANNOTATIONS)
+def check_credentials(engine: Engine, warehouse: str | None = None) -> CredentialCheckResult:
+    """Verify credentials/connectivity for an engine without running any real query or
+    dry-run estimate. Call this once after configuring a new engine (or when a real tool
+    call fails) to get a fast, clear yes/no signal instead of debugging via trial queries.
+    """
+    return _check_credentials_safe(engine, warehouse)
+
+
+@mcp.tool(annotations=_DESCRIBE_ENGINE_CAPABILITIES_ANNOTATIONS)
+def describe_engine_capabilities(engine: Engine) -> EngineCapabilities:
+    """Declare which cost signals are exact vs. approximate for the given warehouse engine.
+
+    Call this before estimate_query_cost or run_query_bounded to understand how much to
+    trust the accuracy_tier on their responses for this engine.
+    """
+    return _describe_engine_capabilities_safe(engine)
+
+
+@mcp.tool(annotations=_ESTIMATE_QUERY_COST_ANNOTATIONS)
+def estimate_query_cost(
+    engine: Engine,
+    sql: str,
+    warehouse: str | None = None,
+    warehouse_size: str | None = None,
+    edition: str | None = None,
+) -> CostEstimate:
+    """Estimate the cost of a SQL query before running it. ALWAYS call this before running
+    an expensive-looking query. The response's accuracy_tier tells you how much to trust
+    the number: PRECISE (exact), UPPER_BOUND (real cap, may overstate), HEURISTIC (rough).
+
+    warehouse_size (Snowflake/Databricks only, e.g. "SMALL", "X-Large") and edition
+    (Snowflake only, e.g. "enterprise") default to the smallest/standard tier if omitted —
+    set them to match the warehouse you actually run this query on, or the dollar figure
+    will understate cost on a larger warehouse."""
+    return _estimate_query_cost_safe(engine, sql, warehouse, warehouse_size, edition)
+
+
+@mcp.tool(annotations=_RUN_QUERY_BOUNDED_ANNOTATIONS)
+async def run_query_bounded(
+    engine: Engine,
+    sql: str,
+    max_bytes_billed: int | None = None,
+    max_rows: int | None = None,
+    max_estimated_cost_usd: float | None = None,
+    warehouse: str | None = None,
+    warehouse_size: str | None = None,
+    edition: str | None = None,
+) -> BoundedQueryResult:
+    """Run a query only if its pre-flight cost estimate is within your given bounds; refuses
+    otherwise (check result.status — "refused" means it did NOT run and result.hint explains
+    why). NOTE: unlike estimate_query_cost, a successful call here has a real monetary/quota
+    side effect — don't call this repeatedly without inspecting the result of each call.
+
+    warehouse_size/edition (see estimate_query_cost) default to the smallest/standard tier
+    if omitted - set them to match the warehouse you actually run on, since max_estimated_cost_usd
+    is checked against the estimate they produce."""
+    return await _run_query_bounded_safe(
+        engine,
+        sql,
+        max_bytes_billed,
+        max_rows,
+        max_estimated_cost_usd,
+        warehouse,
+        warehouse_size,
+        edition,
     )
 
 
