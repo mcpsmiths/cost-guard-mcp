@@ -6,6 +6,14 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-10
+
+Fixed: Snowflake private-key auth failed with "Password was given but private key is not
+encrypted" when `SNOWFLAKE_PRIVATE_KEY_PASSPHRASE` was set to an empty string (what CI does
+for an unset secret); the base image carried four HIGH Debian CVEs; urllib3/pyjwt advisories.
+Changed: tool declarations restructured so MCP directory readers find them (no behaviour
+change); dependency refresh incl. `mcp` 2.3.0. Full detail: [`changelog/v0.3.3.md`](changelog/v0.3.3.md).
+
 ## [0.3.2] - 2026-09-22
 
 Fixed: PyPI package metadata had no `classifiers`, so shields.io's Python-version badge
