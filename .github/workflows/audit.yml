@@ -23,4 +23,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
       - run: uv export --no-hashes --format requirements-txt -o requirements.txt
-      - run: uvx pip-audit@2.10.1 --requirement requirements.txt
+      # PYSEC-2026-4114 (CVE-2026-49265, oauthlib <4.0.0): a PKCE code_verifier timing
+      # attack on the OAuth *authorization-server* side. This project is only an OAuth
+      # client (Databricks M2M via databricks-sdk) and never executes oauthlib; the fix,
+      # oauthlib 4.0.0, is pinned out by databricks-sql-connector (oauthlib<4.0.0 through
+      # its current 4.6.0), so no lock bump can reach it. Accepted 2026-10-10 so this
+      # check stays meaningful for the next real advisory. Re-check by 2026-12-01: drop the
+      # ignore as soon as databricks-sql-connector allows oauthlib>=4 (uv lock
+      # --upgrade-package oauthlib will then move it), or re-justify here.
+      - run: uvx pip-audit@2.10.1 --requirement requirements.txt --ignore-vuln PYSEC-2026-4114
