@@ -7,7 +7,7 @@ from databricks.sdk.core import Config, oauth_service_principal
 from databricks.sdk.credentials_provider import OAuthCredentialsProvider
 
 from cost_guard_mcp.config import load_databricks_config
-from cost_guard_mcp.errors import redact_secrets, sanitize_exceptions
+from cost_guard_mcp.errors import present_remote_text, redact_secrets, sanitize_exceptions
 from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
 from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
@@ -77,7 +77,10 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
                 raise RuntimeError("SELECT current_user() returned no rows")
             current_user = row[0]
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
-        return CredentialCheckResult(engine="databricks", ok=False, detail=redact_secrets(str(exc)))
+        raw_detail = str(exc)
+        safe_detail = present_remote_text(redact_secrets(raw_detail), total_chars=len(raw_detail))
+        logger.warning("engine=databricks check_credentials_failed detail=%s", safe_detail)
+        return CredentialCheckResult(engine="databricks", ok=False, detail=safe_detail)
     finally:
         # conn is None if _connect() itself raised — nothing to close in that case. A failed
         # close() is best-effort and must never mask the success return below.

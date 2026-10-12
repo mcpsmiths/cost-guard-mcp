@@ -4,7 +4,12 @@ import re
 
 from google.cloud import bigquery, bigquery_reservation_v1
 
-from cost_guard_mcp.errors import SanitizedEngineError, redact_secrets, sanitize_exceptions
+from cost_guard_mcp.errors import (
+    SanitizedEngineError,
+    present_remote_text,
+    redact_secrets,
+    sanitize_exceptions,
+)
 from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
@@ -242,7 +247,10 @@ def check_credentials(project: str | None = None) -> CredentialCheckResult:
         client = bigquery.Client(project=project)
         service_account_email = client.get_service_account_email()
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
-        return CredentialCheckResult(engine="bigquery", ok=False, detail=redact_secrets(str(exc)))
+        raw_detail = str(exc)
+        safe_detail = present_remote_text(redact_secrets(raw_detail), total_chars=len(raw_detail))
+        logger.warning("engine=bigquery check_credentials_failed detail=%s", safe_detail)
+        return CredentialCheckResult(engine="bigquery", ok=False, detail=safe_detail)
 
     return CredentialCheckResult(
         engine="bigquery",

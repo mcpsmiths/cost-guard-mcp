@@ -7,7 +7,12 @@ import uuid
 import snowflake.connector
 
 from cost_guard_mcp.config import load_snowflake_config
-from cost_guard_mcp.errors import SanitizedEngineError, redact_secrets, sanitize_exceptions
+from cost_guard_mcp.errors import (
+    SanitizedEngineError,
+    present_remote_text,
+    redact_secrets,
+    sanitize_exceptions,
+)
 from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
 from cost_guard_mcp.types import (
@@ -418,8 +423,10 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     result here, not an error condition — this function always returns a
     CredentialCheckResult (never raises for a credential/connectivity failure) so a caller
     can distinguish "not configured yet" from "actually broken" before attempting a real
-    estimate_query_cost/run_query_bounded call. redact_secrets is applied defensively even
-    though _connect() already redacts its own failures — it is a no-op on already-safe text.
+    estimate_query_cost/run_query_bounded call. The failure detail goes through the same
+    redact_secrets -> present_remote_text chain as every other outbound error text (bounded,
+    repr()-quoted) and is recorded as one WARNING - also when _connect() already sanitized
+    its own failure, where re-presenting the already-safe text just adds a layer of quotes.
     """
     conn: snowflake.connector.SnowflakeConnection | None = None
     try:
@@ -433,7 +440,10 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
                 raise SanitizedEngineError("session context query returned no rows")
             role, current_warehouse, account = row
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
-        return CredentialCheckResult(engine="snowflake", ok=False, detail=redact_secrets(str(exc)))
+        raw_detail = str(exc)
+        safe_detail = present_remote_text(redact_secrets(raw_detail), total_chars=len(raw_detail))
+        logger.warning("engine=snowflake check_credentials_failed detail=%s", safe_detail)
+        return CredentialCheckResult(engine="snowflake", ok=False, detail=safe_detail)
     finally:
         # conn is None if _connect() itself raised — nothing to close in that case. A failed
         # close() is best-effort and must never mask the success return below.

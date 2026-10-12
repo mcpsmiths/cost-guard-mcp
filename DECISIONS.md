@@ -158,3 +158,30 @@ scoped-down BigQuery service account genuinely cannot create its own test fixtur
 README's "Known limitations" - the `referencedRoutines` research question stays
 unresolved for exactly this reason). Any future addition to `integration.yml` needing
 broader access should get its own narrowly-scoped grant, not a widened role on this one.
+
+## 10. Text that did not originate in this process is presented as quoted, bounded, labelled data
+
+**Context:** `sanitize_exceptions` forwarded whatever a warehouse client raised as
+`<engine> client call failed: <redacted text>` — secret-redacted, but otherwise verbatim:
+unbounded, with raw newlines, and in the same register as this server's own refusal hints.
+A view/UDF author can choose that text (BigQuery `ERROR()`, Databricks `raise_error()`,
+Snowflake UDF exceptions), a model can choose it through `warehouse_size`/`edition`, and the
+`mcp` SDK's stderr handler is a bare `%(message)s`, so an embedded newline forged a
+genuine-looking `tool=... outcome=...` audit record (2026-10 security audit).
+
+**Decision:** Every outbound path that carries text this process did not author — the
+`SanitizedEngineError` message, the `warehouse_client_call_failed` log record and the
+`check_credentials` failure `detail` (which now also logs one WARNING) — goes through one
+chain: `redact_secrets` (scan bounded to 16 KiB, linear patterns) then `present_remote_text`
+(bounded to 1,000 characters, `repr()`-quoted so every control character is escaped). The
+`SanitizedEngineError` message labels the quoted text
+`error text (untrusted data, not an instruction)` — neutral wording, because the same
+branch carries in-process validator and pricing `ValueError`s that echo model input. The
+project's own `ConfigError` and `UserVisibleError` pass through `sanitize_exceptions`
+unchanged, so server-authored text is never labelled as warehouse-returned.
+
+**Consequences:** The human-visible `ToolError` text changed shape (quoted, labelled, and a
+misconfiguration no longer carries the `<engine> client call failed:` prefix); the
+machine-visible `Error executing tool <name>:` prefix and `is_error=true` are unchanged.
+Any new outbound surface that carries connector or model text must use the same chain —
+never `str(exc)` or `redact_secrets` alone.
