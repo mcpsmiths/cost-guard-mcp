@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import inspect
 import logging
@@ -665,3 +666,106 @@ def test_sanitize_exceptions_passes_user_visible_error_through_unchanged():
 
     with pytest.raises(UserVisibleError, match="not yet supported"):
         boom()
+
+
+# Regression tests: every as_tool_error-wrapped call, sync OR async, emits exactly one
+# 'tool=<name> outcome=<success|error|cancelled> elapsed_ms=<n>' record on every exit path.
+# Before the fix the async wrapper - the one run_query_bounded, the only billable tool, goes
+# through - emitted none, so operator-paid executions left no audit line (audit:
+# as-tool-error-async-wrapper-omits-tool-outcome-log:src/cost_guard_mcp/errors.py).
+
+
+async def test_as_tool_error_logs_exactly_one_success_record_for_async_func(caplog):
+    @as_tool_error
+    async def some_tool(x):
+        return x * 2
+
+    with caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME):
+        result = await some_tool(21)
+
+    assert result == 42
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    assert "tool=some_tool" in records[0].message
+    assert "outcome=success" in records[0].message
+
+
+async def test_as_tool_error_logs_exactly_one_error_record_for_async_sanitized_error(caplog):
+    @as_tool_error
+    async def some_tool():
+        raise SanitizedEngineError("snowflake client call failed: safe redacted message")
+
+    with (
+        caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(ToolError, match="safe redacted message"),
+    ):
+        await some_tool()
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert "tool=some_tool" in records[0].message
+    assert "outcome=error" in records[0].message
+
+
+async def test_as_tool_error_logs_exactly_one_error_record_for_async_unanticipated_exception(
+    caplog,
+):
+    @as_tool_error
+    async def some_tool():
+        raise KeyError("genuinely unexpected")
+
+    with (
+        caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(KeyError),
+    ):
+        await some_tool()
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert "outcome=error" in records[0].message
+
+
+async def test_as_tool_error_logs_exactly_one_error_record_for_async_tool_error_passthrough(
+    caplog,
+):
+    @as_tool_error
+    async def some_tool():
+        raise ToolError("already a tool error")
+
+    with (
+        caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(ToolError, match="already a tool error"),
+    ):
+        await some_tool()
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert "outcome=error" in records[0].message
+
+
+async def test_as_tool_error_logs_exactly_one_cancelled_record_for_a_cancelled_async_func(
+    caplog,
+):
+    # Amendment A5: an MCP `notifications/cancelled` reaches the tool body as
+    # asyncio.CancelledError - a BaseException none of the mirrored sync branches see. It is
+    # the one way the billable tool can end early, so it must leave exactly one record too.
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    @as_tool_error
+    async def some_tool():
+        started.set()
+        await release.wait()
+
+    with caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME):
+        task = asyncio.create_task(some_tool())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    assert "tool=some_tool" in records[0].message
+    assert "outcome=cancelled" in records[0].message

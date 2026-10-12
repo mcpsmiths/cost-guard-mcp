@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import inspect
 import logging
@@ -184,6 +185,10 @@ def as_tool_error[**P, T](func: Callable[P, T]) -> Callable[P, T]:
     silently handing a sync-looking wrapper to the SDK's implicit-sync-wrapping thread pool -
     which would both defeat the point of an async tool body and never actually run it (a sync
     wrapper calling an async `func` would just produce an unawaited coroutine object).
+
+    Both wrappers emit exactly one `tool=<name> outcome=<...> elapsed_ms=<n>` record per call
+    on every exit path - the async one also when the call is cancelled, the exit only an
+    async tool can take.
     """
 
     if inspect.iscoroutinefunction(func):
@@ -191,12 +196,33 @@ def as_tool_error[**P, T](func: Callable[P, T]) -> Callable[P, T]:
 
         @functools.wraps(func)
         async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
+            tool_name = func.__name__
+            start = time.monotonic()
             try:
-                return await async_func(*args, **kwargs)
+                result = await async_func(*args, **kwargs)
             except ToolError:
+                _log_tool_outcome(tool_name, start, "error")
                 raise
             except (SanitizedEngineError, ConfigError, UserVisibleError) as exc:
+                _log_tool_outcome(tool_name, start, "error")
                 raise ToolError(str(exc)) from exc
+            except Exception:
+                # Mirrors the sync wrapper's bare re-raise below: the exception is untouched,
+                # this branch exists purely to log the outcome.
+                _log_tool_outcome(tool_name, start, "error")
+                raise
+            except BaseException as exc:
+                # The fifth exit path an async tool has and a sync one does not: an MCP
+                # `notifications/cancelled` arrives here as asyncio.CancelledError, a
+                # BaseException none of the branches above see. run_query_bounded - the only
+                # billable tool, whose warehouse-side query may well still be running after the
+                # cancel detaches - must leave an audit record on that exit too.
+                outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+                _log_tool_outcome(tool_name, start, outcome)
+                raise
+            else:
+                _log_tool_outcome(tool_name, start, "success")
+                return result
 
         return cast(Callable[P, T], async_wrapper)
 

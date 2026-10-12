@@ -40,6 +40,15 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   labelled as warehouse-returned. The machine-visible `Error executing tool <name>:` prefix
   and `is_error=true` are unchanged.
 
+### Fixed
+
+- **`run_query_bounded` now emits its per-call outcome record.** `as_tool_error`'s async
+  wrapper - the path the only billable tool takes - never logged, so successful
+  operator-paid executions left no `tool=run_query_bounded outcome=success` line while
+  refusals and failures were recorded (an inverted audit trail). The async wrapper now
+  mirrors the sync one on every exit path, adds `outcome=cancelled` for an MCP client
+  cancellation, and the record names the registered tool rather than its thread helper.
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not

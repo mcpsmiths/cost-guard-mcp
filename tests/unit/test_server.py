@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -71,7 +72,7 @@ def test_call_tool_estimate_query_cost_end_to_end(mock_bq_module, _mock_capacity
 
 @patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
 @patch("cost_guard_mcp.engines.bigquery.bigquery")
-def test_call_tool_run_query_bounded_end_to_end(mock_bq_module, _mock_capacity):
+def test_call_tool_run_query_bounded_end_to_end(mock_bq_module, _mock_capacity, caplog):
     mock_client = MagicMock()
     mock_client.project = "my-project"
     mock_query_job = MagicMock()
@@ -86,12 +87,19 @@ def test_call_tool_run_query_bounded_end_to_end(mock_bq_module, _mock_capacity):
     mock_bq_module.Client.return_value = mock_client
     mock_bq_module.QueryJobConfig.return_value = MagicMock()
 
-    result = _call_tool(
-        "run_query_bounded", {"engine": "bigquery", "sql": "SELECT 1", "max_rows": 5}
-    )
+    with caplog.at_level(logging.INFO, logger="cost_guard_mcp.errors"):
+        result = _call_tool(
+            "run_query_bounded", {"engine": "bigquery", "sql": "SELECT 1", "max_rows": 5}
+        )
 
     assert result.structured_content["status"] == "ok"
     assert result.structured_content["row_count"] == 1
+    # The per-call outcome record is emitted exactly once on the SDK-dispatched path and
+    # names the registered tool, not the thread helper as_tool_error actually wraps.
+    outcome_records = [r for r in caplog.records if r.name == "cost_guard_mcp.errors"]
+    assert len(outcome_records) == 1
+    assert "tool=run_query_bounded" in outcome_records[0].message
+    assert "outcome=success" in outcome_records[0].message
 
 
 @patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)

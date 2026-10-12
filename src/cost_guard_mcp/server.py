@@ -90,7 +90,11 @@ async def _run_query_bounded_in_thread(
 
 
 # Wrapping the async helper (not the sync implementation) keeps as_tool_error's async code
-# path, exactly as when it was stacked on the async tool itself.
+# path, exactly as when it was stacked on the async tool itself. The helper is renamed first
+# so the per-call outcome record (functools.wraps copies __name__ at wrap time) reads
+# `tool=run_query_bounded` - the registered tool - rather than naming this thread helper;
+# nothing else reads that __name__.
+_run_query_bounded_in_thread.__name__ = "run_query_bounded"
 _run_query_bounded_safe = as_tool_error(_run_query_bounded_in_thread)
 
 

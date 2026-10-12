@@ -154,7 +154,9 @@ DATABRICKS_TOKEN = "your-personal-access-token"
   server relies on — never redirect these loggers to stdout. What gets logged:
   - Every tool call (`check_credentials`, `describe_engine_capabilities`,
     `estimate_query_cost`, `run_query_bounded`) logs one INFO record on completion:
-    `tool=<name> outcome=<success|error> elapsed_ms=<n>`.
+    `tool=<name> outcome=<success|error|cancelled> elapsed_ms=<n>` — `cancelled` when the
+    MCP client cancelled the call before it finished (only `run_query_bounded` can take that
+    exit, and its warehouse-side query may still be running; see Known limitations).
   - Every warehouse-client failure (BigQuery/Snowflake/Databricks) logs one WARNING record:
     `engine=<engine> warehouse_client_call_failed message=<presented>` — `message` is the
     same secret-redacted, length-bounded (1,000 characters, then a
