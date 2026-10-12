@@ -485,3 +485,14 @@ def test_every_env_var_read_in_src_is_documented_in_both_manifests():
         f"read in src/ but missing from .mcp.json.example: "
         f"{sorted(expected_in_example - example_env)}"
     )
+
+
+# --- plan-review amendment A14: credential files must never be committable -----------------
+
+
+def test_gitignore_covers_private_keys_and_mcp_host_credentials():
+    # README tells operators to create a project-root .mcp.json holding real credentials and
+    # to point SNOWFLAKE_PRIVATE_KEY_PATH at a *.p8 file; neither may ever be committable.
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    ignored = {line.strip() for line in gitignore}
+    assert {"*.p8", "*.pem", "*.key", ".mcp.json", "credentials*.json", ".env"} <= ignored

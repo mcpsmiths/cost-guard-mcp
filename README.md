@@ -45,7 +45,7 @@ priced accurately — see Known Limitations.
 
 ### A note on credentials with MCP hosts
 
-Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as its own subprocess — it does **not** automatically inherit your shell's environment variables, even if they're set in your `.zshrc`/`.bashrc`. Put them directly in the host's server config instead — see [`.mcp.json.example`](.mcp.json.example) for the exact block, and the "Use with other AI coding tools" section below for where each specific tool wants it.
+Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as its own subprocess — it does **not** automatically inherit your shell's environment variables, even if they're set in your `.zshrc`/`.bashrc`. Put them directly in the host's server config instead — see [`.mcp.json.example`](.mcp.json.example) for the exact block, and the "Use with other AI coding tools" section below for where each specific tool wants it. This repository's `.gitignore` already excludes `.mcp.json`, `*.p8`/`*.pem`/`*.key` and `credentials*.json`, so a project-root host config or key file holding real credentials is never committed by accident.
 
 ## Install
 

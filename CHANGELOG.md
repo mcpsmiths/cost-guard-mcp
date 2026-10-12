@@ -62,6 +62,9 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   this PyPI project, and a unit test requires every environment variable read in `src/` to
   be documented in `server.json` and `.mcp.json.example`; the MCP Registry publishing
   channel itself is recorded as a proposed decision (DECISIONS.md #12).
+- **Security (hygiene):** `.gitignore` now excludes `*.p8`, `*.pem`, `*.key`, `.mcp.json` and
+  `credentials*.json` - the credential files README tells operators to create at the
+  project root.
 
 ## [0.3.3] - 2026-10-10
 

@@ -10,3 +10,10 @@ dist/
 .coverage
 .gstack/
 scratch-pad/
+# Credential files an operator may create at the project root (README, "A note on
+# credentials with MCP hosts"): never committable, whatever the host layout.
+*.p8
+*.pem
+*.key
+.mcp.json
+credentials*.json
