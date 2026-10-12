@@ -52,8 +52,16 @@ otel = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+# Exact pin, mirrored in [tool.uv] build-constraint-dependencies below and recorded in
+# uv.lock's [manifest]: the backend executes during every build (uv build, the editable
+# install inside uv sync, the Docker build), so it must only move through a reviewed diff.
+# Dependabot does not bump this line; tests/unit/test_release_metadata.py pins the
+# equality. See DECISIONS.md #11.
+requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
+
+[tool.uv]
+build-constraint-dependencies = ["hatchling==1.32.4"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cost_guard_mcp"]

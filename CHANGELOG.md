@@ -49,6 +49,11 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   mirrors the sync one on every exit path, adds `outcome=cancelled` for an MCP client
   cancellation, and the record names the registered tool rather than its thread helper.
 
+- **Security (supply chain):** the build backend is pinned (`hatchling==1.32.4`, also as a
+  uv build constraint recorded in `uv.lock`) and every CI `setup-uv` step pins uv 0.12.23,
+  equal to the pre-commit `uv-lock` rev, so a new hatchling or uv release can no longer
+  change the published, attested artifacts without a repository diff (DECISIONS.md #11).
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not

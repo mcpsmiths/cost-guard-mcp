@@ -159,6 +159,42 @@ README's "Known limitations" - the `referencedRoutines` research question stays
 unresolved for exactly this reason). Any future addition to `integration.yml` needing
 broader access should get its own narrowly-scoped grant, not a widened role on this one.
 
+## 11. Build inputs are pinned by reviewed source: `hatchling==1.32.4` and uv 0.12.23
+
+**Context:** A security audit (2026-10) found that the two inputs which execute during every
+build floated: `[build-system] requires = ["hatchling"]` carried no version and was absent
+from `uv.lock`, and none of the seven `astral-sh/setup-uv` steps had a `version:` input, so
+the uv binary was whatever the action resolved at run time. Every other build input -
+runtime dependencies (hash-locked), actions (SHA-pinned), the Docker base image
+(digest-pinned) - already moves only through a reviewed diff. A PEP 517 backend and the
+build tool have unrestricted control over the bytes `uv build` writes to `dist/`, which
+`release.yml` then signs (PEP 740), publishes under Trusted Publishing and attests (SLSA) as
+if the repository had produced them; the SBOM (`uv export`) cannot even name the backend.
+
+**Decision:**
+- `[build-system] requires = ["hatchling==1.32.4"]` - the version the v0.3.3 wheel's `WHEEL`
+  file records as `Generator` - mirrored in `[tool.uv] build-constraint-dependencies` and
+  thereby recorded in `uv.lock`'s `[manifest]`, so `uv build`, the editable install inside
+  `uv sync` (tests.yml, integration.yml) and `uv sync --frozen` (Dockerfile) all resolve the
+  same backend.
+- Every `setup-uv` step pins `with: version: "0.12.23"`, the same value as
+  `.pre-commit-config.yaml`'s `uv-pre-commit` rev: the uv that produces `uv.lock` is the uv
+  that consumes it, in the publish job holding the PyPI OIDC token included.
+- `tests/unit/test_release_metadata.py` asserts both pins, the lock's `[manifest]` entry and
+  the workflow/pre-commit equality, so none of them can move alone.
+- Deliberately not adopted yet: `[tool.uv] required-version`, which would also reject the
+  maintainer's local uv (0.10.7 at the time of writing), and a hash-pinned
+  `build-constraints.txt` with `uv build --require-hashes` for the release build - a
+  follow-up once the version pins have settled.
+
+**Consequences:** Dependabot bumps neither `[build-system].requires` nor a `with: version:`
+input, and pre-commit.ci's autoupdate moves only the `rev`, so a pre-commit autoupdate PR
+now fails the unit suite until the seven workflow pins are bumped in the same PR - intended
+coupling, not a flake. The update path is a quarterly `chore(deps)` that bumps hatchling,
+`uv-pre-commit` and the workflow pins together and re-runs `uv lock` with the new uv.
+Locking with uv 0.12.23 moved `uv.lock` to lock-file revision 5 (no package, version or hash
+changed); the locally installed uv 0.10.7 reads it unchanged.
+
 ## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
 
 **Context:** `sanitize_exceptions` forwarded whatever a warehouse client raised as
