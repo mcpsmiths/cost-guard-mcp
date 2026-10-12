@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from google.api_core.exceptions import BadRequest, InternalServerError
 
+from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines.bigquery import (
     ProviderByteCapExceeded,
     check_credentials,
@@ -435,7 +436,11 @@ def test_execute_bounded_passes_timeout_to_result(mock_bq_module):
 
     execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=None)
 
-    mock_query_job.result.assert_called_once_with(timeout=120)
+    # job_retry=None at result() too (not only at client.query): QueryJob.result resolves
+    # job_retry from the client.query call when left at its default, so passing None at
+    # both sites keeps 'the billed query is never re-submitted by the library' independent
+    # of that internal plumbing.
+    mock_query_job.result.assert_called_once_with(timeout=120, job_retry=None)
 
 
 @patch("cost_guard_mcp.engines.bigquery.bigquery")
@@ -536,3 +541,86 @@ def test_execute_bounded_leaves_other_provider_errors_as_sanitized_engine_error(
         execute_bounded("SELEC 1", max_bytes_billed=None, max_rows=None)
 
     assert not isinstance(excinfo.value, ProviderByteCapExceeded)
+
+
+# Regression tests for the bounded BigQuery API retry/timeout (audit fingerprint
+# bigquery-readonly-paths-inherit-default-retry-600s-no-project-deadline). Without explicit
+# kwargs every call site inherits google-cloud-bigquery's DEFAULT_RETRY (600 s deadline, no
+# per-request timeout) and client.query() additionally wraps jobs.insert in a hard-coded
+# 600 s job-level retry whenever job_retry is not None - so a read-only tool could block
+# uncancellably for ~10-20 min offline and an abandoned run_query_bounded thread could still
+# submit the billed job minutes after the host cancelled it.
+
+
+def test_api_wait_bound_stays_within_documented_execution_bound():
+    # Guards a future constant edit: the README promises tool calls settle within 120 s, so
+    # the API-phase bound (job begin, service-account lookup, Reservations search) must stay
+    # inside the execution watchdog, and _API_RETRY must actually carry that bound.
+    assert bigquery_engine._MAX_API_WAIT_SECONDS <= bigquery_engine._MAX_EXECUTION_WAIT_SECONDS
+    assert bigquery_engine._API_RETRY._timeout == bigquery_engine._MAX_API_WAIT_SECONDS
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_check_credentials_bounds_client_retry_and_timeout(mock_bq_module):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.get_service_account_email.return_value = "sa@my-project.iam.gserviceaccount.com"
+    mock_bq_module.Client.return_value = mock_client
+
+    check_credentials()
+
+    kwargs = mock_client.get_service_account_email.call_args.kwargs
+    assert kwargs["retry"] is bigquery_engine._API_RETRY
+    assert kwargs["timeout"] == bigquery_engine._MAX_API_WAIT_SECONDS
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_bounds_client_retry_and_disables_job_retry(mock_bq_module, _mock_capacity):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(total_bytes_processed=500)
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    dry_run("SELECT * FROM t")
+
+    kwargs = mock_client.query.call_args.kwargs
+    assert kwargs["retry"] is bigquery_engine._API_RETRY
+    assert kwargs["timeout"] == bigquery_engine._MAX_API_WAIT_SECONDS
+    # job_retry=None is mandatory, not just "a bounded job retry": a DEFAULT_JOB_RETRY with a
+    # shorter timeout still makes the library run its hard-coded 600 s jobs.insert wrapper.
+    assert "job_retry" in kwargs
+    assert kwargs["job_retry"] is None
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_bounds_job_begin_retry_and_disables_job_retry(mock_bq_module):
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([])
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=None)
+
+    kwargs = mock_client.query.call_args.kwargs
+    assert kwargs["retry"] is bigquery_engine._API_RETRY
+    assert kwargs["timeout"] == bigquery_engine._MAX_API_WAIT_SECONDS
+    assert "job_retry" in kwargs
+    assert kwargs["job_retry"] is None
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery_reservation_v1")
+def test_is_capacity_billed_bounds_reservation_search_timeout(mock_reservation_module):
+    mock_client = MagicMock()
+    mock_client.search_all_assignments.return_value = []
+    mock_reservation_module.ReservationServiceClient.return_value = mock_client
+
+    is_capacity_billed("my-project")
+
+    kwargs = mock_client.search_all_assignments.call_args.kwargs
+    assert kwargs["timeout"] == bigquery_engine._MAX_API_WAIT_SECONDS

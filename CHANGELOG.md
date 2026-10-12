@@ -158,6 +158,14 @@ the session value wins.
   of deferring to the operator's account/user `MULTI_STATEMENT_COUNT`. No documented
   behaviour changes - multi-statement Snowflake text was never supported.
 
+### Fixed
+
+- BigQuery API round-trips (service-account lookup, dry-run and execution job submission,
+  Reservations search) inherited google-cloud-bigquery's 600 s default retry plus a nested
+  600 s job-insert retry, so the read-only tools could block for 10-20 minutes while Google
+  was unreachable and an abandoned `run_query_bounded` thread could still submit the billed
+  job minutes after a host cancel. Every call now carries a 30 s bound and `job_retry=None`.
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not

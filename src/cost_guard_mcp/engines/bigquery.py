@@ -4,6 +4,7 @@ import re
 
 from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import bigquery, bigquery_reservation_v1
+from google.cloud.bigquery.retry import DEFAULT_RETRY
 
 from cost_guard_mcp.errors import (
     SanitizedEngineError,
@@ -47,7 +48,8 @@ def is_capacity_billed(project: str, location: str = "US") -> bool:
     # this exact `assignee=` filter format. Verified against a real project (2026-09-13) —
     # confirms the gap this project's own plan flagged as an unverified spike.
     assignments = client.search_all_assignments(
-        request={"parent": parent, "query": f"assignee=projects/{project}"}
+        request={"parent": parent, "query": f"assignee=projects/{project}"},
+        timeout=_MAX_API_WAIT_SECONDS,
     )
     return any(assignments)
 
@@ -96,7 +98,13 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
     totalBytesProcessedAccuracy says otherwise, or the project is capacity-billed."""
     client = bigquery.Client(project=project)
     job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
-    query_job = client.query(sql, job_config=job_config)
+    query_job = client.query(
+        sql,
+        job_config=job_config,
+        retry=_API_RETRY,
+        timeout=_MAX_API_WAIT_SECONDS,
+        job_retry=None,
+    )
 
     total_bytes_processed = query_job.total_bytes_processed or 0
     raw_accuracy = (
@@ -227,6 +235,20 @@ def _is_bytes_billed_limit_exceeded(exc: GoogleAPICallError) -> bool:
 # indefinitely, which defeats the point of a "bounded" execution tool.
 _MAX_EXECUTION_WAIT_SECONDS = 120
 
+# Bound on every *other* BigQuery API round-trip this module makes - the service-account
+# lookup, the dry-run and execution job submissions (jobs.insert), and the Reservations
+# search. Without an explicit retry/timeout each of those inherits google-cloud-bigquery's
+# DEFAULT_RETRY (a 600 s deadline with no per-request timeout), and client.query() wraps
+# jobs.insert in a second, hard-coded 600 s job-level retry whenever job_retry is not None -
+# so a read-only tool could block for ~10-20 minutes while Google is unreachable, and an
+# abandoned run_query_bounded thread could still submit the billed job minutes after the
+# host cancelled it. 30 s here plus the 120 s result() wait above stays inside the README's
+# "tool calls can run up to 120 seconds" claim for the phase that actually bills. job_retry
+# must be None (not a shorter DEFAULT_JOB_RETRY): the library applies its own 600 s insert
+# wrapper for any non-None value.
+_MAX_API_WAIT_SECONDS = 30
+_API_RETRY = DEFAULT_RETRY.with_timeout(_MAX_API_WAIT_SECONDS)
+
 
 @sanitize_exceptions("bigquery")
 def execute_bounded(
@@ -257,13 +279,22 @@ def execute_bounded(
         else bigquery.QueryJobConfig()
     )
     try:
-        query_job = client.query(wrapped_sql, job_config=job_config)
+        query_job = client.query(
+            wrapped_sql,
+            job_config=job_config,
+            retry=_API_RETRY,
+            timeout=_MAX_API_WAIT_SECONDS,
+            job_retry=None,
+        )
     except GoogleAPICallError as exc:
         if _is_bytes_billed_limit_exceeded(exc):
             raise ProviderByteCapExceeded(max_bytes_billed) from None
         raise
     try:
-        rows = [dict(row) for row in query_job.result(timeout=_MAX_EXECUTION_WAIT_SECONDS)]
+        rows = [
+            dict(row)
+            for row in query_job.result(timeout=_MAX_EXECUTION_WAIT_SECONDS, job_retry=None)
+        ]
     except GoogleAPICallError as exc:
         if _is_bytes_billed_limit_exceeded(exc):
             raise ProviderByteCapExceeded(max_bytes_billed) from None
@@ -302,7 +333,9 @@ def check_credentials(project: str | None = None) -> CredentialCheckResult:
     """
     try:
         client = bigquery.Client(project=project)
-        service_account_email = client.get_service_account_email()
+        service_account_email = client.get_service_account_email(
+            retry=_API_RETRY, timeout=_MAX_API_WAIT_SECONDS
+        )
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
         raw_detail = str(exc)
         safe_detail = present_remote_text(redact_secrets(raw_detail), total_chars=len(raw_detail))
