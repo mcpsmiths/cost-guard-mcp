@@ -1,5 +1,9 @@
+import base64
+import datetime
 import logging
 import math
+import uuid
+from decimal import Decimal
 
 from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines import databricks as databricks_engine
@@ -11,6 +15,48 @@ from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
 
 logger = logging.getLogger(__name__)
+
+# Cell types pydantic serialises natively in JSON mode (Decimal -> str, datetime/date/time ->
+# ISO 8601, timedelta -> ISO 8601 duration, UUID -> str); passed through untouched.
+_PYDANTIC_NATIVE_CELL_TYPES = (
+    Decimal,
+    datetime.datetime,
+    datetime.date,
+    datetime.time,
+    datetime.timedelta,
+    uuid.UUID,
+)
+
+
+def _json_safe_value(value: object) -> object:
+    """Normalise one connector-native cell so the mcp SDK can always serialise it.
+
+    Runs AFTER the billed query has executed, so it must never raise and must cover every
+    engine's native row values: bytes-like cells (BigQuery BYTES, Snowflake/Databricks
+    BINARY) become base64 text instead of tripping pydantic's default utf8 bytes mode;
+    NaN/Inf become explicit strings instead of JSON null; driver-specific types pydantic
+    does not know (BigQuery INTERVAL -> dateutil relativedelta) are stringified instead of
+    raising "Unable to serialize unknown type". Returns new objects, never mutates.
+    """
+    if value is None or isinstance(value, bool | int | str):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else str(value)
+    if isinstance(value, bytes | bytearray | memoryview):
+        return base64.b64encode(bytes(value)).decode("ascii")
+    if isinstance(value, dict):
+        return {str(_json_safe_value(key)): _json_safe_value(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, _PYDANTIC_NATIVE_CELL_TYPES):
+        return value
+    return str(value)
+
+
+def _json_safe_rows(rows: list[dict]) -> list[dict]:
+    """The one choke point for all three engines and both return paths (ok and
+    row_cap_exceeded): every value placed in BoundedQueryResult.rows is JSON-serialisable."""
+    return [{str(key): _json_safe_value(item) for key, item in row.items()} for row in rows]
 
 
 def run_query_bounded(
@@ -179,6 +225,11 @@ def run_query_bounded(
                 "it. Narrow the query or raise the bound."
             ),
         )
+
+    # After dispatch and before either return path, so a billed execution always yields a
+    # structured result (or an actionable refusal) and never a post-billing serialisation
+    # error from a connector-native cell type.
+    rows = _json_safe_rows(rows)
 
     if row_cap_hit:
         logger.info(

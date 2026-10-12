@@ -56,3 +56,16 @@ def test_bounded_query_result_refused_shape():
     assert result.status == "refused"
     assert result.rows is None
     assert result.row_count is None
+
+
+def test_bounded_query_result_serialises_bytes_as_base64_and_non_finite_floats_as_strings():
+    # Defence in depth behind the row normaliser in tools/run_query_bounded.py: if a future
+    # path puts raw bytes or NaN into rows, the model's own JSON serialisation must not raise
+    # (pydantic's default utf8 bytes mode does on non-UTF-8 input) or emit null for NaN.
+    # pydantic's base64 mode uses the URL-safe alphabet ("_w==" for 0xff, where standard
+    # base64 gives "/w=="); it is only the backstop - the normaliser's standard base64 is what
+    # clients see on every real path.
+    result = BoundedQueryResult(status="ok", rows=[{"b": b"\xff", "n": float("nan")}])
+    dumped = result.model_dump_json()
+    assert '"b":"_w=="' in dumped
+    assert '"n":"NaN"' in dumped

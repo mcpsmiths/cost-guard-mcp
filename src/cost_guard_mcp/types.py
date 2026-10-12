@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 Engine = Literal["bigquery", "snowflake", "databricks"]
 
@@ -48,6 +48,14 @@ class RefusalReason(str, Enum):
 
 
 class BoundedQueryResult(BaseModel):
+    # Defence in depth behind tools/run_query_bounded.py's row normaliser (the actual fix):
+    # should a future path put raw bytes or NaN into `rows`, this model's own JSON
+    # serialisation base64-encodes the bytes instead of raising on non-UTF-8 input and emits
+    # "NaN"/"Infinity" strings instead of null. It cannot help with types pydantic does not
+    # know (e.g. dateutil relativedelta) - hence the normaliser. Serialisation-only config:
+    # the generated JSON schema (the tool's outputSchema) is unchanged.
+    model_config = ConfigDict(ser_json_bytes="base64", ser_json_inf_nan="strings")
+
     status: Literal["ok", "refused"]
     reason: RefusalReason | None = None
     estimate: CostEstimate | None = None

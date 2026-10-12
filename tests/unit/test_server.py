@@ -1,9 +1,13 @@
 import asyncio
+import base64
+import hashlib
 import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
+from dateutil.relativedelta import relativedelta
 from google.api_core.exceptions import BadRequest
+from google.cloud.bigquery.table import Row
 from mcp.server.mcpserver.exceptions import ToolError
 
 from cost_guard_mcp.server import mcp
@@ -229,3 +233,73 @@ def test_call_tool_run_query_bounded_rejects_nan_cost_cap_through_the_sdk(
 
     mock_explain.assert_not_called()
     mock_execute.assert_not_called()
+
+
+def _bigquery_mocks_returning_rows(mock_bq_module, rows):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_query_job = MagicMock()
+    mock_query_job.total_bytes_processed = 100
+    mock_query_job._properties = {
+        "statistics": {"query": {"totalBytesProcessedAccuracy": "PRECISE"}}
+    }
+    mock_query_job.referenced_tables = []
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter(rows)
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+    return mock_client
+
+
+_DIGEST = hashlib.sha256(b"cost-guard").digest()  # not valid UTF-8
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_delivers_binary_interval_and_nan_cells(
+    mock_bq_module, _mock_capacity
+):
+    # Through the SDK's own convert_result: a real google.cloud.bigquery Row whose cells are a
+    # BYTES digest (not UTF-8), an INTERVAL (dateutil relativedelta - a type pydantic cannot
+    # serialise) and a FLOAT64 NaN. Before the normaliser this raised AFTER the billed job
+    # had run, so the model saw only "Error executing tool run_query_bounded".
+    row = Row(
+        (_DIGEST, relativedelta(months=1), float("nan")),
+        {"digest": 0, "interval": 1, "ratio": 2},
+    )
+    _bigquery_mocks_returning_rows(mock_bq_module, [row])
+
+    result = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT 1"})
+
+    assert result.is_error is not True
+    assert result.structured_content["status"] == "ok"
+    assert result.structured_content["rows"] == [
+        {
+            "digest": base64.b64encode(_DIGEST).decode("ascii"),
+            "interval": str(relativedelta(months=1)),
+            "ratio": "nan",
+        }
+    ]
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_row_cap_refusal_delivers_binary_cells(
+    mock_bq_module, _mock_capacity
+):
+    # The refusal path returns the capped rows too, so it needs the same normalisation.
+    rows = [Row((_DIGEST,), {"digest": 0}), Row((_DIGEST,), {"digest": 0})]
+    _bigquery_mocks_returning_rows(mock_bq_module, rows)
+
+    result = _call_tool(
+        "run_query_bounded", {"engine": "bigquery", "sql": "SELECT 1", "max_rows": 1}
+    )
+
+    assert result.is_error is not True
+    assert result.structured_content["status"] == "refused"
+    assert result.structured_content["reason"] == "row_cap_exceeded"
+    assert result.structured_content["rows"] == [
+        {"digest": base64.b64encode(_DIGEST).decode("ascii")}
+    ]

@@ -85,6 +85,15 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   provenance) instead of a `ToolError`. A `NaN` `max_estimated_cost_usd` is rejected (it
   compared as under-cap for every estimate); `+inf` still means no cap. Security audit
   remediation; see DECISIONS.md #11.
+- **Changed (breaking):** `run_query_bounded` result rows are now normalised to JSON-safe
+  values on every engine and both return paths: `BYTES`/`BINARY` cells arrive as standard
+  base64 text (valid-UTF-8 bytes that used to be delivered as plain text are now base64 too),
+  `NaN`/`±Inf` floats as the strings `"nan"`/`"inf"`/`"-inf"` (previously JSON `null`), and
+  driver-native types pydantic cannot serialise (BigQuery `INTERVAL`) as their `str()`.
+  Previously such cells made the SDK's result serialisation raise after the billed query had
+  run, losing the whole result. `BoundedQueryResult` also gained a serialisation-only
+  `ConfigDict` backstop (no `outputSchema` change). Security audit remediation; see
+  DECISIONS.md #12.
 
 ## [0.3.3] - 2026-10-10
 

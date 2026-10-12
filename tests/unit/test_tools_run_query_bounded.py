@@ -1,11 +1,15 @@
+import base64
+import datetime
+import decimal
 import logging
+import uuid
 from unittest.mock import patch
 
 import pytest
 
 from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
 from cost_guard_mcp.errors import UserVisibleError
-from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
+from cost_guard_mcp.tools.run_query_bounded import _json_safe_rows, run_query_bounded
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, RefusalReason
 
 _RUN_QUERY_BOUNDED_LOGGER_NAME = "cost_guard_mcp.tools.run_query_bounded"
@@ -319,3 +323,96 @@ def test_nan_cost_cap_is_rejected_before_any_estimate_or_execute(mock_estimate, 
 
     mock_estimate.assert_not_called()
     mock_engine.execute_bounded.assert_not_called()
+
+
+# --- JSON-safe result rows -------------------------------------------------------------------
+
+
+def test_json_safe_rows_encodes_bytes_like_cells_as_base64_text():
+    raw = b"\xff\x00cost"
+    expected = base64.b64encode(raw).decode("ascii")
+    rows = _json_safe_rows([{"b": raw, "ba": bytearray(raw), "mv": memoryview(raw)}])
+    assert rows == [{"b": expected, "ba": expected, "mv": expected}]
+
+
+def test_json_safe_rows_stringifies_non_finite_floats_and_keeps_finite_ones():
+    rows = _json_safe_rows(
+        [{"nan": float("nan"), "inf": float("inf"), "ninf": float("-inf"), "f": 1.5}]
+    )
+    assert rows == [{"nan": "nan", "inf": "inf", "ninf": "-inf", "f": 1.5}]
+
+
+def test_json_safe_rows_leaves_json_primitives_and_pydantic_native_types_untouched():
+    when = datetime.datetime(2026, 1, 2, 3, 4, 5, tzinfo=datetime.UTC)
+    cell_values = {
+        "none": None,
+        "t": True,
+        "i": 7,
+        "s": "x",
+        "dec": decimal.Decimal("1.50"),
+        "dt": when,
+        "d": when.date(),
+        "tm": when.time(),
+        "td": datetime.timedelta(hours=1),
+        "u": uuid.UUID(int=1),
+    }
+    rows = _json_safe_rows([cell_values])
+    assert rows == [cell_values]
+    assert rows[0]["dec"] is cell_values["dec"]
+
+
+def test_json_safe_rows_recurses_into_struct_array_and_map_cells():
+    nested = {"struct": {"inner": b"\x01", "list": [b"\x02", {"deep": float("nan")}]}}
+    rows = _json_safe_rows([nested])
+    assert rows == [
+        {
+            "struct": {
+                "inner": base64.b64encode(b"\x01").decode("ascii"),
+                "list": [base64.b64encode(b"\x02").decode("ascii"), {"deep": "nan"}],
+            }
+        }
+    ]
+
+
+def test_json_safe_rows_turns_tuple_and_set_cells_into_lists_and_non_string_keys_into_strings():
+    rows = _json_safe_rows([{"tup": (1, 2), "set": frozenset({3}), "m": {("a", "b"): 1, 2: 2}}])
+    assert rows == [{"tup": [1, 2], "set": [3], "m": {"['a', 'b']": 1, "2": 2}}]
+
+
+def test_json_safe_rows_stringifies_driver_native_types_pydantic_cannot_serialise():
+    class IntervalLike:
+        def __str__(self) -> str:
+            return "relativedelta(months=+1)"
+
+    rows = _json_safe_rows([{"interval": IntervalLike()}])
+    assert rows == [{"interval": "relativedelta(months=+1)"}]
+
+
+def test_json_safe_rows_returns_new_rows_without_mutating_the_input():
+    original = [{"b": b"\x00"}]
+    snapshot = [dict(row) for row in original]
+    _json_safe_rows(original)
+    assert original == snapshot
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_ok_result_rows_are_normalised_after_dispatch(mock_estimate, mock_execute):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([{"b": b"\xff"}], 1, False)
+
+    result = run_query_bounded("bigquery", "SELECT 1")
+
+    assert result.rows == [{"b": base64.b64encode(b"\xff").decode("ascii")}]
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_row_cap_refusal_rows_are_normalised_too(mock_estimate, mock_execute):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([{"b": b"\xff"}], 1, True)
+
+    result = run_query_bounded("bigquery", "SELECT 1", max_rows=1)
+
+    assert result.status == "refused"
+    assert result.rows == [{"b": base64.b64encode(b"\xff").decode("ascii")}]

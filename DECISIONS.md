@@ -391,3 +391,32 @@ signatures untouched). Residual, documented in README: BigQuery's 10 MiB-per-ref
 minimum means a tight cap on a many-table query can still be provider-rejected after passing
 the gate - it now surfaces as the structured refusal rather than a provider error string. A
 caller-supplied `max_bytes_billed=0` is passed through unchanged, as before.
+
+## 12. Result rows are normalised to JSON-safe values at one choke point, after execution
+
+**Context:** `BoundedQueryResult.rows` is typed `list[dict]` and all three `execute_bounded`
+implementations return connector-native cell values. The pinned `mcp` SDK serialises a tool
+result twice (pydantic `to_json` for the text content, `model_dump(mode="json")` for the
+structured content), and both raise on a non-UTF-8 `BYTES`/`BINARY` cell or a type pydantic
+does not know (BigQuery `INTERVAL` arrives as a `dateutil` `relativedelta`), while a `NaN`
+float silently becomes JSON `null`. That failure happens *after* the billed query has run,
+and the model then sees only the generic `Error executing tool run_query_bounded`.
+
+**Decision:** `tools/run_query_bounded.py` normalises every row immediately after the engine
+dispatch and before either return path (`ok` and `row_cap_exceeded`), so one function covers
+three engines and both paths: bytes-like cells -> standard base64 text (always, never
+"decode if valid UTF-8", which is ambiguous for consumers); `NaN`/`Inf` -> `"nan"`/`"inf"`/
+`"-inf"`; `dict`/`list`/`tuple`/`set` recursed with non-string keys stringified; `Decimal`,
+`datetime`/`date`/`time`/`timedelta` and `UUID` passed through because pydantic renders them
+natively; anything else -> `str()`. It returns new objects and never raises. `BoundedQueryResult`
+additionally carries `ConfigDict(ser_json_bytes="base64", ser_json_inf_nan="strings")` as a
+backstop for a future path that bypasses the normaliser - serialisation-only, so the
+generated `outputSchema` (and therefore `tools/list`) is unchanged; note pydantic's base64
+mode uses the URL-safe alphabet and cannot help with unknown types, which is why the
+normaliser is the fix and the config only a backstop.
+
+**Consequences:** A billed execution always yields a structured result or an actionable
+refusal. Documented behaviour change for consumers: valid-UTF-8 `BYTES` that used to arrive
+as plain text (type erased) now arrive base64-encoded, and `NaN`/`Inf` are strings rather
+than `null`. Row-size/row-count defaults are a separate hardening item, deliberately not
+folded in here.
