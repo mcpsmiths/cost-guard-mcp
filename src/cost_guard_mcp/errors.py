@@ -15,34 +15,55 @@ T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
+# Upper bound on the text redact_secrets scans. Exception text is model- or warehouse-
+# controlled and otherwise unbounded (neither src/ nor the SDK's stdio transport caps an
+# argument's size), and every pattern below runs over all of it inside the single stdio
+# process with the GIL held - so the scan is capped here, before any pattern runs, and the
+# dropped tail is replaced by a marker. Real connector errors are never this long.
+_MAX_REDACTED_TEXT_CHARS = 16_384
+
 # Shared value-matching fragment for the password/token patterns below. A bare (unquoted)
 # value is allowed to contain internal single spaces (real passwords legitimately can -
 # e.g. SNOWFLAKE_PASSWORD is an arbitrary user-chosen string) via the repetition's
 # lookahead, but that lookahead stops the moment what follows looks like the start of the
 # *next* key=value/key:value pair, so a multi-word value doesn't swallow an unrelated
 # trailing field. A quoted value (single or double) is matched up to its closing quote
-# regardless of what it contains, so both quotes are consumed and never leak.
+# regardless of what it contains, so both quotes are consumed and never leak - or, when the
+# closing quote never comes (the bound above can cut inside a quoted value), to end of text.
 _BARE_WORD = r'[^\s,;"\'}=:]+'
+_DOUBLE_QUOTED = r'"[^"]*(?:"|\Z)'
+_SINGLE_QUOTED = r"'[^']*(?:'|\Z)"
 _VALUE_FRAGMENT = (
-    r'"[^"]*"' r"|'[^']*'" rf"|{_BARE_WORD}(?:\s+(?!{_BARE_WORD}\s*[=:]){_BARE_WORD})*"
+    rf"{_DOUBLE_QUOTED}|{_SINGLE_QUOTED}"
+    rf"|{_BARE_WORD}(?:\s+(?!{_BARE_WORD}\s*[=:]){_BARE_WORD})*"
 )
 
+# Every pattern here must match in time linear in the text: they run on the error path of
+# the single-process server, over text an attacker can shape, and CPython's regex engine
+# holds the GIL for the whole match. Each quantified class below is unambiguous about where
+# it stops, and nothing lazy is left without a terminating alternative.
 _SECRET_PATTERNS = [
+    # Standalone PEM block, first so the key=value patterns below only ever see its
+    # placeholder. The label class excludes '-', so the header matches exactly one way, and
+    # a BEGIN with no END swallows to end of text once (\Z) rather than rescanning the tail
+    # for every candidate ending - the previous `[^\n]*-----.*?-----END` form backtracked
+    # quadratically on a dash-run header (~4 s per 32 KB, x4 per doubling).
+    re.compile(r"-----BEGIN[^\n-]*-----.*?(?:-----END[^\n]*-----|\Z)", re.DOTALL | re.IGNORECASE),
     # Password in various formats: password=value, 'password': value, "password": value.
     # Deliberately no leading ["\']? before the value fragment - the quoted alternatives
     # inside _VALUE_FRAGMENT consume their own opening AND closing quote.
     re.compile(rf'(password|passwd|pwd)["\']?\s*[=:]\s*(?:{_VALUE_FRAGMENT})', re.IGNORECASE),
-    # Private key (with optional passphrase) - handles PEM blocks and quoted multiline values
-    # Matches: private_key=-----BEGIN...-----END... or private_key='value' or 'private_key': 'value'
+    # Private key (with optional passphrase): private_key='value', 'private_key': 'value', or
+    # a bare value that may contain single internal spaces. A PEM-block value has already
+    # been reduced to the placeholder by the pattern above, so there is no PEM alternative
+    # here (the old one rescanned to end of text once per BEGIN without an END).
     re.compile(
         r'(private[_-]?key(?:[_-]?passphrase)?)["\']?\s*[=:]\s*'
-        r'(?:-----BEGIN[^\n]*(?:\n[^\n]*)*?\n-----END[^\n]*-----|["\'](?:[^"\']*)["\']|(?:[^\s,}]|\s(?![\s,}]))+)',
-        re.IGNORECASE | re.DOTALL,
+        rf"(?:{_DOUBLE_QUOTED}|{_SINGLE_QUOTED}|(?:[^\s,}}]|\s(?![\s,}}]))+)",
+        re.IGNORECASE,
     ),
     # Token, API key, secret - same whitespace-tolerant/quote-aware value fragment as password.
     re.compile(rf'(token|api[_-]?key|secret)["\']?\s*[=:]\s*(?:{_VALUE_FRAGMENT})', re.IGNORECASE),
-    # Standalone PEM block (full multiline from BEGIN to END)
-    re.compile(r"-----BEGIN[^\n]*-----.*?-----END[^\n]*-----", re.DOTALL | re.IGNORECASE),
     # Snowflake connection URI format: user:password@host
     re.compile(r"(://[^:/@]+:)([^\s/@]+)(?=@)", re.IGNORECASE),
 ]
@@ -64,6 +85,18 @@ class UserVisibleError(ValueError):
 
 
 def redact_secrets(text: str) -> str:
+    """Substitute every secret-shaped fragment of `text` with a placeholder.
+
+    Scans at most _MAX_REDACTED_TEXT_CHARS characters: the tail beyond the bound is dropped
+    before any pattern runs and replaced by a ' ...[truncated N chars]' marker appended after
+    redaction, so the marker itself is never consumed by a pattern. Together with the linear
+    patterns above this keeps the error path constant-overhead regardless of what the model
+    or the warehouse put in the exception text.
+    """
+    marker = ""
+    if len(text) > _MAX_REDACTED_TEXT_CHARS:
+        marker = f" ...[truncated {len(text) - _MAX_REDACTED_TEXT_CHARS} chars]"
+        text = text[:_MAX_REDACTED_TEXT_CHARS]
     redacted = text
     for pattern in _SECRET_PATTERNS:
         if pattern.pattern.startswith(r"(://"):  # URI pattern
@@ -79,7 +112,7 @@ def redact_secrets(text: str) -> str:
             redacted = pattern.sub(placeholder, redacted)
         else:
             redacted = pattern.sub(lambda m: f"{m.group(1)}=***REDACTED***", redacted)
-    return redacted
+    return redacted + marker
 
 
 def present_remote_text(text: str) -> str:

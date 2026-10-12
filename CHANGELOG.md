@@ -15,6 +15,13 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   as `\xNN` instead of starting a new, prefix-free stderr line that reads as a genuine
   `tool=... outcome=...` or `run_query_bounded refused ...` record. The three pricing
   `ValueError`s echo the offending argument with `!r` for the same reason.
+- **`redact_secrets` is bounded and linear.** It now scans at most 16 KiB of exception text
+  (the tail is replaced by a `...[truncated N chars]` marker) and its PEM/quoted-value
+  patterns no longer backtrack quadratically, so a crafted `warehouse_size`/`edition` or a
+  crafted warehouse error can no longer freeze the single-process server (and its
+  watchdog threads) for seconds per call - ~4 s per 32 KB before, x4 per doubling. A quoted
+  secret cut by the bound still redacts to end of text; the pricing errors echo at most 64
+  characters of the offending argument.
 
 ## [0.3.3] - 2026-10-10
 

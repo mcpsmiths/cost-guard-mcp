@@ -57,3 +57,13 @@ def test_dbus_per_hour_error_message_escapes_control_characters_in_size():
         dbus_per_hour("Small\nforged line")
 
     assert "\n" not in str(exc_info.value)
+
+
+def test_dbus_per_hour_error_message_bounds_the_echoed_size():
+    # Cap the echoed model-supplied argument so an oversized value cannot inflate the
+    # exception text that sanitize_exceptions redacts and logs.
+    with pytest.raises(ValueError) as exc_info:
+        dbus_per_hour("Z" * 500)
+
+    assert "Z" * 64 in str(exc_info.value)
+    assert "Z" * 65 not in str(exc_info.value)

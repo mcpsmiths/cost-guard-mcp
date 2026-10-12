@@ -1,15 +1,18 @@
 import base64
 import inspect
 import logging
+import time
 
 import pytest
 from mcp.server.mcpserver.exceptions import ToolError
 
 from cost_guard_mcp.config import ConfigError
 from cost_guard_mcp.errors import (
+    _MAX_REDACTED_TEXT_CHARS,
     SanitizedEngineError,
     UserVisibleError,
     as_tool_error,
+    redact_secrets,
     sanitize_exceptions,
 )
 
@@ -426,3 +429,84 @@ def test_sanitize_exceptions_redacts_before_neutralising():
     assert "***REDACTED***" in message
     assert cred not in message
     assert "\n" not in message
+
+
+# Regression tests: redact_secrets must complete in time linear in a bounded input length
+# regardless of content. Before the fix the two PEM patterns backtracked quadratically on a
+# dash-run BEGIN header with no END marker (~4.3 s per 32 KB, x4 per doubling, GIL held for
+# the whole single-process server) and the text scanned had no bound at all (audit:
+# cost-guard-mcp/errors.py@redact-secrets-quadratic-regex-on-unbounded-text). The time
+# bounds are deliberately generous for CI (expected ~0.01 s) and every timing assertion is
+# paired with a structural one on the output.
+
+_REDACTION_TIME_BOUND_SECONDS = 2.0
+_PEM_BEGIN = "-" * 5 + "BEGIN"
+_PEM_END = "-" * 5 + "END"
+
+
+def _timed_redact(text):
+    start = time.perf_counter()
+    redacted = redact_secrets(text)
+    return redacted, time.perf_counter() - start
+
+
+def test_redact_secrets_is_bounded_on_crafted_pem_header_text():
+    text = _PEM_BEGIN + "-" * 32768 + "\n" + "z" * 32768  # no END marker anywhere
+
+    redacted, elapsed = _timed_redact(text)
+
+    assert elapsed < _REDACTION_TIME_BOUND_SECONDS
+    assert "...[truncated" in redacted
+    assert "z" * 32768 not in redacted
+    # The dash run is the PEM header itself - swallowed into the placeholder, not echoed.
+    assert "-" * 10 not in redacted
+
+
+def test_redact_secrets_is_bounded_on_private_key_header_repeats():
+    text = ("private-key: " + _PEM_BEGIN + " RSA,\n") * 4096  # ~118 KB, no END marker anywhere
+
+    redacted, elapsed = _timed_redact(text)
+
+    assert elapsed < _REDACTION_TIME_BOUND_SECONDS
+    assert "BEGIN RSA" not in redacted
+    assert "***REDACTED***" in redacted
+
+
+def test_redact_secrets_truncation_marker_only_above_bound():
+    benign = "x" * _MAX_REDACTED_TEXT_CHARS
+
+    assert redact_secrets(benign) == benign
+    assert redact_secrets(benign + "x").endswith(" ...[truncated 1 chars]")
+
+
+def test_redact_secrets_redacts_quoted_password_cut_by_truncation():
+    # The truncation can cut inside a quoted value, so a quote that is never closed must
+    # still redact to end of text instead of leaking the whole value.
+    text = "pass" + 'word="' + "a" * 20000
+
+    redacted = redact_secrets(text)
+
+    assert "***REDACTED***" in redacted
+    assert "aaaa" not in redacted
+
+
+def test_redact_secrets_still_redacts_private_key_pem_after_pattern_reorder():
+    # Guards the dropped PEM alternative of the private-key pattern: the standalone PEM
+    # pattern now runs first and must still leave no key body behind.
+    body = "MIIEvQIBADANBg" + "testbody" + "001"
+    pem = (
+        _PEM_BEGIN
+        + " PRIVATE KEY"
+        + "-" * 5
+        + "\n"
+        + body
+        + "\n"
+        + _PEM_END
+        + " PRIVATE KEY"
+        + "-" * 5
+    )
+
+    redacted = redact_secrets("private_" + "key=" + pem)
+
+    assert body not in redacted
+    assert "REDACTED" in redacted
