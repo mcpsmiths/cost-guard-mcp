@@ -76,6 +76,15 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   The two tools' descriptions gained the one-statement sentence (a description-only
   `tools/list` change; names, annotations and schemas are unchanged). Security audit
   remediation; see DECISIONS.md #10.
+- **Added:** on an on-demand BigQuery project, `run_query_bounded` now attaches a server-side
+  `maximumBytesBilled` derived from `max_estimated_cost_usd` (rounded up to the next MiB,
+  10 MiB floor; a caller's `max_bytes_billed` is only ever lowered, never raised), so the
+  provider enforces the dollar cap even when the dry-run estimate is uninformative (row-level
+  security, `LOWER_BOUND`, absent statistics). BigQuery's `bytesBilledLimitExceeded` rejection
+  is now a normal `status: refused` result (`cost_cap_exceeded` / `byte_cap_exceeded` by cap
+  provenance) instead of a `ToolError`. A `NaN` `max_estimated_cost_usd` is rejected (it
+  compared as under-cap for every estimate); `+inf` still means no cap. Security audit
+  remediation; see DECISIONS.md #11.
 
 ## [0.3.3] - 2026-10-10
 

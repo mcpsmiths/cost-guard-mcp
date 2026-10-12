@@ -212,3 +212,20 @@ def test_estimate_and_run_tool_descriptions_state_the_one_statement_contract():
     tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
     for name in ("estimate_query_cost", "run_query_bounded"):
         assert "exactly one SQL statement" in tools[name].description, name
+
+
+@patch("cost_guard_mcp.engines.snowflake.explain_estimate")
+@patch("cost_guard_mcp.engines.snowflake.execute_bounded")
+def test_call_tool_run_query_bounded_rejects_nan_cost_cap_through_the_sdk(
+    mock_execute, mock_explain
+):
+    # The SDK's argument model passes float('nan') straight through (pydantic accepts a bare
+    # NaN literal in JSON too); the tool must refuse it before pricing or running anything.
+    with pytest.raises(ToolError, match="finite"):
+        _call_tool(
+            "run_query_bounded",
+            {"engine": "snowflake", "sql": "SELECT 1", "max_estimated_cost_usd": float("nan")},
+        )
+
+    mock_explain.assert_not_called()
+    mock_execute.assert_not_called()

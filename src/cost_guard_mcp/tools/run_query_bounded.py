@@ -1,8 +1,10 @@
 import logging
+import math
 
 from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines import databricks as databricks_engine
 from cost_guard_mcp.engines import snowflake as snowflake_engine
+from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
 from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.sql_scope import assert_single_statement
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
@@ -26,6 +28,12 @@ def run_query_bounded(
     # checked against it. Explicit here (estimate_query_cost checks too) so the pin holds
     # even when the estimate is replaced or skipped.
     assert_single_statement(sql, engine)
+
+    # `estimate > nan` is False for every estimate, so a NaN cap would admit anything with
+    # no cap at all - and the mcp SDK's JSON parser accepts a bare NaN literal. +inf is
+    # left alone: it compares correctly and simply means "no dollar cap".
+    if max_estimated_cost_usd is not None and math.isnan(max_estimated_cost_usd):
+        raise UserVisibleError("max_estimated_cost_usd must be a finite number, not NaN.")
 
     # warehouse_size/edition must reach the cap-check estimate below, not just
     # estimate_query_cost's own public tool - otherwise the cost cap here would always be
@@ -106,20 +114,71 @@ def run_query_bounded(
                 ),
             )
 
-    if engine == "bigquery":
-        rows, row_count, row_cap_hit = bigquery_engine.execute_bounded(
-            sql, max_bytes_billed=max_bytes_billed, max_rows=max_rows
+    # BigQuery only: make the provider enforce the dollar cap too. The gate above trusts
+    # the dry-run figure, which BigQuery itself flags as uninformative for row-level-
+    # security-protected tables (always 0 bytes), LOWER_BOUND estimates and absent
+    # statistics - so attach a maximumBytesBilled derived from the cap. A caller-supplied
+    # byte cap is only ever lowered, never raised; +inf means "no cap" and derives nothing.
+    effective_max_bytes_billed = max_bytes_billed
+    byte_cap_derived_from_cost_cap = False
+    if (
+        engine == "bigquery"
+        and max_estimated_cost_usd is not None
+        and math.isfinite(max_estimated_cost_usd)
+        and estimate.estimated_cost_usd is not None
+    ):
+        derived = cost_cap_to_max_bytes_billed(max_estimated_cost_usd)
+        if max_bytes_billed is None or derived <= max_bytes_billed:
+            effective_max_bytes_billed = derived
+            byte_cap_derived_from_cost_cap = True
+
+    try:
+        if engine == "bigquery":
+            rows, row_count, row_cap_hit = bigquery_engine.execute_bounded(
+                sql, max_bytes_billed=effective_max_bytes_billed, max_rows=max_rows
+            )
+        elif engine == "snowflake":
+            rows, row_count, row_cap_hit = snowflake_engine.execute_bounded(
+                sql, warehouse=warehouse, max_rows=max_rows
+            )
+        elif engine == "databricks":
+            rows, row_count, row_cap_hit = databricks_engine.execute_bounded(
+                sql, warehouse=warehouse, max_rows=max_rows
+            )
+        else:
+            raise UserVisibleError(f"run_query_bounded: engine '{engine}' is not yet supported.")
+    except ProviderByteCapExceeded as exc:
+        # The provider enforced the byte cap we attached: a cap refusal is a normal result
+        # (DECISIONS.md #4), attributed to whichever cap the effective limit came from.
+        reason = (
+            RefusalReason.COST_CAP_EXCEEDED
+            if byte_cap_derived_from_cost_cap
+            else RefusalReason.BYTE_CAP_EXCEEDED
         )
-    elif engine == "snowflake":
-        rows, row_count, row_cap_hit = snowflake_engine.execute_bounded(
-            sql, warehouse=warehouse, max_rows=max_rows
+        logger.info(
+            "engine=%s run_query_bounded refused reason=%s detail=provider_byte_cap_exceeded "
+            "maximum_bytes_billed=%s",
+            engine,
+            reason.value,
+            exc.maximum_bytes_billed,
         )
-    elif engine == "databricks":
-        rows, row_count, row_cap_hit = databricks_engine.execute_bounded(
-            sql, warehouse=warehouse, max_rows=max_rows
+        cap_origin = (
+            f"derived from max_estimated_cost_usd=${max_estimated_cost_usd:.4f}"
+            if byte_cap_derived_from_cost_cap
+            else f"your max_bytes_billed={max_bytes_billed}"
         )
-    else:
-        raise UserVisibleError(f"run_query_bounded: engine '{engine}' is not yet supported.")
+        return BoundedQueryResult(
+            status="refused",
+            reason=reason,
+            estimate=estimate,
+            hint=(
+                "BigQuery refused to run this query: it would bill more than the server-side "
+                f"maximumBytesBilled of {exc.maximum_bytes_billed} bytes ({cap_origin}). "
+                "Nothing was billed. BigQuery bills in 1 MiB steps with a 10 MiB minimum per "
+                "referenced table, so a query estimated within a few MiB of the cap can trip "
+                "it. Narrow the query or raise the bound."
+            ),
+        )
 
     if row_cap_hit:
         logger.info(

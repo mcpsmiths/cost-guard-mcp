@@ -1,16 +1,21 @@
 import base64
 import concurrent.futures
+from fractions import Fraction
 from unittest.mock import MagicMock, patch
 
 import pytest
+from google.api_core.exceptions import BadRequest, InternalServerError
 
 from cost_guard_mcp.engines.bigquery import (
+    ProviderByteCapExceeded,
     check_credentials,
+    cost_cap_to_max_bytes_billed,
     dry_run,
     execute_bounded,
     is_capacity_billed,
 )
 from cost_guard_mcp.errors import SanitizedEngineError
+from cost_guard_mcp.pricing.bigquery_pricing import TIB_IN_BYTES
 from cost_guard_mcp.types import AccuracyTier
 
 
@@ -446,3 +451,88 @@ def test_execute_bounded_raise_survives_a_failed_cancel_attempt(mock_bq_module):
 
     with pytest.raises(SanitizedEngineError, match="Query exceeded 120s and was cancelled"):
         execute_bounded("SELECT * FROM huge_table", max_bytes_billed=None, max_rows=None)
+
+
+# --- server-side byte cap derived from the dollar cap ---------------------------------------
+
+_MIB = 1024**2
+
+
+def test_cost_cap_to_max_bytes_billed_one_tib_cap_maps_to_exactly_one_tib():
+    assert cost_cap_to_max_bytes_billed(6.25) == TIB_IN_BYTES
+
+
+@pytest.mark.parametrize("cap", [0.0, 0.0000001])
+def test_cost_cap_to_max_bytes_billed_floors_at_bigquery_minimum_billing(cap):
+    # BigQuery bills a 10 MiB minimum per on-demand query; a smaller cap would fail every
+    # uncached query, so the derived cap never goes below it.
+    assert cost_cap_to_max_bytes_billed(cap) == 10 * _MIB
+
+
+def test_cost_cap_to_max_bytes_billed_rounds_up_to_the_next_mib():
+    # BigQuery rounds totalBytesBilled UP to the next MiB before comparing it with
+    # maximumBytesBilled, so the derived cap must round the same way or a query estimated
+    # within a MiB of the cap passes the gate and is then rejected by the provider.
+    exactly_20_mib = Fraction(20 * _MIB, TIB_IN_BYTES) * Fraction(25, 4)
+    one_byte_over = Fraction(20 * _MIB + 1, TIB_IN_BYTES) * Fraction(25, 4)
+    assert cost_cap_to_max_bytes_billed(float(exactly_20_mib)) == 20 * _MIB
+    assert cost_cap_to_max_bytes_billed(float(one_byte_over)) == 21 * _MIB
+
+
+def test_cost_cap_to_max_bytes_billed_returns_an_int():
+    assert type(cost_cap_to_max_bytes_billed(1.0)) is int
+
+
+def _bytes_billed_limit_error(cls=BadRequest):
+    return cls(
+        "Query exceeded limit for bytes billed: 10485760. 20971520 or higher required.",
+        errors=[{"reason": "bytesBilledLimitExceeded", "message": "x", "domain": "global"}],
+    )
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_maps_provider_byte_cap_rejection_at_submit_to_structured_error(
+    mock_bq_module,
+):
+    mock_client = MagicMock()
+    mock_client.query.side_effect = _bytes_billed_limit_error(BadRequest)
+    mock_bq_module.Client.return_value = mock_client
+
+    with pytest.raises(ProviderByteCapExceeded) as excinfo:
+        execute_bounded("SELECT * FROM t", max_bytes_billed=10 * _MIB, max_rows=None)
+
+    assert excinfo.value.maximum_bytes_billed == 10 * _MIB
+    assert isinstance(excinfo.value, SanitizedEngineError)  # still passes sanitize_exceptions
+    assert "10485760" in str(excinfo.value)
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_maps_provider_byte_cap_rejection_at_result_to_structured_error(
+    mock_bq_module,
+):
+    # The pinned client has no reason mapping for bytesBilledLimitExceeded, so a job that
+    # fails after submission surfaces as InternalServerError (500), not BadRequest - the
+    # errors[].reason is the stable signal, not the exception class.
+    mock_client = MagicMock()
+    mock_query_job = MagicMock()
+    mock_query_job.result.side_effect = _bytes_billed_limit_error(InternalServerError)
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+
+    with pytest.raises(ProviderByteCapExceeded):
+        execute_bounded("SELECT * FROM t", max_bytes_billed=20 * _MIB, max_rows=None)
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_leaves_other_provider_errors_as_sanitized_engine_error(mock_bq_module):
+    # Negative control: a BadRequest with any other reason keeps today's behaviour.
+    mock_client = MagicMock()
+    mock_client.query.side_effect = BadRequest(
+        "Syntax error", errors=[{"reason": "invalidQuery", "message": "Syntax error"}]
+    )
+    mock_bq_module.Client.return_value = mock_client
+
+    with pytest.raises(SanitizedEngineError) as excinfo:
+        execute_bounded("SELEC 1", max_bytes_billed=None, max_rows=None)
+
+    assert not isinstance(excinfo.value, ProviderByteCapExceeded)

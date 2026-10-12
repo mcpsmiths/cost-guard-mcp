@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
+from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
 from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, RefusalReason
@@ -176,3 +177,145 @@ def test_single_statement_with_trailing_semicolon_still_runs(mock_estimate, mock
 
     assert result.status == "ok"
     mock_engine.execute_bounded.assert_called_once()
+
+
+# --- BigQuery server-side byte cap derived from the dollar cap -------------------------------
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_bigquery_cost_cap_attaches_a_derived_server_side_byte_cap(mock_estimate, mock_execute):
+    # The RLS shape: BigQuery's dry run reports 0 bytes / $0.00 PRECISE for a row-level-
+    # security-protected table by design. The gate admits it; the provider must still
+    # enforce the dollar cap via maximumBytesBilled derived from it.
+    mock_estimate.return_value = _estimate(cost=0.0, bytes_=0)
+    mock_execute.return_value = ([{"a": 1}], 1, False)
+
+    result = run_query_bounded("bigquery", "SELECT * FROM rls_t", max_estimated_cost_usd=0.01)
+
+    assert result.status == "ok"
+    mock_execute.assert_called_once_with(
+        "SELECT * FROM rls_t",
+        max_bytes_billed=cost_cap_to_max_bytes_billed(0.01),
+        max_rows=None,
+    )
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] is not None
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_bigquery_both_caps_use_the_smaller_byte_cap(mock_estimate, mock_execute):
+    mock_estimate.return_value = _estimate(cost=0.00001, bytes_=1000)
+    mock_execute.return_value = ([], 0, False)
+
+    # Derived (cost cap 0.0001 -> ~17 MiB) is smaller than the caller's 1 GB: derived wins.
+    run_query_bounded(
+        "bigquery", "SELECT 1", max_bytes_billed=1_000_000_000, max_estimated_cost_usd=0.0001
+    )
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] == cost_cap_to_max_bytes_billed(0.0001)
+
+    # Derived (cost cap 1.0 -> ~164 GiB) is larger than the caller's 50 MB: the caller's
+    # own byte cap is never raised.
+    mock_execute.reset_mock()
+    run_query_bounded(
+        "bigquery", "SELECT 1", max_bytes_billed=50_000_000, max_estimated_cost_usd=1.0
+    )
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] == 50_000_000
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_bigquery_without_a_cost_cap_passes_the_caller_byte_cap_unchanged(
+    mock_estimate, mock_execute
+):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([], 0, False)
+
+    run_query_bounded("bigquery", "SELECT 1")
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] is None  # no cap invented
+
+    mock_execute.reset_mock()
+    run_query_bounded("bigquery", "SELECT 1", max_bytes_billed=123_456_789)
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] == 123_456_789
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_bigquery_infinite_cost_cap_means_no_cap_and_derives_no_byte_cap(
+    mock_estimate, mock_execute
+):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([], 0, False)
+
+    result = run_query_bounded("bigquery", "SELECT 1", max_estimated_cost_usd=float("inf"))
+
+    assert result.status == "ok"
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] is None
+
+
+@pytest.mark.parametrize("engine", ["snowflake", "databricks"])
+@patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.snowflake_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_derived_byte_cap_is_bigquery_only(mock_estimate, mock_snowflake, mock_databricks, engine):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_snowflake.execute_bounded.return_value = ([], 0, False)
+    mock_databricks.execute_bounded.return_value = ([], 0, False)
+
+    run_query_bounded(engine, "SELECT 1", max_estimated_cost_usd=1.0)
+
+    engine_module = mock_snowflake if engine == "snowflake" else mock_databricks
+    engine_module.execute_bounded.assert_called_once_with("SELECT 1", warehouse=None, max_rows=None)
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_provider_byte_cap_rejection_of_a_derived_cap_is_a_cost_cap_refusal(
+    mock_estimate, mock_execute
+):
+    # BigQuery rejected the job against the maximumBytesBilled we derived from the dollar
+    # cap: per DECISIONS.md #4 that is a normal refusal result, not a ToolError.
+    mock_estimate.return_value = _estimate(cost=0.0, bytes_=0)
+    derived = cost_cap_to_max_bytes_billed(0.01)
+    mock_execute.side_effect = ProviderByteCapExceeded(derived)
+
+    result = run_query_bounded("bigquery", "SELECT * FROM rls_t", max_estimated_cost_usd=0.01)
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.COST_CAP_EXCEEDED
+    assert result.estimate is not None
+    assert result.rows is None
+    assert "maximumBytesBilled" in result.hint
+    assert str(derived) in result.hint
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_provider_byte_cap_rejection_of_the_caller_byte_cap_is_a_byte_cap_refusal(
+    mock_estimate, mock_execute
+):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.side_effect = ProviderByteCapExceeded(50_000_000)
+
+    result = run_query_bounded("bigquery", "SELECT 1", max_bytes_billed=50_000_000)
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.BYTE_CAP_EXCEEDED
+    assert "maximumBytesBilled" in result.hint
+
+
+# --- non-finite caps (plan-review amendment A2) -------------------------------------------
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_nan_cost_cap_is_rejected_before_any_estimate_or_execute(mock_estimate, mock_engine):
+    # `estimate > nan` is False for every estimate, so a NaN cap would admit anything with
+    # no cap at all; the mcp SDK's JSON parser accepts a bare NaN literal.
+    mock_estimate.return_value = _estimate(cost=10.0, bytes_=1000)
+
+    with pytest.raises(UserVisibleError, match="finite"):
+        run_query_bounded("snowflake", "SELECT 1", max_estimated_cost_usd=float("nan"))
+
+    mock_estimate.assert_not_called()
+    mock_engine.execute_bounded.assert_not_called()

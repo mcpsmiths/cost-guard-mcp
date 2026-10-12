@@ -2,6 +2,7 @@ import concurrent.futures
 import logging
 import re
 
+from google.api_core.exceptions import GoogleAPICallError
 from google.cloud import bigquery, bigquery_reservation_v1
 
 from cost_guard_mcp.errors import (
@@ -171,6 +172,53 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
     )
 
 
+_MIB = 1024**2
+# BigQuery bills every on-demand query a 10 MiB minimum (and 10 MiB per referenced table), so
+# a maximumBytesBilled below this would make every uncached query fail at the provider.
+_MIN_MAXIMUM_BYTES_BILLED = 10 * _MIB
+# The errors[].reason BigQuery attaches when a job would bill more than its
+# maximumBytesBilled. Matched by reason, not exception class: the API path raises
+# BadRequest (400) while the pinned client maps a failed job with this reason to
+# InternalServerError (500) because its reason table has no entry for it.
+_BYTES_BILLED_LIMIT_EXCEEDED_REASON = "bytesBilledLimitExceeded"
+
+
+def cost_cap_to_max_bytes_billed(max_estimated_cost_usd: float) -> int:
+    """The server-side maximumBytesBilled equivalent of an on-demand dollar cap.
+
+    BigQuery compares maximumBytesBilled against totalBytesBilled, which is the processed
+    byte count rounded UP to the next MiB (10 MiB minimum), while the dry-run dollar figure
+    comes from the unrounded count. Rounding the derived cap up the same way keeps "the gate
+    admits => the provider admits" for single-table queries; without it a query estimated
+    within a MiB of the cap would pass the gate and then be rejected by the provider.
+    """
+    raw_bytes = int(max_estimated_cost_usd / ON_DEMAND_USD_PER_TIB * TIB_IN_BYTES)
+    rounded_up_to_mib = -(-raw_bytes // _MIB) * _MIB
+    return max(rounded_up_to_mib, _MIN_MAXIMUM_BYTES_BILLED)
+
+
+class ProviderByteCapExceeded(SanitizedEngineError):
+    """BigQuery refused to run a job because it would bill more than the maximumBytesBilled
+    attached to it. Nothing was billed. A SanitizedEngineError (so it passes through
+    sanitize_exceptions unchanged) with a fixed, secret-free message; run_query_bounded maps
+    it to a structured refusal instead of a ToolError."""
+
+    def __init__(self, maximum_bytes_billed: int | None) -> None:
+        super().__init__(
+            "BigQuery refused to run this query because it would bill more than the "
+            f"server-side maximumBytesBilled limit of {maximum_bytes_billed} bytes attached "
+            "to the job. Nothing was billed."
+        )
+        self.maximum_bytes_billed = maximum_bytes_billed
+
+
+def _is_bytes_billed_limit_exceeded(exc: GoogleAPICallError) -> bool:
+    return any(
+        isinstance(error, dict) and error.get("reason") == _BYTES_BILLED_LIMIT_EXCEEDED_REASON
+        for error in exc.errors
+    )
+
+
 # How long to wait for a bounded query to finish before giving up and cancelling it. This
 # is a Polling Timeout in google-api-core's terms — confirmed via the base
 # PollingFuture._blocking_poll implementation, not just QueryJob.result()'s own (looser)
@@ -208,9 +256,18 @@ def execute_bounded(
         if max_bytes_billed is not None
         else bigquery.QueryJobConfig()
     )
-    query_job = client.query(wrapped_sql, job_config=job_config)
+    try:
+        query_job = client.query(wrapped_sql, job_config=job_config)
+    except GoogleAPICallError as exc:
+        if _is_bytes_billed_limit_exceeded(exc):
+            raise ProviderByteCapExceeded(max_bytes_billed) from None
+        raise
     try:
         rows = [dict(row) for row in query_job.result(timeout=_MAX_EXECUTION_WAIT_SECONDS)]
+    except GoogleAPICallError as exc:
+        if _is_bytes_billed_limit_exceeded(exc):
+            raise ProviderByteCapExceeded(max_bytes_billed) from None
+        raise
     except concurrent.futures.TimeoutError:
         try:
             query_job.cancel()

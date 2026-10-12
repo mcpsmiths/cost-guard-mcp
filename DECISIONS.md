@@ -356,3 +356,38 @@ deliberate false positives in the safe direction (`THEN'x'` without whitespace,
 and the hint says how to rewrite them. Every scanner mistake must stay in the refuse
 direction: a new dialect construct is added only once its quoting rules are certain, and an
 uncertain construct is refused, never guessed.
+
+## 11. BigQuery dollar caps are also enforced server-side, and the provider's refusal is a normal result
+
+**Context:** `run_query_bounded`'s dollar gate trusts the dry-run figure, which BigQuery
+itself flags as uninformative in several shapes: row-level-security-protected tables always
+report 0 bytes (a $0.00 `PRECISE` estimate), `LOWER_BOUND` accuracy is a floor, and absent
+statistics were coerced to 0. The job was submitted with `maximumBytesBilled` only when the
+caller supplied `max_bytes_billed`, so a cost-cap-only call ran with no server-side bound at
+all. Whether real runs of those shapes bill above the cap is a provider fact the audit could
+only observe with credentials; attaching a server-side cap makes the gate hold either way.
+
+**Decision:** When `max_estimated_cost_usd` is finite and a dollar estimate exists, the
+BigQuery job carries `maximumBytesBilled = max(ceil_to_1MiB(cap / $6.25 per TiB * TiB),
+10 MiB)` (`cost_cap_to_max_bytes_billed`), lowered to a caller-supplied `max_bytes_billed`
+when that is smaller and never raised above it. Rounding up to the next MiB mirrors how
+BigQuery rounds `totalBytesBilled` before comparing, so "the gate admits => the provider
+admits" holds for single-table queries; the 10 MiB floor is BigQuery's own per-query
+minimum. The gate comparison and the dry-run accuracy tiering are unchanged (RLS queries
+still run, now server-bounded). BigQuery's `bytesBilledLimitExceeded` rejection - matched by
+`errors[].reason`, because the pinned client raises `BadRequest` on the API path but maps the
+same reason to `InternalServerError` on the job path - is raised as
+`ProviderByteCapExceeded(SanitizedEngineError)` and mapped to
+`BoundedQueryResult(status="refused")` with `reason=cost_cap_exceeded` when the effective
+limit came from the dollar cap and `byte_cap_exceeded` when it was the caller's own byte cap,
+extending decision #4's "a cap refusal is a normal result" to provider-enforced caps. A `NaN`
+`max_estimated_cost_usd` is rejected with a `UserVisibleError` before any comparison (it
+compares as under-cap for every estimate, and the mcp SDK's JSON parser accepts a bare
+`NaN`); `+inf` is left alone because it compares correctly and means "no dollar cap".
+
+**Consequences:** BigQuery enforces the approved spend regardless of how the unresolved
+provider facts turn out; nothing changes for Snowflake/Databricks (`execute_bounded`
+signatures untouched). Residual, documented in README: BigQuery's 10 MiB-per-referenced-table
+minimum means a tight cap on a many-table query can still be provider-rejected after passing
+the gate - it now surfaces as the structured refusal rather than a provider error string. A
+caller-supplied `max_bytes_billed=0` is passed through unchanged, as before.
