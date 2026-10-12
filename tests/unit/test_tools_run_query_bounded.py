@@ -308,6 +308,26 @@ def test_provider_byte_cap_rejection_of_the_caller_byte_cap_is_a_byte_cap_refusa
     assert "maximumBytesBilled" in result.hint
 
 
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_provider_byte_cap_rejection_with_no_cap_attached_is_not_attributed_to_the_caller(
+    mock_estimate, mock_execute
+):
+    # Neither a caller byte cap nor a finite dollar cap was given, so no maximumBytesBilled
+    # of ours was attached: a bytesBilledLimitExceeded rejection here is a provider-side
+    # event the caller did not ask for. It must surface as the SanitizedEngineError it is
+    # (-> ToolError), not as a refusal blaming "your max_bytes_billed=None".
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.side_effect = ProviderByteCapExceeded(None)
+
+    with pytest.raises(ProviderByteCapExceeded):
+        run_query_bounded("bigquery", "SELECT 1")
+
+    mock_execute.reset_mock()
+    with pytest.raises(ProviderByteCapExceeded):
+        run_query_bounded("bigquery", "SELECT 1", max_estimated_cost_usd=float("inf"))
+
+
 # --- non-finite caps (plan-review amendment A2) -------------------------------------------
 
 

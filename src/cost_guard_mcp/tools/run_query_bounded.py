@@ -165,13 +165,14 @@ def run_query_bounded(
     # security-protected tables (always 0 bytes), LOWER_BOUND estimates and absent
     # statistics - so attach a maximumBytesBilled derived from the cap. A caller-supplied
     # byte cap is only ever lowered, never raised; +inf means "no cap" and derives nothing.
+    # (The dollar gate above has already refused a finite cap with no dollar estimate, so a
+    # dollar estimate is guaranteed to exist whenever this derivation runs.)
     effective_max_bytes_billed = max_bytes_billed
     byte_cap_derived_from_cost_cap = False
     if (
         engine == "bigquery"
         and max_estimated_cost_usd is not None
         and math.isfinite(max_estimated_cost_usd)
-        and estimate.estimated_cost_usd is not None
     ):
         derived = cost_cap_to_max_bytes_billed(max_estimated_cost_usd)
         if max_bytes_billed is None or derived <= max_bytes_billed:
@@ -194,6 +195,11 @@ def run_query_bounded(
         else:
             raise UserVisibleError(f"run_query_bounded: engine '{engine}' is not yet supported.")
     except ProviderByteCapExceeded as exc:
+        if effective_max_bytes_billed is None:
+            # No cap of ours was attached, so this is not a refusal the caller asked for:
+            # let it surface as the SanitizedEngineError (-> ToolError) it is, like any
+            # other provider error, rather than a refusal blaming "max_bytes_billed=None".
+            raise
         # The provider enforced the byte cap we attached: a cap refusal is a normal result
         # (DECISIONS.md #4), attributed to whichever cap the effective limit came from.
         reason = (
