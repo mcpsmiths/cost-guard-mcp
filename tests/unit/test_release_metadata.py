@@ -14,6 +14,7 @@ tomllib (stdlib) parses pyproject.toml and uv.lock.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -21,12 +22,18 @@ import subprocess
 import tomllib
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 PYPROJECT_PATH = REPO_ROOT / "pyproject.toml"
 UV_LOCK_PATH = REPO_ROOT / "uv.lock"
 PRE_COMMIT_CONFIG_PATH = REPO_ROOT / ".pre-commit-config.yaml"
 RELEASE_WORKFLOW_PATH = WORKFLOWS_DIR / "release.yml"
+SERVER_JSON_PATH = REPO_ROOT / "server.json"
+MCP_EXAMPLE_PATH = REPO_ROOT / ".mcp.json.example"
+README_PATH = REPO_ROOT / "README.md"
+SRC_DIR = REPO_ROOT / "src"
 
 _SETUP_UV_USES = "uses: astral-sh/setup-uv@"
 _UV_PRE_COMMIT_REPO = "repo: https://github.com/astral-sh/uv-pre-commit"
@@ -349,3 +356,132 @@ def test_release_ancestry_gate_refuses_an_annotated_tag_off_main(tmp_path):
         scratch=tmp_path,
     )
     assert admitted.returncode == 0, admitted.stdout + admitted.stderr
+
+
+# --- mcp-registry-listing-manual-device-flow-publish-unbound-to-release-workflow:server.json
+
+
+def _server_json() -> dict:
+    return json.loads(SERVER_JSON_PATH.read_text(encoding="utf-8"))
+
+
+def test_server_json_versions_match_pyproject():
+    server_json = _server_json()
+    project_version = _pyproject()["project"]["version"]
+    assert server_json["version"] == project_version
+    assert server_json["packages"][0]["version"] == project_version
+
+
+def test_server_json_package_points_at_this_pypi_project():
+    package = _server_json()["packages"][0]
+    assert package["registryType"] == "pypi"
+    assert package["identifier"] == _pyproject()["project"]["name"] == "cost-guard-mcp"
+
+
+def test_readme_carries_the_registry_ownership_marker():
+    marker = f"<!-- mcp-name: {_server_json()['name']} -->"
+    assert marker in README_PATH.read_text(encoding="utf-8")
+
+
+def _version_gate_script() -> str:
+    build_job = _job_block(RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8"), "build")
+    return _step_run_script(_named_step(build_job, "Verify tag matches"))
+
+
+def test_release_gate_reads_package_fields():
+    # Pins the extended gate so a future simplification cannot silently drop the two fields
+    # a registry consumer actually installs from.
+    script = _version_gate_script()
+    assert "['packages'][0]['version']" in script
+    assert "['packages'][0]['identifier']" in script
+
+
+def _write_release_fixture(
+    directory: Path,
+    *,
+    pyproject_version: str = "9.9.9",
+    project_name: str = "cost-guard-mcp",
+    server_version: str = "9.9.9",
+    package_version: str = "9.9.9",
+    identifier: str = "cost-guard-mcp",
+    registry_type: str = "pypi",
+) -> None:
+    (directory / "pyproject.toml").write_text(
+        f'[project]\nname = "{project_name}"\nversion = "{pyproject_version}"\n', encoding="utf-8"
+    )
+    server_json = {
+        "name": "io.github.mcpsmiths/cost-guard-mcp",
+        "version": server_version,
+        "packages": [
+            {"registryType": registry_type, "identifier": identifier, "version": package_version}
+        ],
+    }
+    (directory / "server.json").write_text(json.dumps(server_json), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_exit"),
+    [
+        pytest.param({}, 0, id="consistent"),
+        pytest.param({"package_version": "0.0.1"}, 1, id="package_version_drifts"),
+        pytest.param({"identifier": "someone-elses-package"}, 1, id="identifier_other_package"),
+        pytest.param({"registry_type": "npm"}, 1, id="registry_type_not_pypi"),
+        pytest.param({"server_version": "8.8.8"}, 1, id="top_level_version_drifts"),
+        pytest.param({"pyproject_version": "8.8.8"}, 1, id="pyproject_version_drifts"),
+    ],
+)
+def test_release_version_gate_against_fixture_manifests(tmp_path, overrides, expected_exit):
+    # Runs the step's own shell text (not a hand-written mirror) for tag v9.9.9 against a
+    # bare directory holding only pyproject.toml and server.json - the audit's reproduction.
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_release_fixture(checkout, **overrides)
+    completed = _run_step_script(
+        _version_gate_script(),
+        cwd=checkout,
+        env={"PATH": os.environ["PATH"], "GITHUB_REF_NAME": "v9.9.9"},
+        scratch=tmp_path,
+    )
+    assert completed.returncode == expected_exit, completed.stdout + completed.stderr
+
+
+# Amendment A11 of the 2026-10 remediation plan: a theme that adds an operator knob must
+# document it in both manifests in the same PR. Any quoted literal of this shape in src/ is
+# treated as an environment variable unless listed in _NOT_ENV_VARS.
+_ENV_LITERAL_RE = re.compile(r"[\"']((?:SNOWFLAKE|DATABRICKS|COST_GUARD|GOOGLE)_[A-Z0-9_]+)[\"']")
+_NOT_ENV_VARS = frozenset({"SNOWFLAKE_JWT"})  # snowflake-connector authenticator constant
+# .mcp.json.example shows exactly one auth path per engine (key pair, PAT); README and
+# server.json document the alternatives, so these are not required to appear in the example.
+_MCP_EXAMPLE_ALTERNATIVE_CREDENTIALS = frozenset(
+    {
+        "SNOWFLAKE_PASSWORD",
+        "SNOWFLAKE_PRIVATE_KEY_PASSPHRASE",
+        "DATABRICKS_CLIENT_ID",
+        "DATABRICKS_CLIENT_SECRET",
+    }
+)
+
+
+def _env_var_names_read_in_src() -> set[str]:
+    names: set[str] = set()
+    for path in sorted(SRC_DIR.rglob("*.py")):
+        names.update(_ENV_LITERAL_RE.findall(path.read_text(encoding="utf-8")))
+    return names - _NOT_ENV_VARS
+
+
+def test_every_env_var_read_in_src_is_documented_in_both_manifests():
+    read_in_src = _env_var_names_read_in_src()
+    # Sanity: the scan must at least find the three engines' primary credentials.
+    assert {"GOOGLE_APPLICATION_CREDENTIALS", "SNOWFLAKE_ROLE", "DATABRICKS_TOKEN"} <= read_in_src
+    documented = {entry["name"] for entry in _server_json()["packages"][0]["environmentVariables"]}
+    assert read_in_src <= documented, (
+        f"read in src/ but missing from server.json environmentVariables: "
+        f"{sorted(read_in_src - documented)}"
+    )
+    example = json.loads(MCP_EXAMPLE_PATH.read_text(encoding="utf-8"))
+    example_env = set(example["mcpServers"]["cost-guard-mcp"]["env"])
+    expected_in_example = read_in_src - _MCP_EXAMPLE_ALTERNATIVE_CREDENTIALS
+    assert expected_in_example <= example_env, (
+        f"read in src/ but missing from .mcp.json.example: "
+        f"{sorted(expected_in_example - example_env)}"
+    )

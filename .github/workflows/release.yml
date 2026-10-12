@@ -43,13 +43,25 @@ jobs:
             echo "Tag $GITHUB_REF_NAME at $TAGGED_COMMIT is not an ancestor of origin/main - release tags must point at reviewed, merged history"
             exit 1
           fi
-      - name: Verify tag matches pyproject.toml and server.json version
+      # server.json is also what the MCP Registry listing is published from (DECISIONS.md
+      # #12), so the gate covers the package record a registry consumer actually installs
+      # from - packages[0].version/identifier/registryType - not only the top-level version.
+      # Mirrored by tests/unit/test_release_metadata.py, which runs this script verbatim.
+      - name: Verify tag matches pyproject.toml and server.json (top level and package record)
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PYPROJECT_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          PYPROJECT_NAME=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['name'])")
           SERVER_JSON_VERSION=$(python3 -c "import json; print(json.load(open('server.json'))['version'])")
-          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ] || [ "$TAG_VERSION" != "$SERVER_JSON_VERSION" ]; then
-            echo "Version mismatch: tag=$TAG_VERSION pyproject.toml=$PYPROJECT_VERSION server.json=$SERVER_JSON_VERSION"
+          PACKAGE_VERSION=$(python3 -c "import json; print(json.load(open('server.json'))['packages'][0]['version'])")
+          PACKAGE_IDENTIFIER=$(python3 -c "import json; print(json.load(open('server.json'))['packages'][0]['identifier'])")
+          PACKAGE_REGISTRY=$(python3 -c "import json; print(json.load(open('server.json'))['packages'][0]['registryType'])")
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ] || [ "$TAG_VERSION" != "$SERVER_JSON_VERSION" ] || [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Version mismatch: tag=$TAG_VERSION pyproject.toml=$PYPROJECT_VERSION server.json=$SERVER_JSON_VERSION server.json packages[0]=$PACKAGE_VERSION"
+            exit 1
+          fi
+          if [ "$PACKAGE_REGISTRY" != "pypi" ] || [ "$PACKAGE_IDENTIFIER" != "$PYPROJECT_NAME" ]; then
+            echo "Package record mismatch: server.json packages[0] is $PACKAGE_REGISTRY/$PACKAGE_IDENTIFIER, expected pypi/$PYPROJECT_NAME"
             exit 1
           fi
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0

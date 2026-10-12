@@ -240,6 +240,65 @@ coupling, not a flake. The update path is a quarterly `chore(deps)` that bumps h
 Locking with uv 0.12.23 moved `uv.lock` to lock-file revision 5 (no package, version or hash
 changed); the locally installed uv 0.10.7 reads it unchanged.
 
+## 12. (Proposed) The MCP Registry listing is published from the tagged release, not from a personal host
+
+**Status:** Proposed. The in-repo gate and its tests below are applied; the publishing
+channel itself awaits the maintainer's decision, which depends on a registry fact that has
+to be confirmed first (see Decision, proposed part).
+
+**Context:** Three install channels are advertised: PyPI (`uvx cost-guard-mcp`), the GitHub
+Release, and the official MCP Registry listing `io.github.mcpsmiths/cost-guard-mcp` (live
+since v0.3.0; third-party directories ingest it automatically). PyPI and the GitHub Release
+are produced only by `release.yml` from a `v*` tag under the `pypi` environment, OIDC,
+PEP 740 and SLSA attestations (decision #8). The listing had no in-repo producer: it was
+published by a manual `mcp-publisher` run after a GitHub device-flow login, from whatever
+`server.json` sat on the publisher's host, with no tag, version, environment or attestation
+gate - and the workflow's version check read only `server.json`'s top-level `version`, never
+`packages[0].version` or `packages[0].identifier`, the fields a registry consumer actually
+installs from. The 2026-10 security audit ran the gate's own one-liners against a
+`server.json` with `packages[0].version = 0.0.1` and `identifier = someone-elses-package`
+for tag v9.9.9 and it passed. The README marker `<!-- mcp-name: ... -->` proves PyPI-project
+ownership to the registry but binds no version and no commit.
+
+**Decision (applied now, no-regret):** the release gate requires
+`server.json.version == packages[0].version == tag`, `packages[0].registryType == "pypi"`
+and `packages[0].identifier == pyproject [project].name`, so any `server.json` that reaches
+a tag names this PyPI project at the tag's version. `tests/unit/test_release_metadata.py`
+runs the gate step's own script against fixture manifests (the `0.0.1` case is the negative
+control), pins the README marker, and requires every `SNOWFLAKE_`/`DATABRICKS_`/
+`COST_GUARD_`/`GOOGLE_` environment variable read in `src/` to appear in `server.json`'s
+`environmentVariables` (and, except for the alternative-credential variables, in
+`.mcp.json.example`), so no operator knob ships undocumented in the listing.
+
+**Decision (proposed - maintainer to finalise):**
+- Recommended: a `registry-publish` job in `release.yml` with `needs: publish`,
+  `environment: mcp-registry` (a new environment, separate from `pypi`, so its OIDC token
+  cannot satisfy PyPI's environment claim - decision #8's blast-radius split, kept),
+  `permissions: {contents: read, id-token: write}`; steps: check out the tag, download a
+  pinned `mcp-publisher` release and verify its sha256, `mcp-publisher login github-oidc`,
+  `mcp-publisher publish` from the checked-out `server.json`. Precondition to confirm first,
+  read-only: that `github-oidc` grants `io.github.mcpsmiths/*` to a workflow in this
+  org-owned repository - the project's own notes record that device-flow granted only
+  `io.github.<user>/*` for this name and that a classic PAT with `read:org` was needed. If
+  it does not, fall back to a dedicated `read:org` classic PAT stored only in the
+  `mcp-registry` environment: still bound to the tagged checkout and environment gating.
+- Alternative: keep manual publishing with a written runbook plus the gate above. Weaker: a
+  personal token, no CI identity, no guarantee that PyPI has the version first.
+- Either way: the commit published is the tagged commit `release.yml` verified; ordering is
+  after PyPI has the version (`needs: publish`); rollback is to publish a corrected version
+  and deprecate the bad one (whether the registry lets a version be overwritten, and its
+  deprecate/delete path, is to be recorded here from the registry docs when deciding);
+  break-glass is a manual `mcp-publisher login github --token <read:org PAT>` from a clean
+  checkout of the tag, documented as the exception, never the routine.
+
+**Consequences:** With the recommended default the listing gains a verifiable publisher
+identity and is always produced from the reviewed, tagged commit after PyPI has the version;
+it requires creating the `mcp-registry` GitHub Environment with a `v*` tag deployment
+policy like `pypi`'s (decision #10). Until the decision lands, the manual path remains, but
+the gate guarantees that a listing published from a tagged checkout points at this PyPI
+project at the tag's version. HANDOFF.md's distribution note now points here instead of
+describing the manual run as the procedure.
+
 ## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
 
 **Context:** `sanitize_exceptions` forwarded whatever a warehouse client raised as

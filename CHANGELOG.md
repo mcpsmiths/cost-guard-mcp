@@ -57,6 +57,11 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   `v*` tag whose commit is not an ancestor of `origin/main`; the hosted controls that
   actually bind release authority (tag ruleset, `pypi` environment tag-only deployment
   policy, PyPI publisher bound to that environment) are recorded in DECISIONS.md #10.
+- **Security (registry listing):** the release gate now also requires `server.json`
+  `packages[0].version` to equal the tag and `packages[0].identifier`/`registryType` to name
+  this PyPI project, and a unit test requires every environment variable read in `src/` to
+  be documented in `server.json` and `.mcp.json.example`; the MCP Registry publishing
+  channel itself is recorded as a proposed decision (DECISIONS.md #12).
 
 ## [0.3.3] - 2026-10-10
 
