@@ -95,6 +95,14 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   `ConfigDict` backstop (no `outputSchema` change). Security audit remediation; see
   DECISIONS.md #17.
 
+Changed (Databricks, security-audit remediation): `estimate_query_cost(engine="databricks")`
+now returns `estimated_cost_usd=None` when `EXPLAIN COST` carries no size statistics
+(previously a query-independent rate floor - 0.035 USD on X-Small - for every such query),
+so `run_query_bounded` refuses a requested `max_estimated_cost_usd` for those plans with
+`cost_cap_exceeded`, exactly as the byte cap already did. Breaking for callers who relied
+on the floor; omit the dollar cap to run such a query - there is deliberately no opt-out
+(`DECISIONS.md` #5: an unenforceable cap must never look enforced).
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not

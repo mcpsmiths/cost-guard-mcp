@@ -194,8 +194,17 @@ def test_explain_estimate_handles_missing_statistics(mock_connect):
     estimate = explain_estimate("SELECT * FROM external_csv_table", warehouse=None)
 
     assert estimate.estimated_bytes is None
+    # Audit: databricks-dollar-estimate-floor-when-size-statistics-absent - no statistics
+    # means no dollar figure either (previously a query-independent 0.035 USD rate floor
+    # that let run_query_bounded's dollar cap admit every such query).
+    assert estimate.estimated_cost_usd is None
     assert estimate.accuracy_tier == AccuracyTier.HEURISTIC
     assert any("no size statistics" in c.lower() for c in estimate.caveats)
+    assert any(
+        "dollar" in c.lower() and "unavailable" in c.lower() and "refuse" in c.lower()
+        for c in estimate.caveats
+    )
+    assert not any("None bytes" in c for c in estimate.caveats)
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")

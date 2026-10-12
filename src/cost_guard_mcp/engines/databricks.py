@@ -137,41 +137,54 @@ def explain_estimate(
         explain_output = "\n".join(row[0] for row in rows)
         max_size_in_bytes = _parse_max_size_in_bytes(explain_output)
 
+        # Resolve the rate first so an unknown warehouse_size still raises, with or
+        # without plan statistics.
         rate = dbus_per_hour(warehouse_size)
-        runtime_hours = scale_runtime_hours(
-            max_size_in_bytes, baseline_hours=_ASSUMED_RUNTIME_HOURS
-        )
-        estimated_cost_usd = rate * SERVERLESS_USD_PER_DBU * runtime_hours
 
         caveats = [
             (
                 "Databricks has no BigQuery-style dry-run; this estimate is HEURISTIC, the "
                 "least precise of this project's three accuracy tiers."
             ),
-            (
+        ]
+        # A dollar figure derived from no plan statistics would depend only on the
+        # warehouse rate, not on the query (0.035 USD for every X-Small query) - a cap
+        # compared against it looks enforced but never discriminates. Report it as
+        # unavailable instead so run_query_bounded's fail-closed gate refuses a requested
+        # max_estimated_cost_usd, exactly as it already does for the byte cap when
+        # estimated_bytes is None (DECISIONS.md #5).
+        estimated_cost_usd: float | None
+        if max_size_in_bytes is None:
+            estimated_cost_usd = None
+            caveats.append(
+                "EXPLAIN COST returned no size statistics for this query (common without "
+                "ANALYZE TABLE having been run, for streaming sources, or for non-Delta "
+                "external tables) - the byte and dollar estimates are unavailable, not zero; "
+                "run_query_bounded will refuse any max_bytes_billed or max_estimated_cost_usd "
+                "cap for this query."
+            )
+        else:
+            runtime_hours = scale_runtime_hours(
+                max_size_in_bytes, baseline_hours=_ASSUMED_RUNTIME_HOURS
+            )
+            estimated_cost_usd = round(rate * SERVERLESS_USD_PER_DBU * runtime_hours, 6)
+            caveats.append(
                 f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on "
                 f"a {warehouse_size} Serverless SQL warehouse, scaled up by a coarse size tier "
                 f"based on {max_size_in_bytes} bytes scanned - still a heuristic, not derived "
                 "from this query's actual expected runtime."
-            ),
-            (
-                "Pricing assumes a Serverless SQL warehouse; Classic/Pro warehouses use "
-                "different (lower) DBU rates plus a separate underlying cloud VM cost not "
-                "modeled here."
-            ),
-        ]
-        if max_size_in_bytes is None:
-            caveats.append(
-                "EXPLAIN COST returned no size statistics for this query (common without "
-                "ANALYZE TABLE having been run, for streaming sources, or for non-Delta "
-                "external tables) - the byte estimate is unavailable, not zero."
             )
+        caveats.append(
+            "Pricing assumes a Serverless SQL warehouse; Classic/Pro warehouses use "
+            "different (lower) DBU rates plus a separate underlying cloud VM cost not "
+            "modeled here."
+        )
 
         return CostEstimate(
             engine="databricks",
             accuracy_tier=AccuracyTier.HEURISTIC,
             estimated_bytes=max_size_in_bytes,
-            estimated_cost_usd=round(estimated_cost_usd, 6),
+            estimated_cost_usd=estimated_cost_usd,
             caveats=caveats,
         )
     finally:

@@ -51,7 +51,9 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
             (
                 "Databricks has no BigQuery-style dry-run; EXPLAIN COST's plan-node "
                 "statistics are frequently absent (no ANALYZE TABLE run, streaming "
-                "sources, non-Delta external tables) - byte estimates may be unavailable."
+                "sources, non-Delta external tables) - without them both the byte and the "
+                "dollar estimate are unavailable (None), not zero, and run_query_bounded "
+                "refuses any max_bytes_billed or max_estimated_cost_usd cap for that query."
             ),
             (
                 "The dollar figure assumes a fixed placeholder runtime on a Serverless SQL "

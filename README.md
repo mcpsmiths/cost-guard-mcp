@@ -210,7 +210,12 @@ DATABRICKS_TOKEN = "your-personal-access-token"
   implemented for Databricks as a result; may be revisited if a future paid workspace
   confirms this is a toggleable setting there.
 - Databricks cost estimates are always `HEURISTIC` (the least precise tier) - Databricks
-  has no dry-run, and `EXPLAIN COST`'s byte estimates are frequently unavailable.
+  has no dry-run, and `EXPLAIN COST`'s size statistics are frequently unavailable (no
+  `ANALYZE TABLE`, streaming sources, non-Delta external tables). Without them both the
+  byte and the dollar estimate are `None` - unavailable, not zero - and `run_query_bounded`
+  refuses any `max_bytes_billed` or `max_estimated_cost_usd` cap for that query rather than
+  comparing it against a query-independent rate floor. Omit the cap to run such a query;
+  there is deliberately no flag that restores the old floor (`DECISIONS.md` #5).
 - Databricks pricing only models Serverless SQL warehouses - Classic/Pro warehouses use
   different (lower) DBU rates plus a separate cloud VM cost not modeled here.
 - Databricks has no per-query warehouse override - the SQL warehouse is fixed by
