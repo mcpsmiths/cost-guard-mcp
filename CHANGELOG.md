@@ -30,7 +30,7 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   exceptions) cannot read as a server refusal hint. `check_credentials` failure `detail`
   gets the same presentation and now logs the `engine=<engine> check_credentials_failed`
   WARNING the README promised. SECURITY.md now lists content returned by the warehouse as
-  untrusted data in scope (DECISIONS.md #10).
+  untrusted data in scope (DECISIONS.md #18).
 
 ### Changed
 

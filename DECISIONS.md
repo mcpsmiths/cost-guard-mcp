@@ -159,7 +159,7 @@ README's "Known limitations" - the `referencedRoutines` research question stays
 unresolved for exactly this reason). Any future addition to `integration.yml` needing
 broader access should get its own narrowly-scoped grant, not a widened role on this one.
 
-## 10. Text that did not originate in this process is presented as quoted, bounded, labelled data
+## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
 
 **Context:** `sanitize_exceptions` forwarded whatever a warehouse client raised as
 `<engine> client call failed: <redacted text>` — secret-redacted, but otherwise verbatim:
