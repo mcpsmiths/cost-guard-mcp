@@ -1,6 +1,8 @@
 import logging
+import math
 import re
 import threading
+from typing import Any
 
 from databricks import sql
 from databricks.sdk.core import Config, oauth_service_principal
@@ -14,44 +16,75 @@ from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResu
 
 logger = logging.getLogger(__name__)
 
-# databricks-sql-connector's own _socket_timeout defaults to 900s on the backend used
-# here (confirmed via CONNECTION_PARAMETERS.md against the installed package) - not
-# infinite, but still too long to leave implicit. Set explicitly, matching this
-# project's own established discipline (see snowflake.py's _NETWORK_TIMEOUT_SECONDS).
+# Every connector/SDK round-trip is bounded explicitly. The libraries' own defaults are
+# finite but far too long to leave implicit against the documented 120 s tool-call bound
+# (same discipline as snowflake.py's _NETWORK_TIMEOUT_SECONDS). Defaults being overridden,
+# confirmed against the installed databricks-sql-connector 4.6.0 / databricks-sdk 0.148.0:
+#   - connector _socket_timeout: 900 s on the Thrift backend used here.
+#   - connector retry policy (_retry_stop_after_attempts_duration / _count): 900 s / 30
+#     attempts, read from the connect kwargs. It exists to ride out a classic/pro
+#     warehouse's cold start - which is exactly how a read-only pre-flight call against an
+#     unreachable workspace pinned a worker-thread slot for ~14 minutes.
+#   - SDK Config (OAuth M2M only): retry_timeout_seconds 300 s / http_timeout_seconds 60 s
+#     for the host-metadata probe that runs at Config() time.
+#   - No server-side statement timeout at all; every session now carries STATEMENT_TIMEOUT
+#     (the API ceiling on read-only paths, the execution bound in execute_bounded) so the
+#     warehouse itself kills a statement this process can no longer cancel.
+# Residual, OAuth M2M only, not tunable through Config (upstream databricks-sdk):
+# Config.databricks_oidc_endpoints -> oauth.get_endpoints_from_url runs OIDC discovery on
+# the module-default _BaseClient() (300 s retry budget), and oauth.ClientCredentials' token
+# request is a requests.post without a timeout. Wrapping _connect in a thread+join watchdog
+# was rejected because it would leak the connecting thread; README qualifies the 120 s
+# bound for OAuth M2M accordingly. PAT auth is fully bounded.
 #
 # Deliberately do NOT pass use_kernel=True: the newer Rust "kernel" backend rejects a
 # generic credentials_provider (OAuth M2M) with NotSupportedError. The default (legacy
 # Thrift) backend used here supports both PAT and OAuth M2M.
 _SOCKET_TIMEOUT_SECONDS = 60
+# Ceiling for every connector/SDK retry budget and the STATEMENT_TIMEOUT of read-only
+# sessions (check_credentials, explain_estimate).
+_MAX_API_WAIT_SECONDS = 60
+_CONNECTOR_RETRY_ATTEMPTS = 5
 
 
 @sanitize_exceptions("databricks")
-def _connect() -> "sql.client.Connection":
+def _connect(statement_timeout_seconds: int = _MAX_API_WAIT_SECONDS) -> "sql.client.Connection":
+    """Open a bounded connection. `statement_timeout_seconds` becomes the session's
+    server-side STATEMENT_TIMEOUT; read-only callers take the API-ceiling default,
+    execute_bounded passes its own execution bound."""
     config = load_databricks_config()
 
+    # One kwargs dict for both auth branches so neither can drift back to the connector's
+    # defaults. STATEMENT_TIMEOUT is in the connector's own session-conf allowlist
+    # (databricks/sql/backend/sea/utils/constants.py) and is forwarded to OpenSession.
+    connect_kwargs: dict[str, Any] = {
+        "server_hostname": config.server_hostname,
+        "http_path": config.http_path,
+        "_socket_timeout": _SOCKET_TIMEOUT_SECONDS,
+        "_retry_stop_after_attempts_duration": _MAX_API_WAIT_SECONDS,
+        "_retry_stop_after_attempts_count": _CONNECTOR_RETRY_ATTEMPTS,
+        "session_configuration": {"STATEMENT_TIMEOUT": str(statement_timeout_seconds)},
+    }
+
     if config.client_id:
+        # auth_type pins the strategy so the SDK does not also read DATABRICKS_TOKEN from the
+        # environment and fail with "more than one authorization method configured" when
+        # both variable sets are present.
         sdk_config = Config(
             host=f"https://{config.server_hostname}",
             client_id=config.client_id,
             client_secret=config.client_secret,
+            auth_type="oauth-m2m",
+            retry_timeout_seconds=_MAX_API_WAIT_SECONDS,
+            http_timeout_seconds=_SOCKET_TIMEOUT_SECONDS,
         )
 
         def credentials_provider() -> OAuthCredentialsProvider:
             return oauth_service_principal(sdk_config)
 
-        return sql.connect(
-            server_hostname=config.server_hostname,
-            http_path=config.http_path,
-            credentials_provider=credentials_provider,
-            _socket_timeout=_SOCKET_TIMEOUT_SECONDS,
-        )
+        return sql.connect(credentials_provider=credentials_provider, **connect_kwargs)
 
-    return sql.connect(
-        server_hostname=config.server_hostname,
-        http_path=config.http_path,
-        access_token=config.access_token,
-        _socket_timeout=_SOCKET_TIMEOUT_SECONDS,
-    )
+    return sql.connect(access_token=config.access_token, **connect_kwargs)
 
 
 def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
@@ -263,7 +296,9 @@ def execute_bounded(
         _max_wait_seconds if _max_wait_seconds is not None else _MAX_EXECUTION_WAIT_SECONDS
     )
 
-    conn = _connect()
+    # Server-side ceiling equal to the client watchdog: the watchdog still fires first in the
+    # normal case; STATEMENT_TIMEOUT matters when this process dies before it can cancel.
+    conn = _connect(statement_timeout_seconds=max(1, math.ceil(max_wait_seconds)))
     try:
         wrapped_sql = sql_text
         if max_rows is not None:

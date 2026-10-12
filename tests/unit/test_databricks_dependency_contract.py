@@ -20,6 +20,8 @@ single `Config` argument.
 
 import inspect
 
+import databricks.sql.backend.sea.utils.constants as databricks_sea_constants
+import databricks.sql.backend.thrift_backend as databricks_thrift_backend
 import databricks.sql.client as databricks_sql_client
 from databricks.sdk.core import Config, oauth_service_principal
 from databricks.sql.auth.auth import get_python_sql_connector_auth_provider
@@ -52,3 +54,34 @@ def test_oauth_service_principal_takes_a_single_config_argument():
     params = list(inspect.signature(oauth_service_principal).parameters.values())
     assert len(params) == 1
     assert params[0].annotation in (Config, "Config")
+
+
+# Audit: databricks-readonly-paths-inherit-connector-900s-retry-duration-and-sdk-300s-
+# discovery-budget-no-project-deadline. _connect() now passes the connector's retry budget,
+# a session_configuration STATEMENT_TIMEOUT and the SDK's own timeouts/auth_type. sql.connect
+# swallows unknown kwargs via **kwargs, so a connector rename would silently restore the
+# 900 s / 30-attempt defaults - these pins are what makes such a rename visible.
+
+
+def test_retry_budget_kwargs_are_read_by_the_installed_thrift_backend():
+    source = inspect.getsource(databricks_thrift_backend)
+    assert '"_retry_stop_after_attempts_duration"' in source
+    assert '"_retry_stop_after_attempts_count"' in source
+
+
+def test_session_configuration_is_a_real_connection_parameter():
+    params = inspect.signature(databricks_sql_client.Connection.__init__).parameters
+    assert "session_configuration" in params
+
+
+def test_statement_timeout_is_in_the_connectors_own_session_conf_allowlist():
+    # The connector's allowlist is sourced from the Databricks SQL parameter reference; the
+    # Thrift backend forwards session_configuration to OpenSession verbatim, so this is the
+    # one offline check that the key is a real server-side session parameter.
+    source = inspect.getsource(databricks_sea_constants)
+    assert '"STATEMENT_TIMEOUT"' in source
+
+
+def test_sdk_config_exposes_the_bounds_and_auth_type_connect_sets():
+    for attribute in ("retry_timeout_seconds", "http_timeout_seconds", "auth_type"):
+        assert hasattr(Config, attribute), attribute

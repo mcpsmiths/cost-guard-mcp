@@ -10,10 +10,8 @@ _FAKE_PAT = "fake-pat-placeholder"
 _FAKE_OAUTH_CREDENTIAL_VALUE = "fake-oauth-credential-placeholder"
 
 
-@patch("cost_guard_mcp.engines.databricks.sql.connect")
-@patch("cost_guard_mcp.engines.databricks.load_databricks_config")
-def test_connect_uses_access_token_when_pat_set(mock_load_config, mock_connect):
-    mock_load_config.return_value = MagicMock(
+def _pat_config():
+    return MagicMock(
         server_hostname="my-workspace.cloud.databricks.com",
         http_path="/sql/1.0/warehouses/abc123",
         access_token=_FAKE_PAT,
@@ -21,14 +19,34 @@ def test_connect_uses_access_token_when_pat_set(mock_load_config, mock_connect):
         client_secret=None,
     )
 
+
+def _assert_connect_kwargs_are_bounded(kwargs, *, statement_timeout):
+    # Audit: databricks-readonly-paths-inherit-connector-900s-retry-duration-and-sdk-300s-
+    # discovery-budget-no-project-deadline. The connector's own defaults are a 900 s retry
+    # duration and 30 attempts; every round-trip must settle inside the documented 120 s
+    # tool-call bound, and every session must carry a server-side STATEMENT_TIMEOUT.
+    # Deliberately NOT assert_called_once_with(<full kwarg set>): a regression that drops one
+    # bound must fail on that bound's own line, not be masked by an exact-shape mismatch.
+    assert kwargs["_socket_timeout"] == 60
+    assert 0 < kwargs["_retry_stop_after_attempts_duration"] <= 120
+    assert 0 < kwargs["_retry_stop_after_attempts_count"] <= 10
+    assert kwargs["session_configuration"] == {"STATEMENT_TIMEOUT": statement_timeout}
+
+
+@patch("cost_guard_mcp.engines.databricks.sql.connect")
+@patch("cost_guard_mcp.engines.databricks.load_databricks_config")
+def test_connect_uses_access_token_when_pat_set(mock_load_config, mock_connect):
+    mock_load_config.return_value = _pat_config()
+
     _connect()
 
-    mock_connect.assert_called_once_with(
-        server_hostname="my-workspace.cloud.databricks.com",
-        http_path="/sql/1.0/warehouses/abc123",
-        access_token=_FAKE_PAT,
-        _socket_timeout=60,
-    )
+    mock_connect.assert_called_once()
+    _, kwargs = mock_connect.call_args
+    assert kwargs["server_hostname"] == "my-workspace.cloud.databricks.com"
+    assert kwargs["http_path"] == "/sql/1.0/warehouses/abc123"
+    assert kwargs["access_token"] == _FAKE_PAT
+    assert "credentials_provider" not in kwargs
+    _assert_connect_kwargs_are_bounded(kwargs, statement_timeout="60")
 
 
 @patch("cost_guard_mcp.engines.databricks.oauth_service_principal")
@@ -50,18 +68,48 @@ def test_connect_uses_oauth_m2m_when_client_credentials_set(
 
     _connect()
 
-    mock_config_cls.assert_called_once_with(
-        host="https://my-workspace.cloud.databricks.com",
-        client_id="client-abc",
-        client_secret=_FAKE_OAUTH_CREDENTIAL_VALUE,
-    )
+    mock_config_cls.assert_called_once()
+    _, config_kwargs = mock_config_cls.call_args
+    assert config_kwargs["host"] == "https://my-workspace.cloud.databricks.com"
+    assert config_kwargs["client_id"] == "client-abc"
+    assert config_kwargs["client_secret"] == _FAKE_OAUTH_CREDENTIAL_VALUE
+    # Pinning the auth type stops the SDK also reading DATABRICKS_TOKEN from the environment
+    # and failing with "more than one authorization method configured" when both variable
+    # sets are present (plan-review amendment A19).
+    assert config_kwargs["auth_type"] == "oauth-m2m"
+    # The SDK's host-metadata probe defaults to a 300 s retry budget at Config() time.
+    assert 0 < config_kwargs["retry_timeout_seconds"] <= 120
+    assert config_kwargs["http_timeout_seconds"] == 60
     _, kwargs = mock_connect.call_args
     assert kwargs["server_hostname"] == "my-workspace.cloud.databricks.com"
     assert kwargs["http_path"] == "/sql/1.0/warehouses/abc123"
-    assert kwargs["_socket_timeout"] == 60
+    assert "access_token" not in kwargs
     assert callable(kwargs["credentials_provider"])
     kwargs["credentials_provider"]()
     mock_oauth_service_principal.assert_called_once_with(mock_sdk_config)
+    _assert_connect_kwargs_are_bounded(kwargs, statement_timeout="60")
+
+
+@patch("cost_guard_mcp.engines.databricks.sql.connect")
+@patch("cost_guard_mcp.engines.databricks.load_databricks_config")
+def test_read_only_paths_open_sessions_with_the_api_ceiling_statement_timeout(
+    mock_load_config, mock_connect
+):
+    # check_credentials and explain_estimate (read_only_hint=True) must open their sessions
+    # with the API ceiling, not the 120 s execution bound reserved for run_query_bounded.
+    mock_load_config.return_value = _pat_config()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = ("alice@example.com",)
+    mock_cursor.fetchall.return_value = [("Relation[a] parquet, Statistics(sizeInBytes=1.0 B)",)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    assert check_credentials().ok is True
+    assert mock_connect.call_args.kwargs["session_configuration"] == {"STATEMENT_TIMEOUT": "60"}
+
+    explain_estimate("SELECT 1", warehouse=None)
+    assert mock_connect.call_args.kwargs["session_configuration"] == {"STATEMENT_TIMEOUT": "60"}
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
@@ -495,3 +543,23 @@ def test_execute_bounded_survives_a_failed_connection_close(mock_connect):
     assert row_count == 1
     assert row_cap_hit is False
     mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks.sql.connect")
+@patch("cost_guard_mcp.engines.databricks.load_databricks_config")
+def test_execute_bounded_opens_session_with_execution_statement_timeout(
+    mock_load_config, mock_connect
+):
+    # The 120 s client-side watchdog alone dies with the process; a server-side
+    # STATEMENT_TIMEOUT equal to the wait bound makes the warehouse kill the statement even
+    # when nobody is left to call cancel(). Rounded up to whole seconds, never below 1.
+    mock_load_config.return_value = _pat_config()
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = _make_mock_cursor([(1,)])
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+    assert mock_connect.call_args.kwargs["session_configuration"]["STATEMENT_TIMEOUT"] == "120"
+
+    execute_bounded("SELECT 1", warehouse=None, max_rows=None, _max_wait_seconds=0.2)
+    assert mock_connect.call_args.kwargs["session_configuration"]["STATEMENT_TIMEOUT"] == "1"

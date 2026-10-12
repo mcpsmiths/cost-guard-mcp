@@ -111,6 +111,25 @@ label families case-insensitively (all 1024-based, as Spark prints them) and tre
 Long.MaxValue placeholder (`8.0 EB`/`8.0 EiB`, "statistics unknown") as no statistics, so
 such plans refuse both caps instead of pricing a 9.2e18-byte scan.
 
+Changed (Databricks, security-audit remediation): every connector/SDK round-trip is now
+bounded explicitly - `sql.connect` gets `_retry_stop_after_attempts_duration=60` and
+`_retry_stop_after_attempts_count=5` (connector defaults: 900 s / 30 attempts), the OAuth
+M2M `Config` gets `retry_timeout_seconds=60`, `http_timeout_seconds=60` and
+`auth_type="oauth-m2m"` (PAT and OAuth variables present together no longer fail with "more
+than one authorization method configured"), and every session carries a server-side
+`STATEMENT_TIMEOUT` (60 s for `check_credentials`/`estimate_query_cost`, 120 s for
+`run_query_bounded`, matching the client watchdog) so the warehouse kills a statement this
+process can no longer cancel. Behaviour change: a read-only call against a STOPPED
+Classic/Pro warehouse now both starts (and bills) the warehouse via OpenSession AND fails
+after ~60 s with no result - strictly worse than the previous 15-minute wait-and-succeed -
+so the warehouse-state guard decision (refuse unless RUNNING, opt-in env var to restore
+auto-start) is scheduled directly after this change and the warehouse-lookup work rather
+than left open-ended. OAuth M2M residual not fixable here: the SDK's OIDC discovery (300 s)
+and token POST (untimed) are not tunable through `Config` (upstream `databricks-sdk`).
+Release gate before 0.4.0: an owner live run confirming the workspace accepts
+`session_configuration` `STATEMENT_TIMEOUT` and recording whether the warehouse-level or
+the session value wins.
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not
