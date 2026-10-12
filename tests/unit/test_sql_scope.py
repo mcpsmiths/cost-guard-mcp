@@ -131,6 +131,85 @@ def test_two_terminators_are_refused(engine):
     _refuses("SELECT 1;;", engine)
 
 
+# --- fix-up review: line-comment terminators and doubled-delimiter ambiguity -------------
+
+# Every character str.splitlines() treats as a line boundary. Spark's lexer ends a `--`
+# comment at a bare '\r' and ZetaSQL's at any of [\r\n]; the scanner must end a line comment
+# no later than any engine does, or the text after the engine's terminator hides a statement.
+_LINE_TERMINATORS = [
+    "\n",
+    "\r",
+    "\r\n",
+    "\x0b",
+    "\x0c",
+    "\x1c",
+    "\x1d",
+    "\x1e",
+    "\x85",
+    "\u2028",
+    "\u2029",
+]
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("terminator", _LINE_TERMINATORS)
+def test_line_comment_ends_at_every_line_terminator_not_only_newline(engine, terminator):
+    # BigQuery runs ';'-separated text as a script: a comment the scanner reads to the end of
+    # the text but the engine ends at '\r' hides `DROP TABLE t` behind an estimate of SELECT 1.
+    _refuses(f"SELECT 1 -- x{terminator}; DROP TABLE t", engine)
+    _refuses(f"SELECT 1; -- x{terminator}DROP TABLE t", engine)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_hash_line_comment_ends_at_a_carriage_return(engine):
+    # bigquery: the '#' comment ends at '\r' and the DROP is a second statement; snowflake and
+    # databricks have no '#' comment at all, so the top-level ';' is reached directly.
+    _refuses("SELECT 1 # x\r; DROP TABLE t", engine)
+
+
+def test_double_slash_line_comment_ends_at_a_carriage_return_for_snowflake():
+    _refuses("SELECT 1 // x\r; DROP TABLE t", "snowflake")
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("terminator", _LINE_TERMINATORS)
+def test_line_comment_closed_by_any_line_terminator_is_still_one_statement(engine, terminator):
+    _accepts(f"SELECT 1 -- x{terminator}", engine)
+    _accepts(f"SELECT 1 -- x{terminator}  ; -- y{terminator}", engine)
+
+
+@pytest.mark.parametrize("engine", ["bigquery", "databricks"])
+def test_raw_string_backslash_before_a_doubled_closing_quote_is_refused(engine):
+    # Under the escape-honouring reading (ZetaSQL lexes r'..' with the cooked string's escape
+    # rules) \' does not close the literal, so it ends at the second quote and `; DROP TABLE
+    # t` is top level; under the escape-free reading '' is a doubled quote inside the body.
+    # The doubled pair must not hide the odd backslash run: refuse rather than guess.
+    _refuses("SELECT r'\\''; DROP TABLE t; --'", engine, match="ambiguous")
+    _refuses('SELECT r"\\""; DROP TABLE t; --"', engine, match="ambiguous")
+
+
+def test_raw_bytes_backslash_before_a_doubled_closing_quote_is_refused_for_bigquery():
+    _refuses("SELECT rb'\\''; DROP TABLE t; --'", "bigquery", match="ambiguous")
+
+
+@pytest.mark.parametrize("engine", ["bigquery", "databricks"])
+def test_backtick_identifier_backslash_before_a_doubled_backtick_is_refused(engine):
+    _refuses("SELECT `a\\``; DROP TABLE t; --` FROM x", engine, match="ambiguous")
+
+
+def test_hex_literal_backslash_before_a_doubled_closing_quote_is_refused_for_databricks():
+    _refuses("SELECT X'0A\\''; DROP TABLE t; --'", "databricks", match="ambiguous")
+
+
+@pytest.mark.parametrize("engine", ["bigquery", "databricks"])
+def test_doubled_delimiters_without_a_backslash_still_read_as_one_literal(engine):
+    _accepts("SELECT r'a''b'", engine)
+    _accepts("SELECT `a``b` FROM t", engine)
+    _accepts("SELECT r'a''b'; -- trailing", engine)
+    # An even run before the doubled pair: both readings agree it is two literal backslashes.
+    _accepts("SELECT r'\\\\''b'", engine)
+
+
 # --- fail closed on anything the scanner cannot resolve ---------------------------------
 
 

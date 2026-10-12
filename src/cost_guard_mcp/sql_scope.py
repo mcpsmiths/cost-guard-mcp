@@ -18,6 +18,7 @@ text is model-controlled input and a parser's error path is itself an attack sur
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 from cost_guard_mcp.errors import UserVisibleError
@@ -31,6 +32,12 @@ logger = logging.getLogger(__name__)
 ALLOW_MULTI_STATEMENT_SQL_ENV_VAR = "COST_GUARD_ALLOW_MULTI_STATEMENT_SQL"
 
 _CONTRACT = "estimate_query_cost/run_query_bounded accept exactly one SQL statement"
+
+# Every character str.splitlines() treats as a line boundary - a superset of each dialect's
+# line-comment terminators (Spark's lexer ends a '--' comment at a bare '\r', ZetaSQL's at
+# any of [\r\n]). Ending a comment earlier than an engine does only exposes more text to the
+# scanner (refuse direction); ending it later would hide a second statement behind it.
+_LINE_TERMINATOR_RE = re.compile("[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
 
 
 @dataclass(frozen=True)
@@ -122,8 +129,8 @@ def _prefix_before(sql: str, index: int) -> str:
 
 
 def _line_comment_end(sql: str, index: int) -> int:
-    newline = sql.find("\n", index)
-    return len(sql) if newline == -1 else newline + 1
+    terminator = _LINE_TERMINATOR_RE.search(sql, index)
+    return len(sql) if terminator is None else terminator.end()
 
 
 def _block_comment_end(sql: str, index: int) -> int:
@@ -163,24 +170,28 @@ def _unescaped_literal_end(sql: str, body_start: int, delimiter: str, construct:
     literals, quoted identifiers), with doubling of a one-character delimiter.
 
     Some dialects still let a backslash protect the closing quote inside these forms; where
-    the body ends in an odd run of backslashes the escape-honouring and escape-free readings
-    pick different closing quotes, so that shape is refused rather than guessed."""
+    a candidate closing delimiter sits behind an odd run of backslashes the escape-honouring
+    and escape-free readings pick different closing quotes, so that shape is refused rather
+    than guessed. Candidates are examined one at a time, and the backslash test comes BEFORE
+    the doubled-delimiter test: a backslash-protected quote followed by a second quote is the
+    ambiguous shape, not a doubled pair to skip."""
     opener = body_start - len(delimiter)
     close = sql.find(delimiter, body_start)
-    while close != -1 and len(delimiter) == 1 and sql.startswith(delimiter * 2, close):
-        close = sql.find(delimiter, close + 2)
-    if close == -1:
-        raise _refuse(f"unterminated {construct}", opener)
-    backslash_run = 0
-    while close - backslash_run - 1 >= body_start and sql[close - backslash_run - 1] == "\\":
-        backslash_run += 1
-    if backslash_run % 2 == 1:
-        raise _refuse(
-            f"a backslash immediately before the closing delimiter of a {construct} makes "
-            "its end ambiguous across dialects - escape it differently or drop it",
-            opener,
-        )
-    return close + len(delimiter)
+    while close != -1:
+        backslash_run = 0
+        while close - backslash_run - 1 >= body_start and sql[close - backslash_run - 1] == "\\":
+            backslash_run += 1
+        if backslash_run % 2 == 1:
+            raise _refuse(
+                f"a backslash immediately before the closing delimiter of a {construct} makes "
+                "its end ambiguous across dialects - escape it differently or drop it",
+                opener,
+            )
+        if len(delimiter) == 1 and sql.startswith(delimiter * 2, close):
+            close = sql.find(delimiter, close + 2)
+            continue
+        return close + len(delimiter)
+    raise _refuse(f"unterminated {construct}", opener)
 
 
 def _quoted_end(sql: str, index: int, dialect: _Dialect) -> int:
