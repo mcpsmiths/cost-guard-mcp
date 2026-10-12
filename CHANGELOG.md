@@ -75,7 +75,7 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   block comment. Set `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1` to restore the old behaviour.
   The two tools' descriptions gained the one-statement sentence (a description-only
   `tools/list` change; names, annotations and schemas are unchanged). Security audit
-  remediation; see DECISIONS.md #10.
+  remediation; see DECISIONS.md #15.
 - **Added:** on an on-demand BigQuery project, `run_query_bounded` now attaches a server-side
   `maximumBytesBilled` derived from `max_estimated_cost_usd` (rounded up to the next MiB,
   10 MiB floor; a caller's `max_bytes_billed` is only ever lowered, never raised), so the
@@ -84,7 +84,7 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   is now a normal `status: refused` result (`cost_cap_exceeded` / `byte_cap_exceeded` by cap
   provenance) instead of a `ToolError`. A `NaN` `max_estimated_cost_usd` is rejected (it
   compared as under-cap for every estimate); `+inf` still means no cap. Security audit
-  remediation; see DECISIONS.md #11.
+  remediation; see DECISIONS.md #16.
 - **Changed (breaking):** `run_query_bounded` result rows are now normalised to JSON-safe
   values on every engine and both return paths: `BYTES`/`BINARY` cells arrive as standard
   base64 text (valid-UTF-8 bytes that used to be delivered as plain text are now base64 too),
@@ -93,7 +93,7 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   Previously such cells made the SDK's result serialisation raise after the billed query had
   run, losing the whole result. `BoundedQueryResult` also gained a serialisation-only
   `ConfigDict` backstop (no `outputSchema` change). Security audit remediation; see
-  DECISIONS.md #12.
+  DECISIONS.md #17.
 
 ## [0.3.3] - 2026-10-10
 

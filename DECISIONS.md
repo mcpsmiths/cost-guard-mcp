@@ -326,7 +326,7 @@ machine-visible `Error executing tool <name>:` prefix and `is_error=true` are un
 Any new outbound surface that carries connector or model text must use the same chain —
 never `str(exc)` or `redact_secrets` alone.
 
-## 10. The tools accept exactly one SQL statement, enforced by a fail-closed scanner
+## 15. The tools accept exactly one SQL statement, enforced by a fail-closed scanner
 
 **Context:** A security audit traced the cost-cap gate end to end: `run_query_bounded`
 prices the submitted text once (one dry run / one `EXPLAIN`), compares two numbers, and
@@ -355,9 +355,14 @@ deliberate false positives in the safe direction (`THEN'x'` without whitespace,
 `DATE'2020-01-01'`, raw strings ending in an odd run of backslashes, nested block comments)
 and the hint says how to rewrite them. Every scanner mistake must stay in the refuse
 direction: a new dialect construct is added only once its quoting rules are certain, and an
-uncertain construct is refused, never guessed.
+uncertain construct is refused, never guessed. Two review findings against the first cut
+illustrate the rule: line comments now end at any `str.splitlines()` boundary (Spark ends a
+`--` comment at a bare `\r`; ending a comment earlier than an engine does is always the
+refuse direction), and the odd-backslash test runs on every candidate closing delimiter
+before the doubled-delimiter skip, so `r'\''; DROP TABLE t; --'` is refused as ambiguous
+rather than read as a doubled quote.
 
-## 11. BigQuery dollar caps are also enforced server-side, and the provider's refusal is a normal result
+## 16. BigQuery dollar caps are also enforced server-side, and the provider's refusal is a normal result
 
 **Context:** `run_query_bounded`'s dollar gate trusts the dry-run figure, which BigQuery
 itself flags as uninformative in several shapes: row-level-security-protected tables always
@@ -380,10 +385,13 @@ same reason to `InternalServerError` on the job path - is raised as
 `ProviderByteCapExceeded(SanitizedEngineError)` and mapped to
 `BoundedQueryResult(status="refused")` with `reason=cost_cap_exceeded` when the effective
 limit came from the dollar cap and `byte_cap_exceeded` when it was the caller's own byte cap,
-extending decision #4's "a cap refusal is a normal result" to provider-enforced caps. A `NaN`
-`max_estimated_cost_usd` is rejected with a `UserVisibleError` before any comparison (it
-compares as under-cap for every estimate, and the mcp SDK's JSON parser accepts a bare
-`NaN`); `+inf` is left alone because it compares correctly and means "no dollar cap".
+extending decision #4's "a cap refusal is a normal result" to provider-enforced caps; when no
+cap of ours was attached (no `max_bytes_billed`, no finite dollar cap) the same provider
+rejection is re-raised as the `SanitizedEngineError` it is, since there is no caller cap to
+attribute it to. A `NaN` `max_estimated_cost_usd` is rejected with a `UserVisibleError`
+before any comparison (it compares as under-cap for every estimate, and the mcp SDK's JSON
+parser accepts a bare `NaN`); `+inf` is left alone because it compares correctly and means
+"no dollar cap".
 
 **Consequences:** BigQuery enforces the approved spend regardless of how the unresolved
 provider facts turn out; nothing changes for Snowflake/Databricks (`execute_bounded`
@@ -392,7 +400,7 @@ minimum means a tight cap on a many-table query can still be provider-rejected a
 the gate - it now surfaces as the structured refusal rather than a provider error string. A
 caller-supplied `max_bytes_billed=0` is passed through unchanged, as before.
 
-## 12. Result rows are normalised to JSON-safe values at one choke point, after execution
+## 17. Result rows are normalised to JSON-safe values at one choke point, after execution
 
 **Context:** `BoundedQueryResult.rows` is typed `list[dict]` and all three `execute_bounded`
 implementations return connector-native cell values. The pinned `mcp` SDK serialises a tool
