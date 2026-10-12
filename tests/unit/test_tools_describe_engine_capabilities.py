@@ -57,3 +57,12 @@ def test_databricks_capabilities_disclose_observed_size_reconciliation_and_fail_
     caps = describe_engine_capabilities("databricks")
     assert any("only raise" in gap for gap in caps.known_gaps)
     assert any("Classic/Pro" in gap and "no dollar" in gap.lower() for gap in caps.known_gaps)
+
+
+@pytest.mark.parametrize("engine", ["snowflake", "databricks"])
+def test_warehouse_engines_disclose_that_read_only_tools_can_start_or_resume_a_warehouse(engine):
+    caps = describe_engine_capabilities(engine)
+    assert any(
+        "check_credentials" in gap and "estimate_query_cost" in gap and "compute" in gap
+        for gap in caps.known_gaps
+    )

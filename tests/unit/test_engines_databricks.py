@@ -825,3 +825,13 @@ def test_explain_estimate_returns_no_dollar_figure_when_a_serverless_warehouse_r
 
     assert estimate.estimated_cost_usd is None
     assert any("no cluster size" in c and "run_query_bounded" in c for c in estimate.caveats)
+
+
+def test_check_credentials_docstring_states_the_statement_it_runs():
+    # The previous docstring claimed the check ran "without ... any real query"; it executes
+    # SELECT current_user() on the DATABRICKS_HTTP_PATH warehouse, which can start a stopped
+    # warehouse. Pin the correction so the claim cannot quietly drift back.
+    docstring = check_credentials.__doc__ or ""
+    assert "SELECT current_user()" in docstring
+    assert "start" in docstring and "warehouse" in docstring
+    assert "without running" not in docstring

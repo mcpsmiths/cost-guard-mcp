@@ -102,8 +102,14 @@ def _connect(statement_timeout_seconds: int = _MAX_API_WAIT_SECONDS) -> "sql.cli
 
 
 def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
-    """Verify Databricks credentials/connectivity without running EXPLAIN COST or any real
-    query.
+    """Verify Databricks credentials/connectivity by opening a session on the
+    DATABRICKS_HTTP_PATH warehouse and executing `SELECT current_user()` - a lightweight
+    context statement, not EXPLAIN COST or a real query. It does run on the warehouse, so it
+    can start a STOPPED SQL warehouse and bill compute until the warehouse auto-stops again
+    (whether the Thrift session alone auto-starts it is the pending owner observation in audit
+    record read-only-tools-auto-start-stopped-warehouse; the fail-closed warehouse-state guard
+    with its COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START opt-in is that record's open decision
+    and would reuse _lookup_warehouse's `state`).
 
     `warehouse` is accepted only for calling-convention consistency with the bigquery/
     snowflake engines and is a documented no-op: Databricks has no per-query USE WAREHOUSE

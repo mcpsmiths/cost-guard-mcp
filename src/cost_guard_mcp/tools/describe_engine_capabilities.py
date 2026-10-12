@@ -54,6 +54,14 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "dollar figure, so run_query_bounded refuses a max_estimated_cost_usd cap on it "
                 "- omit the dollar cap to run there."
             ),
+            (
+                "check_credentials and estimate_query_cost are read-only with respect to data "
+                "but not free of compute: they run lightweight statements (USE WAREHOUSE, a "
+                "session-context SELECT, EXPLAIN, SHOW WAREHOUSES, CURRENT_REGION(), a "
+                "QUERY_HISTORY read) on the named or default warehouse session, which can "
+                "resume a suspended AUTO_RESUME warehouse and bill compute until it suspends "
+                "again."
+            ),
         ],
     ),
     "databricks": EngineCapabilities(
@@ -89,6 +97,12 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
             (
                 "There is no per-query USE WAREHOUSE equivalent - the SQL warehouse is "
                 "fixed by DATABRICKS_HTTP_PATH at connect time, not overridable per call."
+            ),
+            (
+                "check_credentials and estimate_query_cost are read-only with respect to data "
+                "but not free of compute: they open a session on the DATABRICKS_HTTP_PATH "
+                "warehouse and run SELECT current_user() / EXPLAIN COST, which can start a "
+                "STOPPED SQL warehouse and bill compute until it auto-stops again."
             ),
         ],
     ),

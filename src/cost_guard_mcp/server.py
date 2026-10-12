@@ -191,9 +191,14 @@ _run_query_bounded_safe = as_tool_error(_run_query_bounded_in_thread)
 
 @mcp.tool(annotations=_CHECK_CREDENTIALS_ANNOTATIONS)
 def check_credentials(engine: Engine, warehouse: str | None = None) -> CredentialCheckResult:
-    """Verify credentials/connectivity for an engine without running any real query or
-    dry-run estimate. Call this once after configuring a new engine (or when a real tool
-    call fails) to get a fast, clear yes/no signal instead of debugging via trial queries.
+    """Verify credentials/connectivity for an engine with one lightweight session-context
+    statement - no real query and no dry-run estimate. Call this once after configuring a new
+    engine (or when a real tool call fails) to get a fast, clear yes/no signal instead of
+    debugging via trial queries.
+
+    Compute disclosure: on Snowflake and Databricks that statement runs on the named (or
+    default/configured) warehouse session, which can resume a suspended or start a stopped
+    warehouse and bill compute unless it is already running.
     """
     return _check_credentials_safe(engine, warehouse)
 
@@ -227,7 +232,12 @@ def estimate_query_cost(
     priced at the warehouse the query is pinned to as the server observes it (its size, type
     and generation) and at the operator-configured edition, whichever is higher. Warehouse
     types without a modelled rate (Snowpark-optimized, Databricks Classic/Pro) get no dollar
-    figure."""
+    figure.
+
+    Compute disclosure: on Snowflake and Databricks the EXPLAIN and the warehouse/history
+    metadata lookups run on the named (or default/configured) warehouse session, which can
+    resume a suspended or start a stopped warehouse and bill compute unless it is already
+    running."""
     return _estimate_query_cost_safe(engine, sql, warehouse, warehouse_size, edition)
 
 

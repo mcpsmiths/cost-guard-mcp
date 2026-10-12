@@ -23,7 +23,7 @@ An AI agent using a warehouse MCP can silently trigger a full-table scan that co
 
 ## Tools
 
-- `check_credentials(engine, warehouse?)` — verifies credentials/connectivity without running any real query; call this first after configuring a new engine. Supports BigQuery, Snowflake, and Databricks.
+- `check_credentials(engine, warehouse?)` — verifies credentials/connectivity with one lightweight session-context statement (no real query, no dry run); call this first after configuring a new engine. Supports BigQuery, Snowflake, and Databricks. On Snowflake/Databricks it runs on the named (or default/configured) warehouse and can resume a suspended or start a stopped warehouse, billing compute — see Known limitations.
 - `describe_engine_capabilities(engine)` — what's exact vs. approximate for this engine.
 - `estimate_query_cost(engine, sql, warehouse?, warehouse_size?, edition?)` — pre-flight cost estimate, tagged with its accuracy tier. Supports BigQuery, Snowflake, and Databricks. Accepts exactly one SQL statement per call (see Known limitations). `warehouse_size` (Snowflake/Databricks) and `edition` (Snowflake) can only raise the estimate — the dollar figure is priced at the warehouse the query is pinned to, as the server observes it (the `SHOW WAREHOUSES` size/type/generation, or the Databricks Warehouses API), and at the operator-configured `SNOWFLAKE_EDITION`, whichever is higher. Warehouse types without a modelled rate (Snowpark-optimized, Databricks Classic/Pro) get a byte estimate but no dollar figure.
 - `run_query_bounded(engine, sql, max_bytes_billed?, max_rows?, max_estimated_cost_usd?, warehouse?, warehouse_size?, edition?)` — refuses to run if the estimate exceeds your bound. Supports BigQuery, Snowflake, and Databricks. Accepts exactly one SQL statement per call (see Known limitations). A `max_estimated_cost_usd` cap is checked against that observed-warehouse estimate and refuses when no dollar figure exists.
@@ -281,6 +281,17 @@ COST_GUARD_MAX_IN_FLIGHT_QUERIES = "8"
   only raise the USD/credit price, never lower it. A null or non-integer `bytesAssigned` in
   EXPLAIN's plan yields no byte or dollar estimate (unless a historical runtime for the exact
   query exists) rather than the information-free baseline figure.
+- `check_credentials` and `estimate_query_cost` carry `readOnlyHint: true` and never run your
+  query, but they are not free of compute on Snowflake and Databricks: they run lightweight
+  statements (a session-context `SELECT`, `EXPLAIN`, `SHOW WAREHOUSES`, `CURRENT_REGION()`, a
+  `QUERY_HISTORY` read; on Databricks `SELECT current_user()` / `EXPLAIN COST`) on the named,
+  default or `DATABRICKS_HTTP_PATH` warehouse session, which can resume a suspended
+  `AUTO_RESUME` warehouse or start a stopped SQL warehouse and bill compute until it suspends
+  or auto-stops again. Which of these statements actually trigger a resume/start, and whether
+  the read-only tools should refuse on a non-running warehouse unless opted in, is an open
+  owner decision (audit records `read-only-tools-resume-suspended-warehouse` and
+  `read-only-tools-auto-start-stopped-warehouse`) — until it lands, point these tools at an
+  already-running warehouse if an unplanned resume would be unwelcome.
 - BigQuery Editions/capacity-billed projects cannot get a dollar estimate — only a byte count (capacity billing has no fixed $/byte rate).
 - BigQuery dry runs always report 0 bytes processed for tables protected by row-level security, by design, to prevent a side-channel — `dry_run` adds a caveat when it sees 0 bytes against a non-empty `referenced_tables` list, but a $0.00 estimate on such a query must never be treated as proof the query is free to run.
 - On an on-demand BigQuery project, `run_query_bounded`'s `max_estimated_cost_usd` is also enforced server-side: the job carries a `maximumBytesBilled` derived from the dollar cap (cap ÷ $6.25/TiB, rounded up to the next MiB, floored at BigQuery's 10 MiB minimum), lowered further to a caller-supplied `max_bytes_billed` but never raised above it. This is what makes the cap hold for the shapes the dry run cannot price — row-level-security-protected tables (always 0 bytes), `LOWER_BOUND` estimates and absent statistics. A query that would bill more than that limit is rejected by BigQuery with no charge and surfaces as a normal `status: "refused"` result (`reason: cost_cap_exceeded` when the limit came from the dollar cap, `byte_cap_exceeded` when it was your own byte cap), not as an error. Residual: BigQuery bills a 10 MiB minimum per referenced table, so a tight cap on a many-table query can still be provider-rejected after passing the gate — it now shows up as that structured refusal rather than a provider error string. A `NaN` `max_estimated_cost_usd` is rejected outright (it would compare as "under cap" for every estimate); `+inf` still means "no dollar cap".

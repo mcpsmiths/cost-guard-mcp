@@ -210,6 +210,15 @@ the session value wins.
   (default `standard`) sets the USD/credit price. The `estimate_query_cost` and
   `run_query_bounded` descriptions changed accordingly (an intended, description-only
   `tools/list` diff; names, schemas and annotations are unchanged).
+- **Tool descriptions disclose warehouse compute.** `check_credentials` and
+  `estimate_query_cost` (read-only hints) now state that on Snowflake/Databricks they run
+  lightweight statements on the named/configured warehouse session, which can resume a
+  suspended or start a stopped warehouse and bill compute; `describe_engine_capabilities`
+  known_gaps and the README say the same, and the Databricks `check_credentials` docstring no
+  longer claims it runs "without ... any real query" (it executes `SELECT current_user()`).
+  This is the no-regret part of audit records `read-only-tools-resume-suspended-warehouse`
+  and `read-only-tools-auto-start-stopped-warehouse`; the warehouse-state guards remain open
+  owner decisions. Description-only `tools/list` diff.
 
 ## [0.3.3] - 2026-10-10
 

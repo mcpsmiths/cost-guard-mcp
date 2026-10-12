@@ -398,3 +398,14 @@ def test_size_and_edition_arguments_are_described_as_only_able_to_raise_the_esti
     # descriptions must no longer tell the model the rate is its own responsibility.
     for name in ("estimate_query_cost", "run_query_bounded"):
         assert "only raise" in _tool_description(name), name
+
+
+def test_read_only_tool_descriptions_disclose_the_warehouse_compute_side_effect():
+    # check_credentials and estimate_query_cost carry read_only_hint=True, but on Snowflake/
+    # Databricks they run statements on the configured warehouse, which can resume/start a
+    # suspended/stopped warehouse and bill compute. HANDOFF.md required that monetary side
+    # effect to be stated in the description itself (hosts treat annotations as hints only).
+    for name in ("check_credentials", "estimate_query_cost"):
+        description = _tool_description(name)
+        assert "warehouse" in description, name
+        assert "compute" in description, name
