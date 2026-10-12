@@ -7,13 +7,16 @@ for Python's `logging` module when no handler is configured, and for `print(...,
 
 import functools
 import os
+import threading
+from collections.abc import Callable
 
 import anyio.from_thread
 import anyio.to_thread
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 
-from cost_guard_mcp.errors import as_tool_error
+from cost_guard_mcp.config import ConfigError
+from cost_guard_mcp.errors import UserVisibleError, as_tool_error
 from cost_guard_mcp.tools.check_credentials import check_credentials as _check_credentials
 from cost_guard_mcp.tools.describe_engine_capabilities import (
     describe_engine_capabilities as _describe_engine_capabilities,
@@ -56,6 +59,79 @@ _check_credentials_safe = as_tool_error(_check_credentials)
 _describe_engine_capabilities_safe = as_tool_error(_describe_engine_capabilities)
 _estimate_query_cost_safe = as_tool_error(_estimate_query_cost)
 
+# Explicit in-flight cap for the one tool with a monetary side effect. The MCP-level detach
+# below (abandon_on_cancel=True) returns anyio's thread-limiter token the moment the host
+# cancels, while the worker thread, its per-call warehouse connection and the running query
+# stay pinned for up to the 120 s watchdog - so without this cap a host that cancels and
+# re-issues could pin an unbounded number of live warehouse queries, and the process would
+# have stopped counting them. The slot is held for the thread's whole lifetime, cancelled
+# or not. Positive integer, default 8; a bad value fails at startup naming the variable.
+_MAX_IN_FLIGHT_QUERIES_ENV_VAR = "COST_GUARD_MAX_IN_FLIGHT_QUERIES"
+_DEFAULT_MAX_IN_FLIGHT_QUERIES = 8
+
+
+def _load_max_in_flight_queries() -> int:
+    raw = os.environ.get(_MAX_IN_FLIGHT_QUERIES_ENV_VAR)
+    if not raw:  # unset or empty (what GitHub Actions passes for an unset secret) -> default
+        return _DEFAULT_MAX_IN_FLIGHT_QUERIES
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        # Names only the variable - never echoes the rejected text into the error.
+        raise ConfigError(
+            f"{_MAX_IN_FLIGHT_QUERIES_ENV_VAR} must be a positive integer: the maximum number "
+            f"of run_query_bounded calls allowed in flight at once (default "
+            f"{_DEFAULT_MAX_IN_FLIGHT_QUERIES})."
+        )
+    return value
+
+
+_MAX_IN_FLIGHT_QUERIES = _load_max_in_flight_queries()
+_RUN_QUERY_BOUNDED_IN_FLIGHT = threading.BoundedSemaphore(_MAX_IN_FLIGHT_QUERIES)
+
+
+def _run_query_bounded_holding_in_flight_slot(
+    engine: Engine,
+    sql: str,
+    max_bytes_billed: int | None,
+    max_rows: int | None,
+    max_estimated_cost_usd: float | None,
+    warehouse: str | None,
+    warehouse_size: str | None,
+    edition: str | None,
+    *,
+    before_execute: Callable[[], None] | None = None,
+) -> BoundedQueryResult:
+    # Runs INSIDE the worker thread, deliberately. Both the acquire and the release must
+    # live here: anyio's WorkerThread.run skips the function entirely when the future is
+    # already cancelled by the time the thread picks the job up, so an acquire on the async
+    # side could leak a slot that no thread would ever release; and a blocking acquire would
+    # park one of anyio's shared thread-pool tokens behind a full cap instead of refusing.
+    # The non-blocking refusal happens before any warehouse connection is opened.
+    if not _RUN_QUERY_BOUNDED_IN_FLIGHT.acquire(blocking=False):
+        raise UserVisibleError(
+            f"run_query_bounded: {_MAX_IN_FLIGHT_QUERIES} queries are already in flight "
+            f"({_MAX_IN_FLIGHT_QUERIES_ENV_VAR}={_MAX_IN_FLIGHT_QUERIES}); wait for one to "
+            "finish - a cancelled call keeps its slot until its warehouse query completes or "
+            "the ~120 s watchdog cancels it."
+        )
+    try:
+        return _run_query_bounded(
+            engine,
+            sql,
+            max_bytes_billed,
+            max_rows,
+            max_estimated_cost_usd,
+            warehouse,
+            warehouse_size,
+            edition,
+            before_execute=before_execute,
+        )
+    finally:
+        _RUN_QUERY_BOUNDED_IN_FLIGHT.release()
+
 
 async def _run_query_bounded_in_thread(
     engine: Engine,
@@ -89,7 +165,7 @@ async def _run_query_bounded_in_thread(
     # when called outside an anyio worker thread.
     return await anyio.to_thread.run_sync(
         functools.partial(
-            _run_query_bounded,
+            _run_query_bounded_holding_in_flight_slot,
             engine,
             sql,
             max_bytes_billed,

@@ -65,6 +65,14 @@ simplest) or `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET` (OAuth machine-
 via a service principal, preferred for automated use). Only Serverless SQL warehouses are
 priced accurately — see Known Limitations.
 
+### Concurrency (optional)
+`COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default `8`) caps how many `run_query_bounded` calls may
+be in flight at once — counting calls the host has already cancelled, until their worker
+thread exits (at most the 120 s watchdog). A call over the cap fails immediately with a tool
+error naming this variable, before any warehouse connection is opened. Must be a positive
+integer (the server refuses to start otherwise); raise it only if your host legitimately runs
+more concurrent billable queries.
+
 ### A note on credentials with MCP hosts
 
 Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as its own subprocess — it does **not** automatically inherit your shell's environment variables, even if they're set in your `.zshrc`/`.bashrc`. Put them directly in the host's server config instead — see [`.mcp.json.example`](.mcp.json.example) for the exact block, and the "Use with other AI coding tools" section below for where each specific tool wants it. This repository's `.gitignore` already excludes `.mcp.json`, `*.p8`/`*.pem`/`*.key` and `credentials*.json`, so a project-root host config or key file holding real credentials is never committed by accident.
@@ -167,6 +175,7 @@ SNOWFLAKE_PRIVATE_KEY_PATH = "/path/to/rsa_key.p8"
 DATABRICKS_SERVER_HOSTNAME = "your-workspace.cloud.databricks.com"
 DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/your-warehouse-id"
 DATABRICKS_TOKEN = "your-personal-access-token"
+COST_GUARD_MAX_IN_FLIGHT_QUERIES = "8"
 ```
 
 ## Observability
@@ -265,6 +274,7 @@ DATABRICKS_TOKEN = "your-personal-access-token"
 - Every other BigQuery API round-trip this server makes (the service-account lookup behind `check_credentials`, the dry-run and execution job submissions, the Reservations lookup behind the billing-model check) is bounded to 30 seconds of retries, and the client library's own job re-submission is disabled (`job_retry=None`), so the "up to 120 seconds" statements here also hold while Google is unreachable — before 0.4.0 these inherited google-cloud-bigquery's 600 s default retry (doubled for job submission) and could block a tool call for 10-20 minutes, and an abandoned `run_query_bounded` thread could still submit its billed job minutes after the host had cancelled the call.
 - The underlying `mcp` SDK can drop an in-flight tool-call response if the client closes stdin before the tool finishes (upstream issue [modelcontextprotocol/python-sdk#2678](https://github.com/modelcontextprotocol/python-sdk/issues/2678), open since 2026-05, unresolved after several attempted fixes) — no known real-world exposure for well-behaved clients that keep stdin open for the session, but worth knowing about given this server's tool calls can run up to 120 seconds (Databricks OAuth M2M is the one path that can exceed that bound: the `databricks-sdk`'s OIDC discovery keeps its own 300 s retry budget and its token request is untimed, neither tunable through `Config` — an upstream limitation; PAT auth is fully bounded).
 - A client-sent MCP cancellation notification against an in-flight `run_query_bounded` call detaches promptly at the MCP bookkeeping level, and since 0.4.0 the server re-checks for that cancellation once more immediately before the execution is dispatched (after the estimate and every cap check), so a cancel that arrives during the estimate phase never starts the billable query at all. A query that was already running when the cancel arrived keeps running in the abandoned background thread until the per-engine watchdog (~120 s, see above) cancels it. As a backstop that no longer depends on this process staying alive, every submitted job also carries a provider-side deadline equal to that watchdog — BigQuery `jobTimeoutMs`, Snowflake `STATEMENT_TIMEOUT_IN_SECONDS` and Databricks `STATEMENT_TIMEOUT` as session parameters (only ever lowered, never raising an operator's stricter account/user/warehouse policy; see `DECISIONS.md` #14) — so a host that escalates to SIGTERM/SIGKILL after closing stdin (the reference MCP client does, 2-4 s after EOF) cannot leave a query billing past that bound. If you run the container, keep the `--init` flag from the install example: without it the server is PID 1, ignores SIGTERM, and `docker stop` ends in SIGKILL. An MCP host that retries a timed-out or cancelled call issues a brand-new billable call; the earlier one is never resumed.
+- `run_query_bounded` admits at most `COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default 8) calls at once, and a cancelled call keeps its slot until its abandoned thread exits — the MCP-level detach returns the host's concurrency token immediately, so without this cap a host that cancels and re-issues could pin an unbounded number of warehouse connections and running queries (each still bounded by its own caps and the 120 s watchdog). An over-cap call fails with a tool error naming the variable rather than a `status: "refused"` result, because no estimate exists yet (`DECISIONS.md` #4 and #14).
 
 ## More docs
 

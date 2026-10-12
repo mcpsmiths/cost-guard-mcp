@@ -452,7 +452,7 @@ folded in here.
 input pinning, registry publishing channel, read-statement allowlist); the numbering is fixed
 by the remediation plan so parallel branches never claim the same heading. -->
 
-## 14. `run_query_bounded` cancellation: prompt detach, pre-dispatch check, provider-side deadlines
+## 14. `run_query_bounded` cancellation: prompt detach, pre-dispatch check, provider-side deadlines, in-flight cap
 
 **Context:** `run_query_bounded` is the only tool with a monetary side effect. Since v0.3.0
 its blocking warehouse call runs in an anyio worker thread dispatched with
@@ -465,7 +465,11 @@ running in that thread, so a host that escalates to SIGTERM/SIGKILL after closin
 (the reference MCP client does, 2-4 s after EOF; in Docker the server is PID 1 and ignores
 SIGTERM) orphaned the query on the warehouse with no bound at all; and (3) every BigQuery
 API round-trip outside the result wait inherited the client library's 600 s default retry
-(doubled for job submission), so the job begin could still happen minutes after the cancel.
+(doubled for job submission), so the job begin could still happen minutes after the cancel;
+and (4) the detach returned anyio's thread-limiter token (the only, incidental, 40-token
+concurrency bound) while the thread, its connection and its query stayed pinned, so a host
+that cancelled and re-issued grew the number of live warehouse queries without any
+in-process bound.
 
 **Decision:** Keep `abandon_on_cancel=True` - a stop button that returns promptly is the
 right behaviour for the host - and close the gaps around it instead of forwarding the
@@ -489,6 +493,18 @@ cancel into the engines:
   the `warehouse_client_call_failed` record when the warehouse's cancellation wins).
 - BigQuery API calls carry a 30 s retry bound and `job_retry=None` (see
   `engines/bigquery.py`), so the pre-dispatch window is seconds, not minutes.
+- An explicit in-flight cap, `COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default 8, positive
+  integer, rejected at startup otherwise), implemented as a `threading.BoundedSemaphore`
+  whose slot is acquired non-blocking and released inside the worker thread. Acquire and
+  release both live in the thread because anyio's `WorkerThread.run` skips the function
+  when the future is already cancelled (an async-side acquire could leak a slot) and a
+  blocking acquire would park a shared thread-pool token. A cancelled call therefore keeps
+  counting until its thread exits. Over-cap calls raise `UserVisibleError`, which the
+  existing `as_tool_error` wrapper turns into a `ToolError` naming the variable - not a
+  `status="refused"` result, because no estimate exists yet (decision #4: `ToolError` for
+  genuine exceptions). Default 8 rather than 40 (anyio's incidental limiter): the model
+  should rarely need more than a handful of concurrent 120 s billable queries, and the
+  variable exists for the host that does.
 
 Deferred: forwarding the cancel to the engines' own cancel RPCs (`QueryJob.cancel`,
 `SYSTEM$CANCEL_QUERY`, `Cursor.cancel`) and a SIGTERM/lifespan handler that cancels
@@ -501,3 +517,6 @@ load-bearing (PID 1 otherwise ignores SIGTERM). A cancelled call still bills for
 that was already running when the cancel arrived, for at most the 120 s watchdog. The
 pre-dispatch check is only as good as the host's cancellation path through the dispatcher's
 cancel scope; a host that simply drops the connection relies on the provider-side deadline.
+A host issuing more than eight concurrent billable calls, or cancelling and re-issuing past
+the cap, now sees a `ToolError` that names `COST_GUARD_MAX_IN_FLIGHT_QUERIES` and explains
+that cancelled calls still count; raising the variable is the opt-out.

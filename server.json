@@ -100,6 +100,12 @@
           "description": "Set to 1 to let estimate_query_cost/run_query_bounded accept text containing more than one SQL statement. Off by default: the cost cap is only known to cover the single statement the dry run/EXPLAIN priced.",
           "isRequired": false,
           "isSecret": false
+        },
+        {
+          "name": "COST_GUARD_MAX_IN_FLIGHT_QUERIES",
+          "description": "Maximum number of run_query_bounded calls allowed in flight at once (positive integer, default 8). A cancelled call keeps its slot until its warehouse query completes or the 120 s watchdog fires; a call over the cap fails with a tool error naming this variable before any warehouse connection is opened.",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

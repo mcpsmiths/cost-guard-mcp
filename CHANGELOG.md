@@ -173,8 +173,20 @@ the session value wins.
   `anyio.from_thread.check_cancelled`), and every BigQuery job carries
   `jobTimeoutMs=120000` so BigQuery enforces the same bound after the process is gone.
 
+### Added
+
+- `COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default 8): an explicit cap on concurrent
+  `run_query_bounded` calls whose slot is held for the worker thread's whole lifetime. An MCP
+  cancel returned anyio's thread-limiter token while the thread, its warehouse connection
+  and the running query stayed pinned, so cancel-and-reissue could pin an unbounded number
+  of live queries. Over-cap calls fail with a tool error naming the variable before any
+  warehouse connection is opened; the variable is documented in `server.json` and
+  `.mcp.json.example`.
+
 ### Changed
 
+- A cancelled `run_query_bounded` call now counts against the in-flight cap until its
+  warehouse query completes or the 120 s watchdog fires (`DECISIONS.md` #14).
 - The Docker install example runs the container with `--init` so SIGTERM reaches the PID-1
   server; the cancellation entry under Known limitations was rewritten (`DECISIONS.md` #14).
 
