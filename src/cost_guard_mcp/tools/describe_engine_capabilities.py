@@ -40,6 +40,20 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "warehouse argument is supplied - omitting it uses whatever warehouse is "
                 "already active on the connection."
             ),
+            (
+                "The dollar figure is priced at the warehouse the query is pinned to as observed "
+                "through SHOW WAREHOUSES (size, type, Gen1/Gen2) - or the session's current "
+                "warehouse when no warehouse argument is given; warehouse_size and edition "
+                "(operator-configured via SNOWFLAKE_EDITION) can only raise the estimate, never "
+                "lower it. If that lookup fails (e.g. the role cannot run SHOW WAREHOUSES) the "
+                "estimate falls back to the caller-asserted size at Gen1 rates with a caveat."
+            ),
+            (
+                "Only STANDARD warehouses are priced: a Snowpark-optimized (or any other "
+                "non-STANDARD type, or unrecognised-size) warehouse gets a byte estimate but no "
+                "dollar figure, so run_query_bounded refuses a max_estimated_cost_usd cap on it "
+                "- omit the dollar cap to run there."
+            ),
         ],
     ),
     "databricks": EngineCapabilities(
@@ -60,8 +74,17 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "warehouse, not derived from this query's actual expected runtime."
             ),
             (
-                "Only Serverless SQL warehouse pricing is modeled - Classic/Pro warehouses "
-                "use different DBU rates plus a separate cloud VM cost not modeled here."
+                "The dollar figure is priced at the SQL warehouse DATABRICKS_HTTP_PATH binds "
+                "to, as observed through the Warehouses API (cluster size, Serverless or not); "
+                "warehouse_size can only raise the estimate, never lower it. If that lookup "
+                "fails (e.g. the principal lacks CAN_VIEW/CAN_USE on the warehouse) the "
+                "estimate falls back to the caller-asserted size with a caveat."
+            ),
+            (
+                "Only Serverless SQL warehouse pricing is modeled: a Classic/Pro warehouse "
+                "(different DBU rates plus a separate cloud VM cost) gets a byte estimate but "
+                "no dollar figure, so run_query_bounded refuses a max_estimated_cost_usd cap on "
+                "it - omit the dollar cap to run there."
             ),
             (
                 "There is no per-query USE WAREHOUSE equivalent - the SQL warehouse is "

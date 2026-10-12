@@ -1,23 +1,74 @@
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from databricks.sdk.service.sql import GetWarehouseResponse, State
 
-from cost_guard_mcp.engines.databricks import _connect, check_credentials
+from cost_guard_mcp.engines.databricks import (
+    _MAX_API_WAIT_SECONDS,
+    _SOCKET_TIMEOUT_SECONDS,
+    _connect,
+    _lookup_warehouse,
+    _warehouse_id,
+    _WarehouseFacts,
+    check_credentials,
+)
+from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
 
 # Placeholder values for mocked config fields below - never real credentials.
 _FAKE_PAT = "fake-pat-placeholder"
 _FAKE_OAUTH_CREDENTIAL_VALUE = "fake-oauth-credential-placeholder"
 
 
-def _pat_config():
+def _pat_config(http_path="/sql/1.0/warehouses/abc123"):
     return MagicMock(
         server_hostname="my-workspace.cloud.databricks.com",
-        http_path="/sql/1.0/warehouses/abc123",
+        http_path=http_path,
         access_token=_FAKE_PAT,
         client_id=None,
         client_secret=None,
     )
+
+
+def _oauth_config(http_path="/sql/1.0/warehouses/abc123"):
+    return MagicMock(
+        server_hostname="my-workspace.cloud.databricks.com",
+        http_path=http_path,
+        access_token=None,
+        client_id="client-abc",
+        client_secret=_FAKE_OAUTH_CREDENTIAL_VALUE,
+    )
+
+
+def _warehouse_response(*, cluster_size="5X-Large", serverless=True, state=State.RUNNING):
+    # The real SDK response type, so these tests pin the field names explain_estimate reads.
+    return GetWarehouseResponse(
+        id="abc123", cluster_size=cluster_size, enable_serverless_compute=serverless, state=state
+    )
+
+
+@pytest.fixture(autouse=True)
+def databricks_env():
+    """explain_estimate observes the configured SQL warehouse through the Databricks SDK
+    before pricing. Every test in this module therefore gets a fake PAT config and a
+    WorkspaceClient whose warehouses.get fails (lookup unavailable -> caller-asserted rate,
+    the pre-existing behaviour the older tests assume) unless the test configures the
+    yielded mocks itself. Nothing in this module may reach the network."""
+    with (
+        patch("cost_guard_mcp.engines.databricks.load_databricks_config") as mock_load_config,
+        patch("cost_guard_mcp.engines.databricks.Config") as mock_config_cls,
+        patch("cost_guard_mcp.engines.databricks.WorkspaceClient") as mock_workspace_client_cls,
+    ):
+        mock_load_config.return_value = _pat_config()
+        mock_workspace_client_cls.return_value.warehouses.get.side_effect = RuntimeError(
+            "warehouses.get not stubbed by this test"
+        )
+        yield SimpleNamespace(
+            load_config=mock_load_config,
+            config_cls=mock_config_cls,
+            workspace_client_cls=mock_workspace_client_cls,
+        )
 
 
 def _assert_connect_kwargs_are_bounded(kwargs, *, statement_timeout):
@@ -563,3 +614,214 @@ def test_execute_bounded_opens_session_with_execution_statement_timeout(
 
     execute_bounded("SELECT 1", warehouse=None, max_rows=None, _max_wait_seconds=0.2)
     assert mock_connect.call_args.kwargs["session_configuration"]["STATEMENT_TIMEOUT"] == "1"
+
+
+# --- _lookup_warehouse (observed cluster size / serverless flag / state via warehouses.get) --
+
+
+def test_warehouse_id_is_extracted_from_the_http_path():
+    assert _warehouse_id("/sql/1.0/warehouses/abc123DEF") == "abc123DEF"
+
+
+@pytest.mark.parametrize(
+    "http_path",
+    [
+        "sql/1.0/warehouses/abc123",
+        "/sql/1.0/warehouses/abc../x",
+        "/sql/1.0/warehouses/",
+        "/sql/1.0/warehouses/abc123/stop",
+        "/sql/1.0/warehouses/abc123?x=1",
+        "/sql/protocolv1/o/123/abc",
+        "",
+    ],
+)
+def test_warehouse_id_rejects_paths_outside_the_allowlist(http_path):
+    # The id is interpolated into an API path (GET /api/2.0/sql/warehouses/{id}), so it gets
+    # the DECISIONS.md #6 allowlist treatment like every other interpolated identifier.
+    with pytest.raises(ValueError, match="DATABRICKS_HTTP_PATH"):
+        _warehouse_id(http_path)
+
+
+def _stub_warehouse(databricks_env, response):
+    get = databricks_env.workspace_client_cls.return_value.warehouses.get
+    get.side_effect = None
+    get.return_value = response
+    return get
+
+
+def test_lookup_warehouse_builds_a_bounded_pat_client_and_reads_the_warehouse(databricks_env):
+    get = _stub_warehouse(databricks_env, _warehouse_response())
+
+    facts = _lookup_warehouse(databricks_env.load_config.return_value)
+
+    assert facts == _WarehouseFacts(state="RUNNING", cluster_size="5X-Large", is_serverless=True)
+    # Amendment A19: auth_type is pinned so a stray DATABRICKS_CLIENT_ID/SECRET pair in the
+    # environment cannot make the SDK fail with "more than one authorization method
+    # configured". The retry/http bounds keep the lookup - and the SDK's own host-metadata
+    # probe during Config() - from inheriting its 300 s default budget.
+    databricks_env.config_cls.assert_called_once_with(
+        host="https://my-workspace.cloud.databricks.com",
+        token=_FAKE_PAT,
+        auth_type="pat",
+        retry_timeout_seconds=_MAX_API_WAIT_SECONDS,
+        http_timeout_seconds=_SOCKET_TIMEOUT_SECONDS,
+    )
+    databricks_env.workspace_client_cls.assert_called_once_with(
+        config=databricks_env.config_cls.return_value
+    )
+    get.assert_called_once_with("abc123")
+
+
+def test_lookup_warehouse_uses_oauth_m2m_auth_type_when_client_credentials_set(databricks_env):
+    _stub_warehouse(databricks_env, _warehouse_response())
+
+    facts = _lookup_warehouse(_oauth_config())
+
+    assert facts is not None
+    assert facts.is_serverless is True
+    databricks_env.config_cls.assert_called_once_with(
+        host="https://my-workspace.cloud.databricks.com",
+        client_id="client-abc",
+        client_secret=_FAKE_OAUTH_CREDENTIAL_VALUE,
+        auth_type="oauth-m2m",
+        retry_timeout_seconds=_MAX_API_WAIT_SECONDS,
+        http_timeout_seconds=_SOCKET_TIMEOUT_SECONDS,
+    )
+
+
+def test_lookup_warehouse_returns_none_when_the_api_call_fails(databricks_env):
+    assert _lookup_warehouse(databricks_env.load_config.return_value) is None
+
+
+def test_lookup_warehouse_returns_none_without_an_api_call_for_a_non_warehouse_http_path(
+    databricks_env,
+):
+    assert _lookup_warehouse(_pat_config(http_path="/sql/protocolv1/o/123/abc")) is None
+    databricks_env.config_cls.assert_not_called()
+    databricks_env.workspace_client_cls.assert_not_called()
+
+
+def test_lookup_warehouse_treats_missing_fields_as_unknown_and_not_serverless(databricks_env):
+    _stub_warehouse(databricks_env, GetWarehouseResponse(id="abc123"))
+
+    facts = _lookup_warehouse(databricks_env.load_config.return_value)
+
+    assert facts == _WarehouseFacts(state=None, cluster_size=None, is_serverless=False)
+
+
+# --- explain_estimate: the cap-gate rate is bound to the observed warehouse -----------------
+
+
+def _explain_with(
+    mock_connect, explain_output="Relation[a] parquet, Statistics(sizeInBytes=1.0 B)", **kwargs
+):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchall.return_value = [(explain_output,)]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    return explain_estimate("SELECT 1", warehouse=None, **kwargs)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_prices_at_the_observed_serverless_size_when_size_omitted(
+    mock_connect, databricks_env
+):
+    # The audit's reproduction: the http_path warehouse is a 5X-Large Serverless warehouse
+    # (1042 DBU/h); with warehouse_size omitted the old code priced at X-Small (6 DBU/h), so
+    # the cap gate compared a figure 173.7x too low.
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size="5X-Large"))
+
+    estimate = _explain_with(mock_connect)
+
+    assert estimate.estimated_cost_usd == round(1042 * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
+    assert any("understated" in c and "5X-Large" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_lets_the_caller_raise_but_never_lower_the_size(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size="Small"))
+
+    estimate = _explain_with(mock_connect, warehouse_size="4X-Large")
+
+    assert estimate.estimated_cost_usd == round(528 * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
+    assert not any("understated" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_returns_no_dollar_figure_for_a_non_serverless_warehouse(
+    mock_connect, databricks_env
+):
+    # Classic/Pro warehouses are not modelled (separate cloud VM cost); per DECISIONS.md #5
+    # the gate must fail closed rather than compare against a Serverless-rate figure.
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size="Small", serverless=False))
+
+    estimate = _explain_with(mock_connect)
+
+    assert estimate.estimated_cost_usd is None
+    assert estimate.estimated_bytes == 1
+    assert any("Classic/Pro" in c and "run_query_bounded" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_returns_no_dollar_figure_for_an_unrecognised_cluster_size(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size="7X-Large"))
+
+    estimate = _explain_with(mock_connect)
+
+    assert estimate.estimated_cost_usd is None
+    assert any("7X-Large" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_keeps_the_asserted_rate_with_a_caveat_when_the_lookup_fails(
+    mock_connect, databricks_env
+):
+    # Design decision (recommended default): principals without CAN_VIEW/CAN_USE on the
+    # warehouse keep working at the caller-asserted/default rate, with an explicit caveat.
+    estimate = _explain_with(mock_connect)
+
+    expected = round(dbus_per_hour("X-Small") * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
+    assert estimate.estimated_cost_usd == expected
+    assert any("could not be observed" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_falls_back_when_http_path_is_not_a_warehouse_path(
+    mock_connect, databricks_env
+):
+    databricks_env.load_config.return_value = _pat_config(http_path="/sql/protocolv1/o/123/abc")
+
+    estimate = _explain_with(mock_connect, warehouse_size="Medium")
+
+    expected = round(dbus_per_hour("Medium") * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
+    assert estimate.estimated_cost_usd == expected
+    assert any("could not be observed" in c for c in estimate.caveats)
+    databricks_env.workspace_client_cls.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_validates_the_asserted_size_before_any_connection_or_lookup(
+    mock_connect, databricks_env
+):
+    with pytest.raises(SanitizedEngineError, match="unknown Databricks warehouse size"):
+        explain_estimate("SELECT 1", warehouse=None, warehouse_size="Gigantic")
+
+    mock_connect.assert_not_called()
+    databricks_env.workspace_client_cls.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_returns_no_dollar_figure_when_a_serverless_warehouse_reports_no_size(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size=None, serverless=True))
+
+    estimate = _explain_with(mock_connect)
+
+    assert estimate.estimated_cost_usd is None
+    assert any("no cluster size" in c and "run_query_bounded" in c for c in estimate.caveats)

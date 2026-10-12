@@ -386,3 +386,15 @@ async def test_cancel_received_during_the_estimate_never_dispatches_the_executio
 
     # ...and must stop at the before_execute check instead of submitting the execution.
     mock_engine.execute_bounded.assert_not_called()
+
+
+def _tool_description(name):
+    tools = asyncio.run(mcp.list_tools())
+    return next(tool.description for tool in tools if tool.name == name)
+
+
+def test_size_and_edition_arguments_are_described_as_only_able_to_raise_the_estimate():
+    # The rate the cap gate prices at is bound to the observed warehouse; the published
+    # descriptions must no longer tell the model the rate is its own responsibility.
+    for name in ("estimate_query_cost", "run_query_bounded"):
+        assert "only raise" in _tool_description(name), name

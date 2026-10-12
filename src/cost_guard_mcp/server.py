@@ -223,9 +223,11 @@ def estimate_query_cost(
     more statements is refused before anything is estimated.
 
     warehouse_size (Snowflake/Databricks only, e.g. "SMALL", "X-Large") and edition
-    (Snowflake only, e.g. "enterprise") default to the smallest/standard tier if omitted —
-    set them to match the warehouse you actually run this query on, or the dollar figure
-    will understate cost on a larger warehouse."""
+    (Snowflake only, e.g. "enterprise") can only raise the estimate: the dollar figure is
+    priced at the warehouse the query is pinned to as the server observes it (its size, type
+    and generation) and at the operator-configured edition, whichever is higher. Warehouse
+    types without a modelled rate (Snowpark-optimized, Databricks Classic/Pro) get no dollar
+    figure."""
     return _estimate_query_cost_safe(engine, sql, warehouse, warehouse_size, edition)
 
 
@@ -247,9 +249,9 @@ async def run_query_bounded(
     Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
     more statements is refused before anything is estimated or run.
 
-    warehouse_size/edition (see estimate_query_cost) default to the smallest/standard tier
-    if omitted - set them to match the warehouse you actually run on, since max_estimated_cost_usd
-    is checked against the estimate they produce."""
+    warehouse_size/edition (see estimate_query_cost) can only raise the estimate that
+    max_estimated_cost_usd is checked against - it is priced at the observed warehouse, never
+    below it, and a warehouse type without a modelled rate makes a dollar cap refuse."""
     return await _run_query_bounded_safe(
         engine,
         sql,

@@ -16,15 +16,24 @@ from cost_guard_mcp.engines.snowflake import (
     _apply_statement_timeout,
     _connect,
     _lookup_historical_runtime,
-    _lookup_warehouse_generation,
+    _lookup_warehouse_facts,
     _normalize_sql_for_matching,
+    _size_to_pricing_key,
+    _WarehouseFacts,
     check_credentials,
     execute_bounded,
     explain_estimate,
 )
 from cost_guard_mcp.errors import SanitizedEngineError
+from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
 from cost_guard_mcp.types import AccuracyTier, HistoricalRuntimeSignal
+
+
+@pytest.fixture(autouse=True)
+def _snowflake_config_for_every_test(snowflake_config):
+    """explain_estimate reads SnowflakeConfig.edition before it connects (see conftest)."""
+    return snowflake_config
 
 
 @patch("cost_guard_mcp.engines.snowflake.snowflake.connector.connect")
@@ -410,13 +419,15 @@ def test_explain_estimate_skips_use_warehouse_when_warehouse_is_none(mock_connec
     explain_estimate("SELECT 1", warehouse=None)
 
     executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
-    # 2 calls, not 1: EXPLAIN plus the warehouse-history calibration lookup added in
-    # Task 2.1 (_lookup_historical_runtime), which explain_estimate now always attempts on
-    # the same connection after EXPLAIN. Neither call issues USE WAREHOUSE when
-    # warehouse=None - that's the substantive behavior this test guards.
-    assert len(executed_sql) == 2
+    # Three statements: EXPLAIN, then SELECT CURRENT_WAREHOUSE() (the warehouse-facts lookup
+    # resolves the session's active warehouse when none is pinned - this mock answers it with
+    # the plan text, which fails the identifier allowlist, so the lookup degrades to None),
+    # then the warehouse-history calibration lookup. None of them issues USE WAREHOUSE when
+    # warehouse=None - that's the substantive behaviour this test guards.
+    assert len(executed_sql) == 3
     assert not any("USE WAREHOUSE" in stmt for stmt in executed_sql)
     assert "EXPLAIN USING JSON SELECT 1" in executed_sql[0]
+    assert "SELECT CURRENT_WAREHOUSE()" in executed_sql[1]
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
@@ -692,132 +703,440 @@ def test_lookup_historical_runtime_bounds_the_query_with_a_timeout(mock_connect)
     assert kwargs.get("timeout") == _HISTORY_LOOKUP_TIMEOUT_SECONDS
 
 
-# --- _lookup_warehouse_generation (Gen1/Gen2 detection) ------------------------------------
+# --- _lookup_warehouse_facts (observed size/type/generation/state) ---------------------------
 
 
-def test_lookup_warehouse_generation_returns_none_when_warehouse_is_none():
-    mock_conn = MagicMock()
-
-    assert _lookup_warehouse_generation(mock_conn, None) is None
-    mock_conn.cursor.assert_not_called()
-
-
-def test_lookup_warehouse_generation_finds_gen2_and_cloud_provider():
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("2",), ("AWS_US_WEST_2",)]
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-
-    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") == ("2", "AWS")
+def _facts(**overrides):
+    base = {
+        "name": "COMPUTE_WH",
+        "generation": "2",
+        "cloud_provider": "AWS",
+        "size_key": "XSMALL",
+        "size_text": "X-Small",
+        "warehouse_type": "STANDARD",
+        "state": "STARTED",
+        "auto_resume": "true",
+    }
+    return _WarehouseFacts(**{**base, **overrides})
 
 
-def test_lookup_warehouse_generation_finds_gen1_and_cloud_provider():
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("1",), ("AZURE_EAST_US_2",)]
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def test_lookup_warehouse_facts_reads_the_show_warehouses_row_directly(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", generation="2")],
+        region="AWS_US_WEST_2",
+    )
 
-    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") == ("1", "AZURE")
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts == _WarehouseFacts(
+        name="COMPUTE_WH",
+        generation="2",
+        cloud_provider="AWS",
+        size_key="XSMALL",
+        size_text="X-Small",
+        warehouse_type="STANDARD",
+        state="STARTED",
+        auto_resume="true",
+    )
+    # Two metadata statements only: the SHOW row is read through fetchall()/description,
+    # never through a RESULT_SCAN(LAST_QUERY_ID(-1)) SELECT (one statement fewer, same data).
+    assert cursor.executed == ["SHOW WAREHOUSES LIKE 'COMPUTE_WH'", "SELECT CURRENT_REGION()"]
+    assert not any("RESULT_SCAN" in stmt for stmt in cursor.executed)
 
 
-def test_lookup_warehouse_generation_handles_region_group_prefixed_region():
+def test_lookup_warehouse_facts_bounds_every_statement_with_a_timeout(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")],
+        current_warehouse="COMPUTE_WH",
+    )
+
+    _lookup_warehouse_facts(snowflake_fakes.connection(cursor), None)
+
+    assert len(cursor.timeouts) == 3
+    assert all(timeout == _GENERATION_LOOKUP_TIMEOUT_SECONDS for timeout in cursor.timeouts)
+
+
+def test_lookup_warehouse_facts_resolves_current_warehouse_when_none_given(snowflake_fakes):
+    # Replaces the old "warehouse=None -> None" short-circuit: the executing warehouse is
+    # whatever the session has active, and SELECT CURRENT_WAREHOUSE() names it.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("ANALYTICS_XL", "4X-Large")],
+        current_warehouse="ANALYTICS_XL",
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), None)
+
+    assert facts is not None
+    assert facts.name == "ANALYTICS_XL"
+    assert facts.size_key == "X4LARGE"
+    assert cursor.executed == [
+        "SELECT CURRENT_WAREHOUSE()",
+        "SHOW WAREHOUSES LIKE 'ANALYTICS_XL'",
+        "SELECT CURRENT_REGION()",
+    ]
+
+
+def test_lookup_warehouse_facts_returns_none_when_session_has_no_current_warehouse(
+    snowflake_fakes,
+):
+    cursor = snowflake_fakes.cursor(show_rows=[], current_warehouse=None)
+
+    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), None) is None
+    assert not any(stmt.startswith("SHOW WAREHOUSES") for stmt in cursor.executed)
+
+
+def test_lookup_warehouse_facts_returns_none_when_current_warehouse_fails_the_allowlist(
+    snowflake_fakes,
+):
+    # The resolved name is interpolated into SHOW WAREHOUSES LIKE '<name>' exactly like a
+    # caller-supplied one, so it gets the same DECISIONS.md #6 validation first.
+    cursor = snowflake_fakes.cursor(show_rows=[], current_warehouse="WH'; DROP WAREHOUSE X")
+
+    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), None) is None
+    assert not any(stmt.startswith("SHOW WAREHOUSES") for stmt in cursor.executed)
+
+
+def test_lookup_warehouse_facts_matches_the_row_name_case_insensitively(snowflake_fakes):
+    # Amendment A3: unquoted Snowflake identifiers are stored upper-cased and the allowlist
+    # forbids quoted names, so a caller passing 'compute_wh' must still bind to the
+    # 'COMPUTE_WH' row - otherwise the model controls whether the observed size applies.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large")],
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "compute_wh")
+
+    assert facts is not None
+    assert facts.name == "COMPUTE_WH"
+    assert facts.size_key == "X4LARGE"
+    assert cursor.executed[0] == "SHOW WAREHOUSES LIKE 'compute_wh'"
+
+
+def test_lookup_warehouse_facts_returns_none_when_names_genuinely_differ(snowflake_fakes):
+    # Negative control for the case-insensitive match: LIKE's '_' wildcard makes Snowflake
+    # return MYAWH for the pattern MY_WH; it is a different warehouse and must not bind.
+    cursor = snowflake_fakes.cursor(show_rows=[snowflake_fakes.show_row("MYAWH", "6X-Large")])
+
+    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "MY_WH") is None
+
+
+def test_lookup_warehouse_facts_ignores_like_wildcard_sibling_rows(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[
+            snowflake_fakes.show_row("COMPUTEXWH", "6X-Large"),
+            snowflake_fakes.show_row("COMPUTE_WH", "Small"),
+        ]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts is not None
+    assert facts.name == "COMPUTE_WH"
+    assert facts.size_key == "SMALL"
+
+
+@pytest.mark.parametrize(
+    ("size_text", "expected"),
+    [
+        ("X-Small", "XSMALL"),
+        ("Small", "SMALL"),
+        ("Medium", "MEDIUM"),
+        ("Large", "LARGE"),
+        ("X-Large", "XLARGE"),
+        ("2X-Large", "X2LARGE"),
+        ("3X-Large", "X3LARGE"),
+        ("4X-Large", "X4LARGE"),
+        ("5X-Large", "X5LARGE"),
+        ("6X-Large", "X6LARGE"),
+        (" x-small ", "XSMALL"),
+        ("XSMALL", "XSMALL"),
+        ("7X-Large", None),
+        ("", None),
+        (None, None),
+        (4, None),
+    ],
+)
+def test_size_to_pricing_key_normalises_show_warehouses_size_text(size_text, expected):
+    assert _size_to_pricing_key(size_text) == expected
+
+
+def test_lookup_warehouse_facts_keeps_unmodelled_type_and_size_as_facts(snowflake_fakes):
+    # A Snowpark-optimized warehouse or an unrecognised size is still an observation; the
+    # fail-closed decision belongs to explain_estimate (tested below), not to the lookup.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[
+            snowflake_fakes.show_row("SNOWPARK_WH", "7X-Large", warehouse_type="SNOWPARK-OPTIMIZED")
+        ]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "SNOWPARK_WH")
+
+    assert facts is not None
+    assert facts.warehouse_type == "SNOWPARK-OPTIMIZED"
+    assert facts.size_key is None
+
+
+def test_lookup_warehouse_facts_reports_an_unrecognised_generation_as_none(snowflake_fakes):
+    # A future/unexpected generation string (e.g. "3") must not be treated as Gen1/Gen2 -
+    # but it must not throw away the observed size either.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large", generation="3")]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts is not None
+    assert facts.generation is None
+    assert facts.size_key == "X4LARGE"
+
+
+def test_lookup_warehouse_facts_accepts_an_integer_generation_column(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "Small", generation=1)]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts is not None
+    assert facts.generation == "1"
+
+
+def test_lookup_warehouse_facts_handles_region_group_prefixed_region(snowflake_fakes):
     # Accounts whose organization spans multiple region groups get "<group>.<CLOUD>_<REGION>"
     # (e.g. "PUBLIC.AWS_US_WEST_2") from CURRENT_REGION() instead of the plain form - both
     # shapes are documented examples in Snowflake's own CURRENT_REGION() reference.
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("2",), ("PUBLIC.AWS_US_WEST_2",)]
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "Small")], region="PUBLIC.AWS_US_WEST_2"
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts is not None
+    assert facts.cloud_provider == "AWS"
+
+
+@pytest.mark.parametrize("region", ["ORACLE_US_EAST", None])
+def test_lookup_warehouse_facts_reports_an_unusable_region_as_no_cloud_provider(
+    snowflake_fakes, region
+):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "Small")], region=region
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts is not None
+    assert facts.cloud_provider is None
+    assert facts.size_key == "SMALL"
+
+
+def test_lookup_warehouse_facts_treats_non_string_columns_as_unknown(snowflake_fakes):
+    # A row whose size/type/state/auto_resume are NULL (or a future type change) and a NULL
+    # CURRENT_REGION() are still an observation of that warehouse: the unknown fields become
+    # None and explain_estimate decides what to do with them.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[("COMPUTE_WH", None, None, None, None, "2")], region=(None,)
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts is not None
+    assert facts.generation == "2"
+    assert facts.size_key is None
+    assert facts.size_text is None
+    assert facts.warehouse_type is None
+    assert facts.state is None
+    assert facts.auto_resume is None
+    assert facts.cloud_provider is None
+
+
+def test_lookup_warehouse_facts_returns_none_for_invalid_warehouse_name():
     mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
 
-    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") == ("2", "AWS")
-
-
-def test_lookup_warehouse_generation_returns_none_for_invalid_warehouse_name():
-    mock_conn = MagicMock()
-
-    assert _lookup_warehouse_generation(mock_conn, "WH1; malicious") is None
+    assert _lookup_warehouse_facts(mock_conn, "WH1; malicious") is None
     mock_conn.cursor.assert_not_called()
 
 
-def test_lookup_warehouse_generation_returns_none_on_exception():
+def test_lookup_warehouse_facts_returns_none_on_exception():
     mock_conn = MagicMock()
     mock_conn.cursor.side_effect = RuntimeError("permission denied")
 
-    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+    assert _lookup_warehouse_facts(mock_conn, "COMPUTE_WH") is None
 
 
-def test_lookup_warehouse_generation_returns_none_when_generation_row_is_none():
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [None, ("AWS_US_WEST_2",)]
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def test_lookup_warehouse_facts_returns_none_when_show_warehouses_fails(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "Small")], fail_on=("SHOW WAREHOUSES",)
+    )
 
-    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
-
-
-def test_lookup_warehouse_generation_returns_none_for_unrecognized_generation_value():
-    # A future/unexpected generation string (e.g. "3") must degrade safely, not crash or be
-    # silently treated as Gen1/Gen2.
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("3",), ("AWS_US_WEST_2",)]
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-
-    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH") is None
 
 
-def test_lookup_warehouse_generation_returns_none_when_region_row_is_none():
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("2",), None]
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def test_lookup_warehouse_facts_returns_none_when_a_row_has_too_few_columns(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(show_rows=[("COMPUTE_WH", "STARTED")])
 
-    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH") is None
 
 
-def test_lookup_warehouse_generation_returns_none_for_unrecognized_cloud_provider():
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("2",), ("ORACLE_US_EAST",)]
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-
-    assert _lookup_warehouse_generation(mock_conn, "COMPUTE_WH") is None
+# --- explain_estimate: the cap-gate rate is bound to the observed warehouse -----------------
 
 
-def test_lookup_warehouse_generation_filters_show_warehouses_by_validated_name():
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("2",), ("AWS_US_WEST_2",)]
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def _estimate_with(
+    snowflake_fakes,
+    *,
+    show_rows,
+    region="AWS_US_EAST_1",
+    bytes_assigned=1000,
+    warehouse="COMPUTE_WH",
+    current_warehouse=None,
+    history_rows=(),
+    fail_on=(),
+    **kwargs,
+):
+    cursor = snowflake_fakes.cursor(
+        plan={
+            "GlobalStats": {
+                "partitionsTotal": 10,
+                "partitionsAssigned": 4,
+                "bytesAssigned": bytes_assigned,
+            }
+        },
+        show_rows=show_rows,
+        region=region,
+        current_warehouse=current_warehouse,
+        history_rows=history_rows,
+        fail_on=fail_on,
+    )
+    with patch(
+        "cost_guard_mcp.engines.snowflake._connect",
+        return_value=snowflake_fakes.connection(cursor),
+    ):
+        estimate = explain_estimate("SELECT 1", warehouse=warehouse, **kwargs)
+    return estimate, cursor
 
-    _lookup_warehouse_generation(mock_conn, "COMPUTE_WH")
 
-    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
-    assert "SHOW WAREHOUSES LIKE 'COMPUTE_WH'" in executed_sql[0]
-    assert "RESULT_SCAN(LAST_QUERY_ID(-1))" in executed_sql[1]
-    assert "CURRENT_REGION()" in executed_sql[2]
+def test_explain_estimate_prices_at_the_observed_size_when_warehouse_size_is_omitted(
+    snowflake_fakes,
+):
+    # The audit's reproduction: a Gen2/AWS 4X-Large STANDARD warehouse, warehouse_size
+    # omitted. The old code priced this at XSMALL (1.35 credits/h); the pinned warehouse
+    # bills 172.8 credits/h, so the cap gate compared a figure 128x too low.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("ANALYTICS_XL", "4X-Large", generation="2")],
+        region="AWS_US_EAST_1",
+        bytes_assigned=2_500_000,
+        warehouse="ANALYTICS_XL",
+    )
+
+    expected = round(
+        172.8 * 2.0 * scale_runtime_hours(2_500_000, baseline_hours=_ASSUMED_RUNTIME_HOURS), 6
+    )
+    assert estimate.estimated_cost_usd == expected
+    assert estimate.accuracy_tier == AccuracyTier.UPPER_BOUND
+    assert any("understated" in c and "4X-Large" in c for c in estimate.caveats)
 
 
-def test_lookup_warehouse_generation_bounds_every_query_with_a_timeout():
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("2",), ("AWS_US_WEST_2",)]
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+def test_explain_estimate_lets_the_caller_raise_but_never_lower_the_size(snowflake_fakes):
+    # Asserted X4LARGE on an observed Small Gen1 warehouse: the larger assertion wins (the
+    # caller may only raise the figure) and no understatement caveat is added.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "Small", generation="1")],
+        warehouse_size="X4LARGE",
+    )
 
-    _lookup_warehouse_generation(mock_conn, "COMPUTE_WH")
+    expected = round(
+        credits_per_hour("X4LARGE", generation="1", cloud_provider="AWS")
+        * usd_per_credit("standard")
+        * _ASSUMED_RUNTIME_HOURS,
+        6,
+    )
+    assert estimate.estimated_cost_usd == expected
+    assert not any("understated" in c for c in estimate.caveats)
 
-    for call in mock_cursor.execute.call_args_list:
-        assert call.kwargs.get("timeout") == _GENERATION_LOOKUP_TIMEOUT_SECONDS
+
+def test_explain_estimate_resolves_current_warehouse_when_warehouse_is_none(snowflake_fakes):
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("ANALYTICS_XL", "4X-Large", generation="2")],
+        warehouse=None,
+        current_warehouse="ANALYTICS_XL",
+    )
+
+    expected = round(172.8 * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6)
+    assert estimate.estimated_cost_usd == expected
+    assert not any("USE WAREHOUSE" in stmt for stmt in cursor.executed)
+    assert cursor.executed.index("SELECT CURRENT_WAREHOUSE()") < cursor.executed.index(
+        "SHOW WAREHOUSES LIKE 'ANALYTICS_XL'"
+    )
 
 
-# --- explain_estimate wiring for Gen1/Gen2 detection ---------------------------------------
+def test_explain_estimate_applies_the_observed_size_for_a_lowercase_warehouse_argument(
+    snowflake_fakes,
+):
+    # Amendment A3, end to end: 'compute_wh' binds to the COMPUTE_WH row, so the observed
+    # 4X-Large size applies and a 0.10 USD cap would refuse (see test_tools_run_query_bounded).
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large", generation="2")],
+        warehouse="compute_wh",
+    )
+
+    assert estimate.estimated_cost_usd == round(
+        172.8 * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
+    )
+    assert estimate.estimated_cost_usd > 0.10
+
+
+def test_explain_estimate_returns_no_dollar_figure_for_a_non_standard_warehouse_type(
+    snowflake_fakes,
+):
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[
+            snowflake_fakes.show_row("SNOWPARK_WH", "Medium", warehouse_type="SNOWPARK-OPTIMIZED")
+        ],
+        warehouse="SNOWPARK_WH",
+    )
+
+    assert estimate.estimated_cost_usd is None
+    assert estimate.estimated_bytes == 1000
+    assert any("SNOWPARK-OPTIMIZED" in c and "run_query_bounded" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_returns_no_dollar_figure_for_unrecognised_size_text(snowflake_fakes):
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "7X-Large")],
+    )
+
+    assert estimate.estimated_cost_usd is None
+    assert any("7X-Large" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_keeps_the_asserted_gen1_rate_when_the_lookup_fails(snowflake_fakes):
+    # Design decision (recommended default): roles that cannot run SHOW WAREHOUSES keep
+    # working at the caller-asserted/default rate with the existing explicit caveat.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large")],
+        fail_on=("SHOW WAREHOUSES",),
+        warehouse_size="MEDIUM",
+    )
+
+    expected = round(
+        credits_per_hour("MEDIUM") * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
+    )
+    assert estimate.estimated_cost_usd == expected
+    assert any("could not be determined" in c for c in estimate.caveats)
 
 
 @patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
-@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_generation")
+@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_facts")
 @patch("cost_guard_mcp.engines.snowflake._connect")
 def test_explain_estimate_uses_gen2_rate_when_generation_detected(
-    mock_connect, mock_lookup_generation, mock_lookup_historical
+    mock_connect, mock_lookup_facts, mock_lookup_historical
 ):
     plan_json = json.dumps(
         {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
@@ -827,7 +1146,7 @@ def test_explain_estimate_uses_gen2_rate_when_generation_detected(
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
-    mock_lookup_generation.return_value = ("2", "AWS")
+    mock_lookup_facts.return_value = _facts(generation="2", cloud_provider="AWS", size_key="MEDIUM")
     mock_lookup_historical.return_value = None
 
     estimate = explain_estimate("SELECT 1", warehouse="WH", warehouse_size="MEDIUM")
@@ -840,10 +1159,10 @@ def test_explain_estimate_uses_gen2_rate_when_generation_detected(
 
 
 @patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
-@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_generation")
+@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_facts")
 @patch("cost_guard_mcp.engines.snowflake._connect")
 def test_explain_estimate_uses_gen1_rate_when_generation_detected_as_gen1(
-    mock_connect, mock_lookup_generation, mock_lookup_historical
+    mock_connect, mock_lookup_facts, mock_lookup_historical
 ):
     plan_json = json.dumps(
         {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
@@ -853,7 +1172,9 @@ def test_explain_estimate_uses_gen1_rate_when_generation_detected_as_gen1(
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
-    mock_lookup_generation.return_value = ("1", "AZURE")
+    mock_lookup_facts.return_value = _facts(
+        generation="1", cloud_provider="AZURE", size_key="MEDIUM"
+    )
     mock_lookup_historical.return_value = None
 
     estimate = explain_estimate("SELECT 1", warehouse="WH", warehouse_size="MEDIUM")
@@ -865,12 +1186,13 @@ def test_explain_estimate_uses_gen1_rate_when_generation_detected_as_gen1(
 
 
 @patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
-@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_generation")
+@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_facts")
 @patch("cost_guard_mcp.engines.snowflake._connect")
-def test_explain_estimate_falls_back_to_gen1_rate_when_generation_lookup_fails(
-    mock_connect, mock_lookup_generation, mock_lookup_historical
+def test_explain_estimate_still_applies_the_observed_size_when_generation_is_unknown(
+    mock_connect, mock_lookup_facts, mock_lookup_historical
 ):
-    # Plan requirement: "lookup fails (falls back to Gen1 plus an explicit caveat)".
+    # Generation undeterminable keeps the Gen1 fallback (design decision), but the size axis
+    # is a separate observation and must still win over an understated assertion.
     plan_json = json.dumps(
         {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
     )
@@ -879,31 +1201,34 @@ def test_explain_estimate_falls_back_to_gen1_rate_when_generation_lookup_fails(
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
-    mock_lookup_generation.return_value = None
+    mock_lookup_facts.return_value = _facts(
+        generation=None, cloud_provider=None, size_key="X4LARGE"
+    )
     mock_lookup_historical.return_value = None
 
-    estimate = explain_estimate("SELECT 1", warehouse="WH", warehouse_size="MEDIUM")
+    estimate = explain_estimate("SELECT 1", warehouse="WH")
 
     expected_cost = round(
-        credits_per_hour("MEDIUM") * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
+        credits_per_hour("X4LARGE") * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
     )
     assert estimate.estimated_cost_usd == expected_cost
     assert any("could not be determined" in c for c in estimate.caveats)
+    assert any("understated" in c for c in estimate.caveats)
 
 
 @patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
 @patch("cost_guard_mcp.engines.snowflake._connect")
-def test_explain_estimate_falls_back_to_gen1_rate_when_warehouse_not_provided(
+def test_explain_estimate_falls_back_to_gen1_rate_when_no_warehouse_can_be_resolved(
     mock_connect, mock_lookup_historical
 ):
-    # Plan requirement: "warehouse argument is not provided (falls back to Gen1 plus an
-    # explicit caveat)". Deliberately does NOT mock _lookup_warehouse_generation - exercises
-    # the real function's own warehouse=None short-circuit, wired end-to-end.
+    # warehouse=None and the session has no current warehouse either: nothing can be
+    # observed, so the pre-existing Gen1/asserted fallback and caveat apply. Deliberately
+    # does NOT mock _lookup_warehouse_facts - exercises the real resolution path.
     plan_json = json.dumps(
         {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
     )
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_cursor.fetchone.side_effect = [(plan_json,), (None,)]
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -917,6 +1242,143 @@ def test_explain_estimate_falls_back_to_gen1_rate_when_warehouse_not_provided(
     assert estimate.estimated_cost_usd == expected_cost
     assert any("could not be determined" in c for c in estimate.caveats)
     assert any("no warehouse specified" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_runtime_caveat_names_the_effective_size(snowflake_fakes):
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("ANALYTICS_XL", "4X-Large")],
+        warehouse="ANALYTICS_XL",
+    )
+
+    assert any("on a X4LARGE warehouse" in c for c in estimate.caveats)
+
+
+# --- explain_estimate: edition comes from SNOWFLAKE_EDITION, the argument may only raise it --
+
+
+def test_explain_estimate_prices_at_the_configured_edition_when_argument_omitted(
+    snowflake_fakes, snowflake_config
+):
+    snowflake_config.return_value.edition = "enterprise"
+
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", generation="1")],
+    )
+
+    expected = round(credits_per_hour("XSMALL") * 3.00 * _ASSUMED_RUNTIME_HOURS, 6)
+    assert estimate.estimated_cost_usd == expected
+    assert any("SNOWFLAKE_EDITION" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_lets_the_caller_raise_the_edition(snowflake_fakes, snowflake_config):
+    snowflake_config.return_value.edition = "enterprise"
+
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", generation="1")],
+        edition="vps",
+    )
+
+    assert estimate.estimated_cost_usd == round(
+        credits_per_hour("XSMALL") * 6.00 * _ASSUMED_RUNTIME_HOURS, 6
+    )
+
+
+def test_explain_estimate_never_lets_the_caller_lower_the_edition(
+    snowflake_fakes, snowflake_config
+):
+    snowflake_config.return_value.edition = "business_critical"
+
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", generation="1")],
+        edition="standard",
+    )
+
+    assert estimate.estimated_cost_usd == round(
+        credits_per_hour("XSMALL") * 4.00 * _ASSUMED_RUNTIME_HOURS, 6
+    )
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"warehouse_size": "GIGANTIC"}, "unknown Snowflake warehouse size"),
+        ({"edition": "platinum"}, "unknown Snowflake edition"),
+    ],
+)
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_validates_asserted_rate_inputs_before_connecting(
+    mock_connect, kwargs, message
+):
+    # Validation-first ordering: the pricing ValueError fires before any connection or
+    # warehouse lookup, so its (bounded) message is what the caller sees.
+    with pytest.raises(SanitizedEngineError, match=message):
+        explain_estimate("SELECT 1", warehouse="WH", **kwargs)
+
+    mock_connect.assert_not_called()
+
+
+# --- explain_estimate: bytesAssigned type guard (amendment A10) -----------------------------
+
+
+def test_explain_estimate_returns_no_estimate_when_bytes_assigned_is_null(snowflake_fakes):
+    # A null bytesAssigned used to flow into scale_runtime_hours as None and produce the
+    # information-free baseline figure that DECISIONS.md #5 forbids - a dollar cap would
+    # have looked enforced against a number that said nothing about the query.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")],
+        bytes_assigned=None,
+    )
+
+    assert estimate.estimated_bytes is None
+    assert estimate.estimated_cost_usd is None
+    assert any("bytesAssigned" in c and "unavailable" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_keeps_the_float_for_an_integer_bytes_assigned(snowflake_fakes):
+    # Positive control for the guard above.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")],
+        bytes_assigned=1000,
+    )
+
+    assert estimate.estimated_bytes == 1000
+    assert isinstance(estimate.estimated_cost_usd, float)
+
+
+@pytest.mark.parametrize("bytes_assigned", [True, -1, "1000", 12.5])
+def test_explain_estimate_rejects_non_integer_or_negative_bytes_assigned(
+    snowflake_fakes, bytes_assigned
+):
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")],
+        bytes_assigned=bytes_assigned,
+    )
+
+    assert estimate.estimated_bytes is None
+    assert estimate.estimated_cost_usd is None
+
+
+def test_explain_estimate_prices_from_history_when_bytes_assigned_is_null(snowflake_fakes):
+    # The historical runtime is query-dependent evidence, so a dollar figure is still
+    # legitimate without a byte estimate - but the byte estimate itself stays None.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", generation="1")],
+        bytes_assigned=None,
+        history_rows=[("SELECT 1", 4000, 1024)],
+    )
+
+    assert estimate.estimated_bytes is None
+    assert estimate.estimated_cost_usd == round(
+        credits_per_hour("XSMALL") * usd_per_credit("standard") * (4000 / 1000 / 3600), 6
+    )
 
 
 @patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")

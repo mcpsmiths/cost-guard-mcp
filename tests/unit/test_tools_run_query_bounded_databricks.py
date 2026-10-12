@@ -9,6 +9,8 @@ module rather than test_tools_run_query_bounded.py so that file keeps a single w
 import asyncio
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 from cost_guard_mcp.types import RefusalReason
 
@@ -28,6 +30,35 @@ _IEC_PLAN_TEXT = (
 _PLAN_IEC_SHAPE = [(_IEC_PLAN_TEXT,)]
 _IEC_LEAF_BYTES = int(134.6 * 1024**3)
 _PLAN_SENTINEL_ONLY = [("Relation[a] parquet, Statistics(sizeInBytes=8.0 EiB, rowCount=1)",)]
+
+
+# Placeholder value for the mocked config below - never a real credential.
+_FAKE_PAT = "fake-pat-placeholder"
+
+
+@pytest.fixture(autouse=True)
+def _databricks_warehouse_lookup_unavailable():
+    """explain_estimate observes the configured SQL warehouse through the Databricks SDK before
+    pricing (the observed-warehouse decision). These gate tests pin the statistics-less -> None
+    contract at the caller-asserted X-Small rate, so the lookup is made to fail (no network) and
+    the documented fallback keeps that rate - the same path a principal without CAN_VIEW/CAN_USE
+    on the warehouse takes."""
+    with (
+        patch("cost_guard_mcp.engines.databricks.load_databricks_config") as mock_load_config,
+        patch("cost_guard_mcp.engines.databricks.Config"),
+        patch("cost_guard_mcp.engines.databricks.WorkspaceClient") as mock_workspace_client_cls,
+    ):
+        mock_load_config.return_value = MagicMock(
+            server_hostname="my-workspace.cloud.databricks.com",
+            http_path="/sql/1.0/warehouses/abc123",
+            access_token=_FAKE_PAT,
+            client_id=None,
+            client_secret=None,
+        )
+        mock_workspace_client_cls.return_value.warehouses.get.side_effect = RuntimeError(
+            "warehouses.get not stubbed by this test"
+        )
+        yield
 
 
 def _mock_explain_connection(rows):

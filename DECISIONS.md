@@ -520,3 +520,37 @@ cancel scope; a host that simply drops the connection relies on the provider-sid
 A host issuing more than eight concurrent billable calls, or cancelling and re-issuing past
 the cap, now sees a `ToolError` that names `COST_GUARD_MAX_IN_FLIGHT_QUERIES` and explains
 that cancelled calls still count; raising the variable is the opt-out.
+
+## 15. The cap-gate rate is bound to the observed warehouse; caller inputs can only raise it
+
+**Context:** A security audit (fingerprint
+`cap-gate-rate-from-caller-asserted-warehouse-size-not-observed-warehouse`) showed that
+`run_query_bounded`'s only Snowflake/Databricks spend control compared `max_estimated_cost_usd`
+with an estimate whose credit/DBU rate came solely from the model-supplied
+`warehouse_size`/`edition` strings (defaulting to the cheapest tier), although the server
+already ran `SHOW WAREHOUSES` for the pinned warehouse and discarded its size. An omitted size
+admitted a query costing up to 512x/174x the cap while reporting `ok` and `UPPER_BOUND` — the
+condition decision #5 forbids. The design (README, tool docstrings) had delegated the rate's
+correctness to the model, the very principal the gate exists to constrain.
+
+**Decision:** The estimate is priced at the warehouse the query will execute on as the server
+observes it — Snowflake: the `SHOW WAREHOUSES` row (size/type/generation, read via
+`fetchall()`/`description`, matched by exact case-insensitive name because LIKE's `_` is a
+wildcard), resolving `CURRENT_WAREHOUSE()` when no warehouse argument is given; Databricks:
+`GET /api/2.0/sql/warehouses/{id}` for the `DATABRICKS_HTTP_PATH` warehouse, with `auth_type`
+pinned and 60 s bounds — at `max(caller-asserted, observed)`. Edition is operator configuration
+(`SNOWFLAKE_EDITION`, default `standard`) because the server cannot observe it without
+ORGADMIN; the tool argument may only raise it. Warehouse types the rate table does not model
+(non-STANDARD Snowflake, non-Serverless Databricks, unrecognised sizes) and a plan without a
+usable `bytesAssigned` yield `estimated_cost_usd=None`, so a dollar cap refuses (#5). A failed
+lookup keeps the caller-asserted/default rate with a caveat so roles without
+`SHOW WAREHOUSES`/`CAN_USE` rights keep working — failing closed on lookup failure was
+rejected because it would refuse every cost-capped call for such roles. Assuming the pricier
+Gen2 rate when the generation is undeterminable stays a separate, open decision.
+
+**Consequences:** Classic/Pro and Snowpark-optimized deployments lose the dollar figure (omit
+the dollar cap to run there) — a breaking change released as 0.4.0. The
+`estimate_query_cost`/`run_query_bounded` descriptions changed (an intended, description-only
+`tools/list` diff). Release gates: `tests/integration/test_snowflake_live.py` pins the
+`SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution; a manual Databricks
+run must confirm `warehouses.get` succeeds with `CAN_USE` on the warehouse.

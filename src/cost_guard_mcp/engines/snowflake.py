@@ -3,6 +3,8 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
+from typing import TypeGuard
 
 import snowflake.connector
 
@@ -275,69 +277,287 @@ def _lookup_historical_runtime(
         return None
 
 
-def _lookup_warehouse_generation(
-    conn: "snowflake.connector.SnowflakeConnection", warehouse: str | None
-) -> tuple[str, str] | None:
-    """Best-effort, non-privileged lookup of a warehouse's generation ("1" or "2") and the
-    account's cloud provider ("AWS"/"AZURE"/"GCP"), used by explain_estimate() to pick the
-    correct Gen1/Gen2 credit rate instead of always assuming Gen1. Mirrors
-    _lookup_historical_runtime's contract exactly: any failure at all — no warehouse given,
-    permission, network, malformed/unrecognized response shape, timeout — returns None, never
-    raises. explain_estimate() degrades to the pre-existing Gen1-assumed rate plus an explicit
-    caveat whenever this returns None; no exception from this function ever propagates out of
-    explain_estimate.
+@dataclass(frozen=True)
+class _WarehouseFacts:
+    """What SHOW WAREHOUSES and CURRENT_REGION() say about the warehouse a query is pinned to.
 
-    Both `SHOW WAREHOUSES` and `CURRENT_REGION()` are ordinary, non-privileged SQL — no
-    ACCOUNTADMIN or elevated grant is required (unlike ACCOUNT_USAGE views), consistent with
-    this project's least-privilege stance (AGENTS.md / DECISIONS.md #7). `generation` is a
-    real `SHOW WAREHOUSES` output column added by Snowflake behavior-change bundle
-    2025_07/bcr-2110 ("A positive integer, currently either `1` or `2`"); it's read back via
-    the documented `RESULT_SCAN(LAST_QUERY_ID(-1))` pattern since a `SHOW` command's own
-    output can't be wrapped directly in a `SELECT`.
-
-    No live Snowflake account was available to verify this against a real Gen2 warehouse
-    while implementing this (see this repo's isolated-worktree constraints) — treat the exact
-    SQL shape here as a documented-but-not-live-verified best effort; a real Gen2 warehouse
-    live-verification pass is an explicit follow-up for whoever has credentials.
+    `size_key` is the pricing-table key for the row's `size` text (`size_text`), or None when
+    the text is not a size this project prices; `generation`/`cloud_provider` are None when
+    their value is not one of the recognised ones. `state`/`auto_resume` are carried for the
+    pending read-only warehouse-state guard (audit record read-only-tools-resume-suspended-
+    warehouse) so it can reuse this single lookup instead of issuing another one.
     """
-    if warehouse is None:
+
+    name: str
+    generation: str | None
+    cloud_provider: str | None
+    size_key: str | None
+    size_text: str | None
+    warehouse_type: str | None
+    state: str | None
+    auto_resume: str | None
+
+
+_STANDARD_WAREHOUSE_TYPE = "STANDARD"
+
+# SHOW WAREHOUSES reports `size` as display text ('X-Small', '4X-Large'); the pricing table is
+# keyed the way Snowflake's own CREATE WAREHOUSE syntax spells sizes ('XSMALL', 'X4LARGE'). An
+# explicit allowlist, not a regex: anything else (a new size, an Interactive/Snowpark tier
+# label, garbage) is "not priced" and makes explain_estimate fail closed on a dollar cap.
+_SHOW_SIZE_TO_PRICING_KEY: dict[str, str] = {
+    "X-SMALL": "XSMALL",
+    "XSMALL": "XSMALL",
+    "SMALL": "SMALL",
+    "MEDIUM": "MEDIUM",
+    "LARGE": "LARGE",
+    "X-LARGE": "XLARGE",
+    "XLARGE": "XLARGE",
+    "2X-LARGE": "X2LARGE",
+    "XXLARGE": "X2LARGE",
+    "X2LARGE": "X2LARGE",
+    "3X-LARGE": "X3LARGE",
+    "XXXLARGE": "X3LARGE",
+    "X3LARGE": "X3LARGE",
+    "4X-LARGE": "X4LARGE",
+    "X4LARGE": "X4LARGE",
+    "5X-LARGE": "X5LARGE",
+    "X5LARGE": "X5LARGE",
+    "6X-LARGE": "X6LARGE",
+    "X6LARGE": "X6LARGE",
+}
+
+
+def _size_to_pricing_key(size_text: object) -> str | None:
+    if not isinstance(size_text, str):
         return None
+    return _SHOW_SIZE_TO_PRICING_KEY.get(size_text.strip().upper())
+
+
+def _text_or_none(value: object, *, upper: bool = False) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text.upper() if upper else text
+
+
+def _cloud_provider_from_region(region_row: object) -> str | None:
+    """CURRENT_REGION() returns "<CLOUD>_<REGION>" (e.g. "AWS_US_WEST_2") for most accounts, or
+    "<region-group>.<CLOUD>_<REGION>" (e.g. "PUBLIC.AWS_US_WEST_2") for accounts whose
+    organization spans multiple region groups - both shapes are documented examples in
+    Snowflake's own CURRENT_REGION() reference."""
+    if not isinstance(region_row, (tuple, list)) or not region_row:
+        return None
+    if not isinstance(region_row[0], str):
+        return None
+    region = region_row[0].rsplit(".", 1)[-1]
+    cloud_provider = region.split("_", 1)[0].upper()
+    return cloud_provider if cloud_provider in _CLOUD_PROVIDERS else None
+
+
+def _lookup_warehouse_facts(
+    conn: "snowflake.connector.SnowflakeConnection", warehouse: str | None
+) -> _WarehouseFacts | None:
+    """Best-effort, non-privileged observation of the warehouse the query is pinned to - its
+    size, type, generation and state from its SHOW WAREHOUSES row, plus the account's cloud
+    provider from CURRENT_REGION() - used by explain_estimate() to bind the cap-gate rate to
+    the warehouse that will actually execute instead of to the caller's warehouse_size string
+    (DECISIONS.md #15). Mirrors _lookup_historical_runtime's contract exactly: any failure at
+    all - permission, network, malformed response shape, timeout, no resolvable warehouse -
+    returns None, never raises; explain_estimate() then degrades to the caller-asserted/Gen1
+    rate plus an explicit caveat.
+
+    When `warehouse` is None the session's active warehouse is resolved with SELECT
+    CURRENT_WAREHOUSE() first - it is what EXPLAIN just ran against and what execute_bounded
+    will run against. The resolved name is interpolated into SHOW WAREHOUSES LIKE '<name>'
+    exactly like a caller-supplied one, so it passes the same allowlist (DECISIONS.md #6).
+
+    The row is read straight from the SHOW result via fetchall()/cursor.description - no
+    RESULT_SCAN(LAST_QUERY_ID(-1)) SELECT (one statement fewer, same data). LIKE treats '_' as
+    a single-character wildcard, so the pattern can return sibling warehouses (MYAWH for
+    MY_WH); only the row whose name matches case-insensitively is used - unquoted Snowflake
+    identifiers are stored upper-cased and _WAREHOUSE_NAME_RE forbids quoted ones, so
+    'compute_wh' and 'COMPUTE_WH' are the same warehouse. `generation` is a real SHOW
+    WAREHOUSES column (behavior-change bundle 2025_07/bcr-2110, "currently either 1 or 2");
+    the `size`/`type` text shapes are pinned by tests/integration/test_snowflake_live.py.
+
+    SHOW WAREHOUSES, CURRENT_WAREHOUSE() and CURRENT_REGION() are all ordinary, non-privileged
+    SQL - no ACCOUNTADMIN or elevated grant is required (AGENTS.md / DECISIONS.md #7).
+    """
     try:
+        if warehouse is None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT CURRENT_WAREHOUSE()", timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS
+                )
+                current = cur.fetchone()
+            if current is None or not isinstance(current[0], str):
+                return None
+            warehouse = current[0]
         validated_warehouse = _validate_warehouse(warehouse)
         with conn.cursor() as cur:
             cur.execute(
                 f"SHOW WAREHOUSES LIKE '{validated_warehouse}'",
                 timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS,
             )
-            cur.execute(
-                'SELECT "generation" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID(-1)))',
-                timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS,
-            )
-            generation_row = cur.fetchone()
+            columns = [str(column[0]).lower() for column in (cur.description or ())]
+            rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
 
             cur.execute("SELECT CURRENT_REGION()", timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS)
             region_row = cur.fetchone()
     except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
         return None
 
-    if generation_row is None or not isinstance(generation_row[0], str):
+    matching = [
+        row
+        for row in rows
+        if isinstance(row.get("name"), str) and row["name"].upper() == validated_warehouse.upper()
+    ]
+    if len(matching) != 1:
         return None
-    generation = generation_row[0].strip()
-    if generation not in ("1", "2"):
-        return None
+    row = matching[0]
+    generation = str(row.get("generation", "")).strip()
+    return _WarehouseFacts(
+        name=row["name"],
+        generation=generation if generation in ("1", "2") else None,
+        cloud_provider=_cloud_provider_from_region(region_row),
+        size_key=_size_to_pricing_key(row.get("size")),
+        size_text=_text_or_none(row.get("size")),
+        warehouse_type=_text_or_none(row.get("type"), upper=True),
+        state=_text_or_none(row.get("state"), upper=True),
+        auto_resume=_text_or_none(row.get("auto_resume")),
+    )
 
-    if region_row is None or not isinstance(region_row[0], str):
-        return None
-    # CURRENT_REGION() returns "<CLOUD>_<REGION>" (e.g. "AWS_US_WEST_2") for most accounts, or
-    # "<region-group>.<CLOUD>_<REGION>" (e.g. "PUBLIC.AWS_US_WEST_2") for accounts whose
-    # organization spans multiple region groups - both shapes are documented examples in
-    # Snowflake's own CURRENT_REGION() reference.
-    region = region_row[0].rsplit(".", 1)[-1]
-    cloud_provider = region.split("_", 1)[0].upper()
-    if cloud_provider not in _CLOUD_PROVIDERS:
-        return None
 
-    return generation, cloud_provider
+_CORTEX_CAVEAT = (
+    "This estimate excludes Cortex AI Function ('AI Credits') cost — EXPLAIN's bytesAssigned "
+    "only reflects warehouse compute/scan, not AI-inference calls inside the SQL."
+)
+_FAIL_CLOSED_HINT = (
+    "no dollar estimate is produced, so run_query_bounded refuses a max_estimated_cost_usd cap "
+    "for it; omit the dollar cap to run on this warehouse."
+)
+
+
+def _is_valid_byte_count(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _rate_for(
+    facts: _WarehouseFacts | None, asserted_size_key: str
+) -> tuple[float | None, str, list[str]]:
+    """Pick the credit rate the cap gate prices at: (rate, effective size key, caveats).
+
+    The rate is never below the observed warehouse - the caller's warehouse_size may raise the
+    size, never lower it. `rate` is None when the observed warehouse is of a type or size the
+    rate table does not model; explain_estimate then returns estimated_cost_usd=None so
+    run_query_bounded refuses a dollar cap (DECISIONS.md #5: an unenforceable cap must never
+    look enforced). A failed lookup (facts is None) keeps the caller-asserted/default size at
+    the Gen1 rate with an explicit caveat, so roles that cannot run SHOW WAREHOUSES keep
+    working (DECISIONS.md #15).
+    """
+    if facts is None:
+        caveat = (
+            "Warehouse generation and size could not be determined (no warehouse specified or "
+            "resolvable, or the SHOW WAREHOUSES/cloud-provider lookup failed) — assuming Gen1 "
+            f"credit rates at the caller-asserted {asserted_size_key} size; actual cost will be "
+            "higher than this estimate if the warehouse is really Gen2 or larger."
+        )
+        return credits_per_hour(asserted_size_key), asserted_size_key, [caveat]
+    if facts.warehouse_type != _STANDARD_WAREHOUSE_TYPE:
+        caveat = (
+            f"Warehouse {facts.name} is of type {facts.warehouse_type!r}, which this project's "
+            f"rate table does not model (only STANDARD warehouses are priced) — {_FAIL_CLOSED_HINT}"
+        )
+        return None, asserted_size_key, [caveat]
+    if facts.size_key is None:
+        caveat = (
+            f"Warehouse {facts.name} reports size {repr(facts.size_text)[:32]}, which this "
+            f"project's rate table does not recognise — {_FAIL_CLOSED_HINT}"
+        )
+        return None, asserted_size_key, [caveat]
+
+    caveats: list[str] = []
+    size_key = max(asserted_size_key, facts.size_key, key=credits_per_hour)
+    if size_key != asserted_size_key:
+        caveats.append(
+            f"warehouse_size {asserted_size_key!r} understated the pinned warehouse {facts.name} "
+            f"({facts.size_text}, {size_key}) — priced at the observed size; the warehouse_size "
+            "argument can only raise the estimate, never lower it."
+        )
+    if facts.generation is not None and facts.cloud_provider is not None:
+        rate = credits_per_hour(
+            size_key, generation=facts.generation, cloud_provider=facts.cloud_provider
+        )
+        if facts.generation == "2":
+            caveats.append(
+                f"Warehouse generation detected as Gen2 on {facts.cloud_provider} — billed at "
+                "Gen2's higher per-hour credit rate (per Snowflake's Service Consumption "
+                "Table), not Gen1's."
+            )
+        else:
+            caveats.append(
+                f"Warehouse generation detected as Gen1 on {facts.cloud_provider} — billed at "
+                "Gen1's per-hour credit rate."
+            )
+        return rate, size_key, caveats
+    caveats.append(
+        f"Warehouse generation could not be determined for {facts.name} (SHOW WAREHOUSES "
+        "reported an unrecognised generation, or CURRENT_REGION() an unrecognised cloud "
+        "provider) — assuming Gen1 credit rates; actual cost will be higher than this estimate "
+        "if the warehouse is really Gen2."
+    )
+    return credits_per_hour(size_key), size_key, caveats
+
+
+def _price_for(configured_edition: str, asserted_edition: str) -> tuple[float, list[str]]:
+    """USD/credit at the higher of the operator-configured edition (SNOWFLAKE_EDITION) and the
+    caller-asserted one: the tool argument may only raise the price, never lower it. Edition
+    is an account property the server cannot observe without ORGADMIN, hence configuration."""
+    effective = max(configured_edition.lower(), asserted_edition.lower(), key=usd_per_credit)
+    caveats: list[str] = []
+    if effective != asserted_edition.lower():
+        caveats.append(
+            f"edition {asserted_edition!r} is below the operator-configured "
+            f"SNOWFLAKE_EDITION={configured_edition!r} — priced at the configured edition; the "
+            "edition argument can only raise the estimate, never lower it."
+        )
+    return usd_per_credit(effective), caveats
+
+
+def _runtime_for(
+    conn: "snowflake.connector.SnowflakeConnection",
+    sql: str,
+    bytes_assigned: object,
+    size_key: str,
+) -> tuple[float | None, list[str]]:
+    """Runtime hours for the dollar figure: a historical run of this exact SQL when there is
+    one, else the byte-tier heuristic - but only from a real, non-negative integer bytesAssigned.
+    A null/non-integer value used to flow into scale_runtime_hours as None and yield the
+    information-free baseline figure DECISIONS.md #5 forbids; it now yields None (no dollar
+    estimate) unless the query-dependent historical signal exists."""
+    historical = _lookup_historical_runtime(conn, sql)
+    if historical is not None:
+        caveat = (
+            f"Cost is informed by {historical.sample_count} historical run(s) of this "
+            f"exact query, averaging {historical.avg_runtime_hours * 3600:.1f}s — more "
+            "reliable than the coarse size-tier heuristic below."
+        )
+        return historical.avg_runtime_hours, [caveat]
+    if _is_valid_byte_count(bytes_assigned):
+        caveat = (
+            f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
+            f"on a {size_key} warehouse, scaled up by a coarse size tier based on "
+            f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
+            "query's actual expected runtime."
+        )
+        return scale_runtime_hours(bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS), [caveat]
+    caveat = (
+        f"EXPLAIN returned no usable bytesAssigned figure ({repr(bytes_assigned)[:32]}) — the "
+        "byte estimate is unavailable, not zero, and without a historical runtime signal no "
+        "dollar estimate is produced; run_query_bounded refuses a byte or dollar cap for this "
+        "query."
+    )
+    return None, [caveat]
 
 
 @sanitize_exceptions("snowflake")
@@ -350,12 +570,27 @@ def explain_estimate(
     """Estimate Snowflake query cost via EXPLAIN. Always UPPER_BOUND — never PRECISE — since
     Snowflake bills by warehouse-time, not bytes, and EXPLAIN's byte/partition figures are
     themselves documented upper bounds ("runtime optimizations... can reduce the number of
-    partitions and bytes scanned")."""
+    partitions and bytes scanned").
+
+    The dollar figure is priced at the warehouse the query is pinned to as observed through
+    SHOW WAREHOUSES (size/type/generation) - never below it: `warehouse_size` and `edition`
+    can only raise the estimate. Warehouse types the rate table does not model, and a plan
+    without a usable bytesAssigned, yield estimated_cost_usd=None so run_query_bounded fails
+    closed on a dollar cap (DECISIONS.md #5, #15).
+    """
+    # Validate every caller-asserted input before connecting: an unknown warehouse name, size
+    # or edition is a clear (sanitized) ValueError that never costs a connection or a lookup.
+    validated_warehouse = _validate_warehouse(warehouse) if warehouse is not None else None
+    asserted_size_key = warehouse_size.upper()
+    credits_per_hour(asserted_size_key)
+    usd_per_credit(edition)
+    config = load_snowflake_config()
+
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            if warehouse is not None:
-                cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
+            if validated_warehouse is not None:
+                cur.execute(f"USE WAREHOUSE {validated_warehouse}")
             # num_statements=1: Snowflake rejects the whole text if it is not exactly one
             # statement, so a ';'-separated trailing statement can neither execute inside this
             # read-only-advertised estimate nor be silently discarded (see
@@ -367,70 +602,24 @@ def explain_estimate(
             raise ValueError("EXPLAIN USING JSON returned no rows")
 
         plan = json.loads(row[0])
-        global_stats = plan["GlobalStats"]
-        bytes_assigned = global_stats["bytesAssigned"]
+        bytes_assigned = plan["GlobalStats"]["bytesAssigned"]
 
-        generation_info = _lookup_warehouse_generation(conn, warehouse)
-        if generation_info is not None:
-            generation, cloud_provider = generation_info
-            rate = credits_per_hour(
-                warehouse_size, generation=generation, cloud_provider=cloud_provider
-            )
-            if generation == "2":
-                generation_caveat = (
-                    f"Warehouse generation detected as Gen2 on {cloud_provider} — billed at "
-                    "Gen2's higher per-hour credit rate (per Snowflake's Service Consumption "
-                    "Table), not Gen1's."
-                )
-            else:
-                generation_caveat = (
-                    f"Warehouse generation detected as Gen1 on {cloud_provider} — billed at "
-                    "Gen1's per-hour credit rate."
-                )
-        else:
-            rate = credits_per_hour(warehouse_size)
-            generation_caveat = (
-                "Warehouse generation could not be determined (no warehouse specified, or "
-                "the generation/cloud-provider lookup failed) — assuming Gen1 credit rates; "
-                "actual cost will be higher than this estimate if the warehouse is really "
-                "Gen2."
-            )
-        price = usd_per_credit(edition)
+        facts = _lookup_warehouse_facts(conn, warehouse)
+        rate, size_key, rate_caveats = _rate_for(facts, asserted_size_key)
+        price, price_caveats = _price_for(config.edition, edition)
+        runtime_hours, runtime_caveats = _runtime_for(conn, sql, bytes_assigned, size_key)
 
-        historical = _lookup_historical_runtime(conn, sql)
-        if historical is not None:
-            runtime_hours = historical.avg_runtime_hours
-            runtime_caveat = (
-                f"Cost is informed by {historical.sample_count} historical run(s) of this "
-                f"exact query, averaging {historical.avg_runtime_hours * 3600:.1f}s — more "
-                "reliable than the coarse size-tier heuristic below."
-            )
-        else:
-            runtime_hours = scale_runtime_hours(
-                bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS
-            )
-            runtime_caveat = (
-                f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
-                f"on a {warehouse_size} warehouse, scaled up by a coarse size tier based on "
-                f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
-                "query's actual expected runtime."
-            )
-        estimated_cost_usd = rate * price * runtime_hours
-
+        estimated_cost_usd = (
+            None
+            if rate is None or runtime_hours is None
+            else round(rate * price * runtime_hours, 6)
+        )
         return CostEstimate(
             engine="snowflake",
             accuracy_tier=AccuracyTier.UPPER_BOUND,
-            estimated_bytes=bytes_assigned,
-            estimated_cost_usd=round(estimated_cost_usd, 6),
-            caveats=[
-                (
-                    "This estimate excludes Cortex AI Function ('AI Credits') cost — EXPLAIN's "
-                    "bytesAssigned only reflects warehouse compute/scan, not AI-inference calls "
-                    "inside the SQL."
-                ),
-                generation_caveat,
-                runtime_caveat,
-            ],
+            estimated_bytes=bytes_assigned if _is_valid_byte_count(bytes_assigned) else None,
+            estimated_cost_usd=estimated_cost_usd,
+            caveats=[_CORTEX_CAVEAT, *rate_caveats, *price_caveats, *runtime_caveats],
         )
     finally:
         # Best-effort close, mirroring the cancel-is-best-effort discipline in execute_bounded

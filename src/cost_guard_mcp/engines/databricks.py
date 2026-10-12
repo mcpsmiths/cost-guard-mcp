@@ -2,14 +2,22 @@ import logging
 import math
 import re
 import threading
+from dataclasses import dataclass
 from typing import Any
 
 from databricks import sql
+from databricks.sdk import WorkspaceClient
 from databricks.sdk.core import Config, oauth_service_principal
 from databricks.sdk.credentials_provider import OAuthCredentialsProvider
+from databricks.sdk.service.sql import GetWarehouseResponse
 
-from cost_guard_mcp.config import load_databricks_config
-from cost_guard_mcp.errors import present_remote_text, redact_secrets, sanitize_exceptions
+from cost_guard_mcp.config import DatabricksConfig, load_databricks_config
+from cost_guard_mcp.errors import (
+    SanitizedEngineError,
+    present_remote_text,
+    redact_secrets,
+    sanitize_exceptions,
+)
 from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
 from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
@@ -45,6 +53,12 @@ _SOCKET_TIMEOUT_SECONDS = 60
 # sessions (check_credentials, explain_estimate).
 _MAX_API_WAIT_SECONDS = 60
 _CONNECTOR_RETRY_ATTEMPTS = 5
+
+# Wall-clock bound for the Databricks SDK's REST calls (the warehouse lookup below and the
+# SDK's own host-metadata probe during Config()); the SDK's default retry budget is 300 s.
+# Equal to the connector's socket timeout so one unreachable workspace never costs a tool
+# call more than about two of these before the estimate falls back.
+_MAX_API_WAIT_SECONDS = 60
 
 
 @sanitize_exceptions("databricks")
@@ -181,6 +195,150 @@ def _parse_max_size_in_bytes(explain_output: str) -> int | None:
     return int(max(known_sizes))
 
 
+# DATABRICKS_HTTP_PATH names the SQL warehouse the connector binds to; its id is the last path
+# segment and is interpolated into the SDK's GET /api/2.0/sql/warehouses/{id} call, so it gets
+# the same allowlist treatment as every other interpolated identifier (DECISIONS.md #6).
+_WAREHOUSE_ID_RE = re.compile(r"^/sql/1\.0/warehouses/([A-Za-z0-9]+)$")
+
+
+def _warehouse_id(http_path: str) -> str:
+    match = _WAREHOUSE_ID_RE.fullmatch(http_path)
+    if match is None:
+        raise ValueError(
+            "DATABRICKS_HTTP_PATH is not a SQL warehouse path of the form "
+            "/sql/1.0/warehouses/<warehouse-id>; the warehouse cannot be looked up."
+        )
+    return match.group(1)
+
+
+@dataclass(frozen=True)
+class _WarehouseFacts:
+    """What GET /api/2.0/sql/warehouses/{id} says about the http_path warehouse. `state` is
+    carried for the pending read-only warehouse-state guard (audit record read-only-tools-
+    auto-start-stopped-warehouse) so it can share this one bounded call."""
+
+    state: str | None
+    cluster_size: str | None
+    is_serverless: bool
+
+
+@sanitize_exceptions("databricks")
+def _get_warehouse(config: DatabricksConfig) -> GetWarehouseResponse:
+    warehouse_id = _warehouse_id(config.http_path)
+    # auth_type is pinned on both paths so a stray DATABRICKS_TOKEN or DATABRICKS_CLIENT_ID in
+    # the environment cannot make the SDK raise "more than one authorization method
+    # configured" (verified against databricks-sdk 0.148.0). retry_timeout_seconds /
+    # http_timeout_seconds bound both the GET and the SDK's own /.well-known/databricks-config
+    # host-metadata probe during Config(); the SDK's default budget is 300 s. WorkspaceClient
+    # itself does not accept those two kwargs, hence the explicit Config.
+    if config.client_id:
+        sdk_config = Config(
+            host=f"https://{config.server_hostname}",
+            client_id=config.client_id,
+            client_secret=config.client_secret,
+            auth_type="oauth-m2m",
+            retry_timeout_seconds=_MAX_API_WAIT_SECONDS,
+            http_timeout_seconds=_SOCKET_TIMEOUT_SECONDS,
+        )
+    else:
+        sdk_config = Config(
+            host=f"https://{config.server_hostname}",
+            token=config.access_token,
+            auth_type="pat",
+            retry_timeout_seconds=_MAX_API_WAIT_SECONDS,
+            http_timeout_seconds=_SOCKET_TIMEOUT_SECONDS,
+        )
+    return WorkspaceClient(config=sdk_config).warehouses.get(warehouse_id)
+
+
+def _lookup_warehouse(config: DatabricksConfig) -> _WarehouseFacts | None:
+    """Best-effort observation of the SQL warehouse DATABRICKS_HTTP_PATH binds to, through the
+    already-depended-on databricks-sdk, used by explain_estimate() to bind the cap-gate rate to
+    the warehouse that will actually execute instead of to the caller's warehouse_size string
+    (DECISIONS.md #15). Any failure - a non-warehouse http_path, a principal without
+    CAN_VIEW/CAN_USE on the warehouse, network, timeout - returns None (the sanitized reason is
+    logged by @sanitize_exceptions) and explain_estimate keeps the caller-asserted rate with a
+    caveat. Worst case is about 2 x _MAX_API_WAIT_SECONDS (host-metadata probe + GET); the
+    OAuth path's OIDC discovery keeps the SDK's own budget (an accepted residual, see the
+    databricks-readonly-paths-inherit-connector-900s-retry-duration audit record).
+    """
+    try:
+        response = _get_warehouse(config)
+    except SanitizedEngineError:
+        return None
+    state_value = getattr(response.state, "value", None)
+    return _WarehouseFacts(
+        state=state_value if isinstance(state_value, str) else None,
+        cluster_size=response.cluster_size if isinstance(response.cluster_size, str) else None,
+        is_serverless=response.enable_serverless_compute is True,
+    )
+
+
+_FAIL_CLOSED_HINT = (
+    "no dollar estimate is produced, so run_query_bounded refuses a max_estimated_cost_usd cap "
+    "for it; omit the dollar cap to run on this warehouse."
+)
+
+
+def _rate_for(
+    facts: _WarehouseFacts | None, warehouse_size: str
+) -> tuple[float | None, str, list[str]]:
+    """Pick the DBU/h rate the cap gate prices at: (rate, effective size label, caveats).
+
+    The rate is never below the observed warehouse - the caller's warehouse_size may raise the
+    size, never lower it. `rate` is None when the warehouse is not a Serverless SQL warehouse
+    (Classic/Pro add a separate cloud VM cost this project does not model) or reports a size the
+    rate table lacks; explain_estimate then returns estimated_cost_usd=None so run_query_bounded
+    refuses a dollar cap (DECISIONS.md #5). A failed lookup (facts is None) keeps the
+    caller-asserted/default size with an explicit caveat so principals without CAN_VIEW/CAN_USE
+    on the warehouse keep working (DECISIONS.md #15).
+    """
+    asserted_rate = dbus_per_hour(warehouse_size)
+    if facts is None:
+        caveat = (
+            "The configured SQL warehouse could not be observed (DATABRICKS_HTTP_PATH is not a "
+            "/sql/1.0/warehouses/<id> path, or GET /api/2.0/sql/warehouses/<id> failed - e.g. "
+            "the principal lacks CAN_VIEW/CAN_USE on it) — priced at the caller-asserted "
+            f"{warehouse_size} size assuming a Serverless SQL warehouse; the real cost is higher "
+            "if the warehouse is larger, and Classic/Pro warehouses add a separate cloud VM cost "
+            "not modeled here."
+        )
+        return asserted_rate, warehouse_size, [caveat]
+    if not facts.is_serverless:
+        caveat = (
+            "The configured SQL warehouse is not a Serverless SQL warehouse (Classic/Pro use "
+            "different DBU rates plus a separate cloud VM cost this project does not model) — "
+            f"{_FAIL_CLOSED_HINT}"
+        )
+        return None, warehouse_size, [caveat]
+    if facts.cluster_size is None:
+        caveat = (
+            "The configured SQL warehouse reports no cluster size this project's DBU rate table "
+            f"can price — {_FAIL_CLOSED_HINT}"
+        )
+        return None, warehouse_size, [caveat]
+    try:
+        observed_rate = dbus_per_hour(facts.cluster_size)
+    except ValueError:
+        caveat = (
+            f"The configured SQL warehouse reports cluster size {repr(facts.cluster_size)[:32]}, "
+            f"which this project's DBU rate table does not model — {_FAIL_CLOSED_HINT}"
+        )
+        return None, warehouse_size, [caveat]
+    if observed_rate > asserted_rate:
+        caveat = (
+            f"warehouse_size {warehouse_size!r} understated the configured Serverless SQL "
+            f"warehouse ({facts.cluster_size}) — priced at the observed size; the warehouse_size "
+            "argument can only raise the estimate, never lower it."
+        )
+        return observed_rate, facts.cluster_size, [caveat]
+    caveat = (
+        f"Priced at the caller-asserted {warehouse_size} size, which is at least the observed "
+        f"Serverless SQL warehouse size ({facts.cluster_size})."
+    )
+    return asserted_rate, warehouse_size, [caveat]
+
+
 @sanitize_exceptions("databricks")
 def explain_estimate(
     sql_text: str, warehouse: str | None, warehouse_size: str = "X-Small"
@@ -192,7 +350,19 @@ def explain_estimate(
 
     `warehouse` is accepted only for calling-convention consistency and is a documented
     no-op - see check_credentials's docstring for why.
+
+    The dollar figure is priced at the SQL warehouse DATABRICKS_HTTP_PATH binds to, as
+    observed through the Warehouses API (cluster size, Serverless or not) - never below it:
+    `warehouse_size` can only raise the estimate. Non-Serverless (Classic/Pro) warehouses and
+    unrecognised sizes yield estimated_cost_usd=None so run_query_bounded fails closed on a
+    dollar cap (DECISIONS.md #5, #15).
     """
+    # Validate the caller-asserted size before any lookup or connection: an unknown size is a
+    # clear (sanitized) ValueError that never costs an API call.
+    dbus_per_hour(warehouse_size)
+    config = load_databricks_config()
+    rate, size_label, rate_caveats = _rate_for(_lookup_warehouse(config), warehouse_size)
+
     conn = _connect()
     try:
         with conn.cursor() as cur:
@@ -202,22 +372,20 @@ def explain_estimate(
         explain_output = "\n".join(row[0] for row in rows)
         max_size_in_bytes = _parse_max_size_in_bytes(explain_output)
 
-        # Resolve the rate first so an unknown warehouse_size still raises, with or
-        # without plan statistics.
-        rate = dbus_per_hour(warehouse_size)
-
         caveats = [
             (
                 "Databricks has no BigQuery-style dry-run; this estimate is HEURISTIC, the "
                 "least precise of this project's three accuracy tiers."
             ),
+            *rate_caveats,
         ]
         # A dollar figure derived from no plan statistics would depend only on the
         # warehouse rate, not on the query (0.035 USD for every X-Small query) - a cap
         # compared against it looks enforced but never discriminates. Report it as
         # unavailable instead so run_query_bounded's fail-closed gate refuses a requested
         # max_estimated_cost_usd, exactly as it already does for the byte cap when
-        # estimated_bytes is None (DECISIONS.md #5).
+        # estimated_bytes is None (DECISIONS.md #5). The same None results when the observed
+        # warehouse has no modelled rate (rate is None, see _rate_for).
         estimated_cost_usd: float | None
         if max_size_in_bytes is None:
             estimated_cost_usd = None
@@ -232,18 +400,15 @@ def explain_estimate(
             runtime_hours = scale_runtime_hours(
                 max_size_in_bytes, baseline_hours=_ASSUMED_RUNTIME_HOURS
             )
-            estimated_cost_usd = round(rate * SERVERLESS_USD_PER_DBU * runtime_hours, 6)
+            estimated_cost_usd = (
+                None if rate is None else round(rate * SERVERLESS_USD_PER_DBU * runtime_hours, 6)
+            )
             caveats.append(
                 f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on "
-                f"a {warehouse_size} Serverless SQL warehouse, scaled up by a coarse size tier "
+                f"a {size_label} Serverless SQL warehouse, scaled up by a coarse size tier "
                 f"based on {max_size_in_bytes} bytes scanned - still a heuristic, not derived "
                 "from this query's actual expected runtime."
             )
-        caveats.append(
-            "Pricing assumes a Serverless SQL warehouse; Classic/Pro warehouses use "
-            "different (lower) DBU rates plus a separate underlying cloud VM cost not "
-            "modeled here."
-        )
 
         return CostEstimate(
             engine="databricks",

@@ -66,6 +66,12 @@
           "isSecret": true
         },
         {
+          "name": "SNOWFLAKE_EDITION",
+          "description": "Snowflake: account edition that sets the USD/credit price of estimates - standard (default), enterprise, business_critical or vps. The per-call edition argument can only raise it.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
           "name": "DATABRICKS_SERVER_HOSTNAME",
           "description": "Databricks: SQL warehouse server hostname (e.g. my-workspace.cloud.databricks.com, no scheme, no trailing slash). Required to use the databricks engine.",
           "isRequired": false,

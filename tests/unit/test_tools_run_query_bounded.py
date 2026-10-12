@@ -519,3 +519,68 @@ def test_before_execute_defaults_to_none_and_is_keyword_only(mock_estimate, mock
     # contract server.py forwards, and the hook must never be confusable with one of them.
     with pytest.raises(TypeError):
         run_query_bounded("bigquery", "SELECT 1", None, None, None, None, None, None, MagicMock())
+
+
+# --- end to end: the Snowflake cost cap is enforced at the observed warehouse size ----------
+
+
+def _observed_warehouse_cursor(snowflake_fakes, size):
+    # The audit's verifier-05 fixture: only the connector entry point is faked; the SHOW
+    # WAREHOUSES row describes a Gen2/AWS STANDARD warehouse of the given size.
+    return snowflake_fakes.cursor(
+        plan={
+            "GlobalStats": {
+                "partitionsTotal": 10,
+                "partitionsAssigned": 4,
+                "bytesAssigned": 2_500_000,
+            }
+        },
+        show_rows=[snowflake_fakes.show_row("ANALYTICS_XL", size, generation="2")],
+        region="AWS_US_EAST_1",
+    )
+
+
+def test_snowflake_cost_cap_is_enforced_at_the_observed_warehouse_size(
+    snowflake_fakes, snowflake_config
+):
+    # warehouse_size omitted against a 4X-Large warehouse under a 0.10 USD cap: the old code
+    # priced at XSMALL (0.0225 USD), returned status 'ok' labelled UPPER_BOUND and executed.
+    cursor = _observed_warehouse_cursor(snowflake_fakes, "4X-Large")
+    with (
+        patch(
+            "cost_guard_mcp.engines.snowflake._connect",
+            return_value=snowflake_fakes.connection(cursor),
+        ),
+        patch("cost_guard_mcp.engines.snowflake.execute_bounded") as mock_execute,
+    ):
+        result = run_query_bounded(
+            "snowflake", "SELECT * FROM t", warehouse="ANALYTICS_XL", max_estimated_cost_usd=0.10
+        )
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.COST_CAP_EXCEEDED
+    assert result.estimate.estimated_cost_usd > 0.10
+    mock_execute.assert_not_called()
+
+
+def test_snowflake_cost_cap_still_admits_a_query_on_a_small_observed_warehouse(
+    snowflake_fakes, snowflake_config
+):
+    # Positive control: the same call against an X-Small warehouse stays under the cap and
+    # runs, so the refusal above is driven by the observed size, not by the new code path.
+    cursor = _observed_warehouse_cursor(snowflake_fakes, "X-Small")
+    with (
+        patch(
+            "cost_guard_mcp.engines.snowflake._connect",
+            return_value=snowflake_fakes.connection(cursor),
+        ),
+        patch("cost_guard_mcp.engines.snowflake.execute_bounded") as mock_execute,
+    ):
+        mock_execute.return_value = ([], 0, False)
+        result = run_query_bounded(
+            "snowflake", "SELECT * FROM t", warehouse="ANALYTICS_XL", max_estimated_cost_usd=0.10
+        )
+
+    assert result.status == "ok"
+    assert result.estimate.estimated_cost_usd < 0.10
+    mock_execute.assert_called_once()

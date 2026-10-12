@@ -271,3 +271,46 @@ def test_databricks_config_does_not_leak_secrets_in_repr():
     # CodeQL's "Incomplete URL substring sanitization" query, a false positive for a
     # plain repr-content assertion with no URL-validation semantics at all.)
     assert "client-abc" in config_repr
+
+
+def test_load_snowflake_config_edition_defaults_to_standard(monkeypatch):
+    _set_minimal_snowflake_env(monkeypatch)
+    monkeypatch.delenv("SNOWFLAKE_EDITION", raising=False)
+    assert load_snowflake_config().edition == "standard"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("enterprise", "enterprise"),
+        ("Business_Critical", "business_critical"),
+        (" VPS ", "vps"),
+        ("", "standard"),
+    ],
+)
+def test_load_snowflake_config_normalises_snowflake_edition(monkeypatch, raw, expected):
+    _set_minimal_snowflake_env(monkeypatch)
+    monkeypatch.setenv("SNOWFLAKE_EDITION", raw)
+    assert load_snowflake_config().edition == expected
+
+
+def test_load_snowflake_config_rejects_an_unknown_snowflake_edition(monkeypatch):
+    # Validated at load time against the pricing table, so a typo surfaces as a clear
+    # ConfigError on the first tool call instead of a pricing ValueError deep inside an
+    # estimate.
+    _set_minimal_snowflake_env(monkeypatch)
+    monkeypatch.setenv("SNOWFLAKE_EDITION", "platinum")
+    with pytest.raises(ConfigError, match="SNOWFLAKE_EDITION"):
+        load_snowflake_config()
+
+
+def test_snowflake_config_edition_defaults_to_standard_when_constructed_directly():
+    config = SnowflakeConfig(
+        account="myaccount",
+        user="myuser",
+        role="READER",
+        private_key_path="/path/to/key.p8",
+        private_key_passphrase=None,
+        password=None,
+    )
+    assert config.edition == "standard"

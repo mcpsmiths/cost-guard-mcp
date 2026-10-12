@@ -1,9 +1,14 @@
 import os
 from dataclasses import dataclass, field
 
+from cost_guard_mcp.pricing.snowflake_pricing import usd_per_credit
+
 
 class ConfigError(RuntimeError):
     """Raised when a required credential/config env var is missing or invalid."""
+
+
+_DEFAULT_SNOWFLAKE_EDITION = "standard"
 
 
 @dataclass(frozen=True)
@@ -22,6 +27,10 @@ class SnowflakeConfig:
     # Login-time SECONDARY_ROLES pin: "NONE" (default) or "ALL" (explicit opt-out). See
     # load_snowflake_config() and DECISIONS.md #7.
     secondary_roles: str = "NONE"
+    # Account edition (SNOWFLAKE_EDITION) sets the USD/credit price of every estimate. It is
+    # operator configuration because the server cannot observe it without ORGADMIN; the
+    # per-call `edition` tool argument may only raise it (DECISIONS.md #15).
+    edition: str = _DEFAULT_SNOWFLAKE_EDITION
 
 
 @dataclass(frozen=True)
@@ -79,6 +88,18 @@ def _load_snowflake_secondary_roles() -> str:
     return raw
 
 
+def _parse_snowflake_edition(raw: str | None) -> str:
+    """Normalise SNOWFLAKE_EDITION (unset/empty -> 'standard', case-insensitive) and validate
+    it against the pricing table at load time, so a typo is a clear ConfigError on the first
+    tool call rather than a pricing ValueError inside an estimate."""
+    edition = (raw or "").strip().lower() or _DEFAULT_SNOWFLAKE_EDITION
+    try:
+        usd_per_credit(edition)
+    except ValueError as exc:
+        raise ConfigError(f"SNOWFLAKE_EDITION is invalid: {exc}") from exc
+    return edition
+
+
 def load_snowflake_config() -> SnowflakeConfig:
     account = os.environ.get("SNOWFLAKE_ACCOUNT")
     user = os.environ.get("SNOWFLAKE_USER")
@@ -129,6 +150,7 @@ def load_snowflake_config() -> SnowflakeConfig:
         private_key_passphrase=os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None,
         password=password,
         secondary_roles=secondary_roles,
+        edition=_parse_snowflake_edition(os.environ.get("SNOWFLAKE_EDITION")),
     )
 
 

@@ -25,8 +25,8 @@ An AI agent using a warehouse MCP can silently trigger a full-table scan that co
 
 - `check_credentials(engine, warehouse?)` — verifies credentials/connectivity without running any real query; call this first after configuring a new engine. Supports BigQuery, Snowflake, and Databricks.
 - `describe_engine_capabilities(engine)` — what's exact vs. approximate for this engine.
-- `estimate_query_cost(engine, sql, warehouse?, warehouse_size?, edition?)` — pre-flight cost estimate, tagged with its accuracy tier. Supports BigQuery, Snowflake, and Databricks. Accepts exactly one SQL statement per call (see Known limitations). `warehouse_size` (Snowflake/Databricks) and `edition` (Snowflake) default to the smallest/standard tier if omitted — set them to match the warehouse you actually run on, or the dollar figure understates cost on a larger one.
-- `run_query_bounded(engine, sql, max_bytes_billed?, max_rows?, max_estimated_cost_usd?, warehouse?, warehouse_size?, edition?)` — refuses to run if the estimate exceeds your bound. Supports BigQuery, Snowflake, and Databricks. Accepts exactly one SQL statement per call (see Known limitations).
+- `estimate_query_cost(engine, sql, warehouse?, warehouse_size?, edition?)` — pre-flight cost estimate, tagged with its accuracy tier. Supports BigQuery, Snowflake, and Databricks. Accepts exactly one SQL statement per call (see Known limitations). `warehouse_size` (Snowflake/Databricks) and `edition` (Snowflake) can only raise the estimate — the dollar figure is priced at the warehouse the query is pinned to, as the server observes it (the `SHOW WAREHOUSES` size/type/generation, or the Databricks Warehouses API), and at the operator-configured `SNOWFLAKE_EDITION`, whichever is higher. Warehouse types without a modelled rate (Snowpark-optimized, Databricks Classic/Pro) get a byte estimate but no dollar figure.
+- `run_query_bounded(engine, sql, max_bytes_billed?, max_rows?, max_estimated_cost_usd?, warehouse?, warehouse_size?, edition?)` — refuses to run if the estimate exceeds your bound. Supports BigQuery, Snowflake, and Databricks. Accepts exactly one SQL statement per call (see Known limitations). A `max_estimated_cost_usd` cap is checked against that observed-warehouse estimate and refuses when no dollar figure exists.
 
 ## Setup
 
@@ -34,7 +34,7 @@ An AI agent using a warehouse MCP can silently trigger a full-table scan that co
 Set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key file path (or run `gcloud auth application-default login`).
 
 ### Snowflake
-Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no default, never `ACCOUNTADMIN`), and either `SNOWFLAKE_PRIVATE_KEY_PATH` (preferred) or `SNOWFLAKE_PASSWORD` (discouraged).
+Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no default, never `ACCOUNTADMIN`), and either `SNOWFLAKE_PRIVATE_KEY_PATH` (preferred) or `SNOWFLAKE_PASSWORD` (discouraged). Optionally set `SNOWFLAKE_EDITION` to the account's edition — `standard` (default), `enterprise`, `business_critical` or `vps` — which sets the USD/credit price of every estimate; the per-call `edition` argument can only raise it.
 
 - `SNOWFLAKE_ROLE` is the *only* authorization boundary for the SQL an agent sends through
   this server, so it is enforced, not just documented: `ACCOUNTADMIN`, `SECURITYADMIN` and
@@ -63,7 +63,8 @@ Set `DATABRICKS_SERVER_HOSTNAME` and `DATABRICKS_HTTP_PATH` (from the SQL wareho
 Connection Details tab), and either `DATABRICKS_TOKEN` (a personal access token,
 simplest) or `DATABRICKS_CLIENT_ID` + `DATABRICKS_CLIENT_SECRET` (OAuth machine-to-machine
 via a service principal, preferred for automated use). Only Serverless SQL warehouses are
-priced accurately — see Known Limitations.
+priced — a Classic/Pro warehouse gets a byte estimate but no dollar figure, see Known
+Limitations.
 
 ### Concurrency (optional)
 `COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default `8`) caps how many `run_query_bounded` calls may
@@ -248,22 +249,38 @@ COST_GUARD_MAX_IN_FLIGHT_QUERIES = "8"
   refuses any `max_bytes_billed` or `max_estimated_cost_usd` cap for that query rather than
   comparing it against a query-independent rate floor. Omit the cap to run such a query;
   there is deliberately no flag that restores the old floor (`DECISIONS.md` #5).
-- Databricks pricing only models Serverless SQL warehouses - Classic/Pro warehouses use
-  different (lower) DBU rates plus a separate cloud VM cost not modeled here.
+- Databricks pricing only models Serverless SQL warehouses. The warehouse
+  `DATABRICKS_HTTP_PATH` binds to is looked up through the Warehouses API
+  (`GET /api/2.0/sql/warehouses/{id}`, `CAN_USE` on the warehouse suffices): its cluster size is
+  the floor of the estimate (`warehouse_size` can only raise it), and a Classic/Pro warehouse
+  (different DBU rates plus a separate cloud VM cost not modeled here) gets no dollar figure,
+  so a `max_estimated_cost_usd` cap refuses — omit the dollar cap to run there. If the lookup
+  fails (e.g. a principal without `CAN_VIEW`/`CAN_USE`, or an `http_path` that is not a
+  `/sql/1.0/warehouses/<id>` path), the estimate keeps the caller-asserted size with a caveat.
 - Databricks has no per-query warehouse override - the SQL warehouse is fixed by
   `DATABRICKS_HTTP_PATH` at connect time.
 - Snowflake's `UPPER_BOUND` estimate excludes Cortex AI Function ("AI Credits") cost.
-- Snowflake warehouse generation (Gen1 vs. the newer, pricier Gen2) is detected on a
-  best-effort basis via `SHOW WAREHOUSES` and `CURRENT_REGION()` (both ordinary,
-  non-privileged SQL) to pick the correct credit rate — Gen2 bills ~1.35x Gen1 on AWS/GCP
-  and ~1.25x on Azure. Detection needs a `warehouse` to be specified; if it isn't, or the
-  lookup fails for any reason (permission, timeout, unrecognized response shape), the
-  estimate safely falls back to Gen1 rates with an explicit caveat rather than erroring —
-  since Gen2 is now the default for new standard warehouses in most regions, an
-  undetectable generation means the real cost may be higher than this estimate. Live-
-  verified 2026-09-18 against a real trial account: its default warehouse (`COMPUTE_WH`)
-  is genuinely Gen2 on AWS, and this detection correctly identified it and applied the
-  Gen2 rate.
+- Snowflake warehouse size, type and generation (Gen1 vs. the newer, pricier Gen2) are read
+  from the pinned warehouse's `SHOW WAREHOUSES` row, plus `CURRENT_REGION()` for the cloud
+  provider (all ordinary, non-privileged SQL); when no `warehouse` argument is given, the
+  session's current warehouse (`CURRENT_WAREHOUSE()`) is used. The observed size is the floor
+  of the estimate (`warehouse_size` can only raise it) and the generation picks the credit
+  rate — Gen2 bills ~1.35x Gen1 on AWS/GCP and ~1.25x on Azure. A Snowpark-optimized or
+  otherwise non-STANDARD warehouse, or an unrecognised size, gets a byte estimate but no
+  dollar figure, so a `max_estimated_cost_usd` cap refuses — omit the dollar cap to run there.
+  If the lookup fails for any reason (permission, timeout, unrecognized response shape, no
+  current warehouse), the estimate falls back to the caller-asserted size at Gen1 rates with
+  an explicit caveat rather than erroring — since Gen2 is now the default for new standard
+  warehouses in most regions, an undetectable generation means the real cost may be higher
+  than this estimate. Live-verified 2026-09-18 against a real trial account: its default
+  warehouse (`COMPUTE_WH`) is genuinely Gen2 on AWS, and the detection applied the Gen2 rate;
+  the `SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution are pinned
+  by `tests/integration/test_snowflake_live.py` (a release gate for 0.4.0).
+- Snowflake's edition is operator configuration (`SNOWFLAKE_EDITION`, default `standard`),
+  because the server cannot observe it without ORGADMIN; the per-call `edition` argument can
+  only raise the USD/credit price, never lower it. A null or non-integer `bytesAssigned` in
+  EXPLAIN's plan yields no byte or dollar estimate (unless a historical runtime for the exact
+  query exists) rather than the information-free baseline figure.
 - BigQuery Editions/capacity-billed projects cannot get a dollar estimate — only a byte count (capacity billing has no fixed $/byte rate).
 - BigQuery dry runs always report 0 bytes processed for tables protected by row-level security, by design, to prevent a side-channel — `dry_run` adds a caveat when it sees 0 bytes against a non-empty `referenced_tables` list, but a $0.00 estimate on such a query must never be treated as proof the query is free to run.
 - On an on-demand BigQuery project, `run_query_bounded`'s `max_estimated_cost_usd` is also enforced server-side: the job carries a `maximumBytesBilled` derived from the dollar cap (cap ÷ $6.25/TiB, rounded up to the next MiB, floored at BigQuery's 10 MiB minimum), lowered further to a caller-supplied `max_bytes_billed` but never raised above it. This is what makes the cap hold for the shapes the dry run cannot price — row-level-security-protected tables (always 0 bytes), `LOWER_BOUND` estimates and absent statistics. A query that would bill more than that limit is rejected by BigQuery with no charge and surfaces as a normal `status: "refused"` result (`reason: cost_cap_exceeded` when the limit came from the dollar cap, `byte_cap_exceeded` when it was your own byte cap), not as an error. Residual: BigQuery bills a 10 MiB minimum per referenced table, so a tight cap on a many-table query can still be provider-rejected after passing the gate — it now shows up as that structured refusal rather than a provider error string. A `NaN` `max_estimated_cost_usd` is rejected outright (it would compare as "under cap" for every estimate); `+inf` still means "no dollar cap".

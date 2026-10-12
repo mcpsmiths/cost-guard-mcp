@@ -190,6 +190,27 @@ the session value wins.
 - The Docker install example runs the container with `--init` so SIGTERM reaches the PID-1
   server; the cancellation entry under Known limitations was rewritten (`DECISIONS.md` #14).
 
+### Changed
+
+- **Snowflake/Databricks cost estimates are priced at the observed warehouse, never below it**
+  (security audit `cap-gate-rate-from-caller-asserted-warehouse-size-not-observed-warehouse`;
+  DECISIONS.md #15). The cap gate used to price at whatever `warehouse_size`/`edition` the
+  caller supplied, defaulting to the cheapest tier, so an omitted size admitted a query costing
+  up to 512x (Snowflake) / 174x (Databricks) the approved cap and labelled it `UPPER_BOUND`.
+  Snowflake now reads the pinned warehouse's `SHOW WAREHOUSES` row directly (size/type/
+  generation/state via `fetchall()`, no `RESULT_SCAN`; exact case-insensitive name match so
+  LIKE's `_` wildcard cannot bind a sibling; `CURRENT_WAREHOUSE()` resolved when no `warehouse`
+  is given) and Databricks looks the `DATABRICKS_HTTP_PATH` warehouse up through the Warehouses
+  API (`auth_type` pinned, 60 s bounds); `warehouse_size`/`edition` can only raise the estimate.
+  **Breaking:** Snowpark-optimized/non-STANDARD Snowflake warehouses, unrecognised sizes and
+  Databricks Classic/Pro warehouses no longer get a dollar figure, so a `max_estimated_cost_usd`
+  cap refuses on them (omit the dollar cap to run there); a null/non-integer EXPLAIN
+  `bytesAssigned` no longer yields the information-free baseline figure. A failed lookup keeps
+  the previous caller-asserted fallback with a caveat. New optional `SNOWFLAKE_EDITION`
+  (default `standard`) sets the USD/credit price. The `estimate_query_cost` and
+  `run_query_bounded` descriptions changed accordingly (an intended, description-only
+  `tools/list` diff; names, schemas and annotations are unchanged).
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not

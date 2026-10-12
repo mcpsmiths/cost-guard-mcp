@@ -43,3 +43,17 @@ def test_databricks_known_gaps_disclose_dollar_estimate_is_none_without_statisti
     caps = describe_engine_capabilities("databricks")
     assert any("dollar" in gap and "unavailable" in gap for gap in caps.known_gaps)
     assert any("refuse" in gap.lower() for gap in caps.known_gaps)
+
+
+def test_snowflake_capabilities_disclose_observed_size_reconciliation_and_fail_closed_types():
+    caps = describe_engine_capabilities("snowflake")
+    assert any("SHOW WAREHOUSES" in gap and "only raise" in gap for gap in caps.known_gaps)
+    assert any(
+        "Snowpark-optimized" in gap and "no dollar" in gap.lower() for gap in caps.known_gaps
+    )
+
+
+def test_databricks_capabilities_disclose_observed_size_reconciliation_and_fail_closed_types():
+    caps = describe_engine_capabilities("databricks")
+    assert any("only raise" in gap for gap in caps.known_gaps)
+    assert any("Classic/Pro" in gap and "no dollar" in gap.lower() for gap in caps.known_gaps)
