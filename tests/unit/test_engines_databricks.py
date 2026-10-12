@@ -180,6 +180,55 @@ def test_explain_estimate_parses_max_size_in_bytes_from_statistics(mock_connect)
     assert estimate.estimated_cost_usd is not None
 
 
+from cost_guard_mcp.engines.databricks import _parse_max_size_in_bytes
+
+
+def test_parse_max_size_in_bytes_accepts_spark3_iec_suffixes():
+    # Audit: databricks-explain-cost-size-regex-rejects-iec-unit-suffixes. The docs fixture
+    # above re-printed in the Spark 3.x shape (Utils.bytesToString IEC suffixes, no hints=):
+    # the 134.6 GiB leaf must win - not the 20-byte Aggregate node, and not None.
+    explain_output = (
+        "== Optimized Logical Plan ==\n"
+        "Aggregate [count(1) AS count(1)#2L], Statistics(sizeInBytes=20.0 B, rowCount=1)\n"
+        "+- Relation[ss_store_sk,ss_sold_date_sk] parquet, "
+        "Statistics(sizeInBytes=134.6 GiB, rowCount=2.88E+9)\n"
+    )
+    assert _parse_max_size_in_bytes(explain_output) == int(134.6 * 1024**3)
+
+
+@pytest.mark.parametrize(
+    ("size_text", "expected_bytes"),
+    [
+        ("1.5 KiB", 1.5 * 1024),
+        ("1.5 MiB", 1.5 * 1024**2),
+        ("2.0 TiB", 2 * 1024**4),
+        ("1.0 PiB", 1024**5),
+        ("134.6 gib", 134.6 * 1024**3),
+        ("4.0 EB", 4 * 1024**6),
+    ],
+)
+def test_parse_max_size_in_bytes_accepts_every_spark_size_label(size_text, expected_bytes):
+    # Both label families Spark's Statistics formatter can print, case-insensitive, all
+    # 1024-based (Spark's bytesToString is binary under either label style).
+    plan = f"Relation[a] parquet, Statistics(sizeInBytes={size_text}, rowCount=1)"
+    assert _parse_max_size_in_bytes(plan) == int(expected_bytes)
+
+
+@pytest.mark.parametrize("sentinel_text", ["8.0 EiB", "8.0 EB"])
+def test_parse_max_size_in_bytes_treats_long_max_sentinel_as_unknown(sentinel_text):
+    # Spark prints Long.MaxValue (2**63 - 1) as "8.0 EiB"/"8.0 EB" for relations whose
+    # statistics are defaulted - it encodes "unknown", not a scan size, so it must neither
+    # win max() over a real leaf nor stand in as a 9.2e18-byte estimate on its own.
+    sentinel_only = f"Relation[a] parquet, Statistics(sizeInBytes={sentinel_text}, rowCount=1)"
+    assert _parse_max_size_in_bytes(sentinel_only) is None
+
+    sentinel_and_leaf = (
+        f"Join Inner, Statistics(sizeInBytes={sentinel_text})\n"
+        "+- Relation[a] parquet, Statistics(sizeInBytes=134.6 GiB, rowCount=1)\n"
+    )
+    assert _parse_max_size_in_bytes(sentinel_and_leaf) == int(134.6 * 1024**3)
+
+
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_explain_estimate_handles_missing_statistics(mock_connect):
     # Real, confirmed case: no ANALYZE TABLE run, streaming source, or non-Delta external

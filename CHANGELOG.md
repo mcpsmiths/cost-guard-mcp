@@ -103,6 +103,14 @@ so `run_query_bounded` refuses a requested `max_estimated_cost_usd` for those pl
 on the floor; omit the dollar cap to run such a query - there is deliberately no opt-out
 (`DECISIONS.md` #5: an unenforceable cap must never look enforced).
 
+Fixed (Databricks, security-audit remediation): `EXPLAIN COST` size statistics printed with
+Spark 3.x IEC suffixes (`KiB`..`EiB`) or `EB` were silently skipped by the size parser, so a
+134.6 GiB leaf table could be estimated as the 20-byte node above it (or as no bytes at
+all) and both caps compared against an information-free value. The parser now accepts both
+label families case-insensitively (all 1024-based, as Spark prints them) and treats Spark's
+Long.MaxValue placeholder (`8.0 EB`/`8.0 EiB`, "statistics unknown") as no statistics, so
+such plans refuse both caps instead of pricing a 9.2e18-byte scan.
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not

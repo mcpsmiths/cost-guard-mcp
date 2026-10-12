@@ -95,12 +95,43 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     )
 
 
-_UNIT_MULTIPLIERS = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4, "PB": 1024**5}
+# Every size label Spark's Statistics formatter can print, upper-cased for lookup. Both
+# families are 1024-based: Spark's Utils.bytesToString divides by 1024 whether it labels
+# the result "GB" (Spark 2.x) or "GiB" (Spark 3.x), so "134.6 GB" and "134.6 GiB" are the
+# same byte count here.
+_UNIT_MULTIPLIERS = {
+    "B": 1,
+    "KB": 1024,
+    "KIB": 1024,
+    "MB": 1024**2,
+    "MIB": 1024**2,
+    "GB": 1024**3,
+    "GIB": 1024**3,
+    "TB": 1024**4,
+    "TIB": 1024**4,
+    "PB": 1024**5,
+    "PIB": 1024**5,
+    "EB": 1024**6,
+    "EIB": 1024**6,
+}
 
-# Real confirmed EXPLAIN COST output format (docs.databricks.com/aws/en/optimizations/cbo,
-# live-verified 2026-09-13): "Statistics(sizeInBytes=134.6 GB, rowCount=2.88E+9, ...)" -
-# unit-suffixed, not a raw byte integer like Snowflake's bytesAssigned.
-_STATISTICS_RE = re.compile(r"sizeInBytes=([\d.]+)\s*(B|KB|MB|GB|TB|PB)\b", re.IGNORECASE)
+# EXPLAIN COST prints unit-suffixed sizes, not a raw byte integer like Snowflake's
+# bytesAssigned: "Statistics(sizeInBytes=134.6 GB, rowCount=2.88E+9, hints=none)". The SI
+# label shape comes from the docs.databricks.com/aws/en/optimizations/cbo example (the
+# Spark 2.x Statistics.toString form, fetched 2026-09-13); the IEC shape ("134.6 GiB", no
+# hints=) is what upstream Spark 3.x Utils.bytesToString emits. No EXPLAIN COST output has
+# yet been captured from a live warehouse, so both label families are accepted and a
+# leaf-table size is never silently skipped because of a suffix mismatch (audit:
+# databricks-explain-cost-size-regex-rejects-iec-unit-suffixes).
+_STATISTICS_RE = re.compile(
+    r"sizeInBytes=([\d.]+)\s*(B|KiB|MiB|GiB|TiB|PiB|EiB|KB|MB|GB|TB|PB|EB)\b", re.IGNORECASE
+)
+
+# Spark defaults a relation's statistics to Long.MaxValue (2**63 - 1) when it has none and
+# prints that as "8.0 EB"/"8.0 EiB". It encodes "unknown", not a scan size, so it is dropped
+# before max() - otherwise it would both outrank every real leaf and stand in as a 9.2e18-
+# byte estimate on its own instead of the honest None that refuses both caps.
+_SPARK_UNKNOWN_SIZE_SENTINEL_BYTES = 2**63 - 1
 
 # EXPLAIN COST gives no runtime estimate at all - same deliberately conservative,
 # documented placeholder pattern already used for Snowflake (see _ASSUMED_RUNTIME_HOURS
@@ -110,10 +141,11 @@ _ASSUMED_RUNTIME_HOURS = 30 / 3600
 
 def _parse_max_size_in_bytes(explain_output: str) -> int | None:
     matches = _STATISTICS_RE.findall(explain_output)
-    if not matches:
-        return None
     sizes = [float(value) * _UNIT_MULTIPLIERS[unit.upper()] for value, unit in matches]
-    return int(max(sizes))
+    known_sizes = [size for size in sizes if size < _SPARK_UNKNOWN_SIZE_SENTINEL_BYTES]
+    if not known_sizes:
+        return None
+    return int(max(known_sizes))
 
 
 @sanitize_exceptions("databricks")
