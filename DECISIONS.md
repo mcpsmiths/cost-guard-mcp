@@ -447,3 +447,57 @@ refusal. Documented behaviour change for consumers: valid-UTF-8 `BYTES` that use
 as plain text (type erased) now arrive base64-encoded, and `NaN`/`Inf` are strings rather
 than `null`. Row-size/row-count defaults are a separate hardening item, deliberately not
 folded in here.
+
+<!-- #10-#13 are added by the sibling 0.4.0 remediation branches (release authority, build
+input pinning, registry publishing channel, read-statement allowlist); the numbering is fixed
+by the remediation plan so parallel branches never claim the same heading. -->
+
+## 14. `run_query_bounded` cancellation: prompt detach, pre-dispatch check, provider-side deadlines
+
+**Context:** `run_query_bounded` is the only tool with a monetary side effect. Since v0.3.0
+its blocking warehouse call runs in an anyio worker thread dispatched with
+`abandon_on_cancel=True`, so an MCP `notifications/cancelled` detaches the request promptly
+instead of being shielded until the warehouse call returns. The 2026-10 security audit
+showed what that detach left open: (1) a cancel that arrived during the estimate did not
+stop the abandoned thread from submitting the execution afterwards, into a cancelled future
+nobody reads; (2) the only deadline on a submitted job was the client-side 120 s watchdog
+running in that thread, so a host that escalates to SIGTERM/SIGKILL after closing stdin
+(the reference MCP client does, 2-4 s after EOF; in Docker the server is PID 1 and ignores
+SIGTERM) orphaned the query on the warehouse with no bound at all; and (3) every BigQuery
+API round-trip outside the result wait inherited the client library's 600 s default retry
+(doubled for job submission), so the job begin could still happen minutes after the cancel.
+
+**Decision:** Keep `abandon_on_cancel=True` - a stop button that returns promptly is the
+right behaviour for the host - and close the gaps around it instead of forwarding the
+cancel into the engines:
+
+- The tool body takes a keyword-only `before_execute: Callable[[], None] | None` hook
+  that `server.py` binds to `anyio.from_thread.check_cancelled`, called exactly once after
+  the estimate and every cap check and immediately before dispatch. A cancel received
+  before execution never submits the job. The hook is injected by the server because
+  `check_cancelled` raises outside an anyio worker thread, and it reads the thread's
+  cancel-scope chain - the mcp dispatcher's `peer_cancel_mode="interrupt"` cancels the
+  handler's `CancelScope`, which is what trips it.
+- Every submitted job carries a provider-side deadline equal to the watchdog: BigQuery
+  `QueryJobConfig.job_timeout_ms = 120000`; Snowflake `STATEMENT_TIMEOUT_IN_SECONDS` and
+  Databricks `STATEMENT_TIMEOUT` as session parameters, lowered-only (a session value
+  supersedes an account/user policy in Snowflake's hierarchy, so the effective value is
+  read first and only ever lowered). The 120 s bound therefore survives the thread and the
+  process. Equal to the watchdog, not watchdog + 10 s: the README promised 120 s and the
+  bound itself is the point. Which side observes the deadline first is a race; either way
+  the caller gets a sanitized error and exactly one WARNING record (the watchdog's own, or
+  the `warehouse_client_call_failed` record when the warehouse's cancellation wins).
+- BigQuery API calls carry a 30 s retry bound and `job_retry=None` (see
+  `engines/bigquery.py`), so the pre-dispatch window is seconds, not minutes.
+
+Deferred: forwarding the cancel to the engines' own cancel RPCs (`QueryJob.cancel`,
+`SYSTEM$CANCEL_QUERY`, `Cursor.cancel`) and a SIGTERM/lifespan handler that cancels
+in-flight jobs on exit. Both need a job registry threaded through all three engine
+signatures and signal handling inside the mcp/anyio run loop, and neither helps on
+SIGKILL - the provider-side deadline does.
+
+**Consequences:** The install example uses `docker run --init` and the flag is
+load-bearing (PID 1 otherwise ignores SIGTERM). A cancelled call still bills for a query
+that was already running when the cancel arrived, for at most the 120 s watchdog. The
+pre-dispatch check is only as good as the host's cancellation path through the dispatcher's
+cancel scope; a host that simply drops the connection relies on the provider-side deadline.

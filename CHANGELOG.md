@@ -165,6 +165,18 @@ the session value wins.
   600 s job-insert retry, so the read-only tools could block for 10-20 minutes while Google
   was unreachable and an abandoned `run_query_bounded` thread could still submit the billed
   job minutes after a host cancel. Every call now carries a 30 s bound and `job_retry=None`.
+- An MCP cancellation that arrived while `run_query_bounded` was still estimating did not
+  stop the abandoned worker thread from submitting the billable execution afterwards, and
+  the only deadline on a submitted BigQuery job was the client-side 120 s watchdog in that
+  thread (SIGTERM/SIGKILL after stdin close orphaned the query with no bound). The tool now
+  re-checks for cancellation immediately before dispatch (`before_execute`, bound to
+  `anyio.from_thread.check_cancelled`), and every BigQuery job carries
+  `jobTimeoutMs=120000` so BigQuery enforces the same bound after the process is gone.
+
+### Changed
+
+- The Docker install example runs the container with `--init` so SIGTERM reaches the PID-1
+  server; the cancellation entry under Known limitations was rewritten (`DECISIONS.md` #14).
 
 ## [0.3.3] - 2026-10-10
 

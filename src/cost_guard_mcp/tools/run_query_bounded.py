@@ -3,6 +3,7 @@ import datetime
 import logging
 import math
 import uuid
+from collections.abc import Callable
 from decimal import Decimal
 
 from cost_guard_mcp.engines import bigquery as bigquery_engine
@@ -68,6 +69,8 @@ def run_query_bounded(
     warehouse: str | None = None,
     warehouse_size: str | None = None,
     edition: str | None = None,
+    *,
+    before_execute: Callable[[], None] | None = None,
 ) -> BoundedQueryResult:
     # The text priced below must be the text executed below, as exactly one statement:
     # a second statement behind a top-level ';' would run under a cap that was never
@@ -178,6 +181,17 @@ def run_query_bounded(
         if max_bytes_billed is None or derived <= max_bytes_billed:
             effective_max_bytes_billed = derived
             byte_cap_derived_from_cost_cap = True
+
+    # Last cooperative cancellation point. Everything above is read-only (the estimate and
+    # the cap checks); everything below has a monetary side effect. server.py binds this to
+    # anyio.from_thread.check_cancelled, so an MCP `notifications/cancelled` that arrived
+    # while the estimate was running raises here and the billable query is never submitted
+    # by the abandoned worker thread. Keyword-only and None by default: check_cancelled
+    # raises NoEventLoopError outside an anyio worker thread, so the server injects it;
+    # direct callers (tests, library use) must never pay for it or be able to pass it
+    # positionally as a ninth tool parameter.
+    if before_execute is not None:
+        before_execute()
 
     try:
         if engine == "bigquery":

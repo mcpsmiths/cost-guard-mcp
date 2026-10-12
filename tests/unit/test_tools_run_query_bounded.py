@@ -1,9 +1,10 @@
+import asyncio
 import base64
 import datetime
 import decimal
 import logging
 import uuid
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -436,3 +437,85 @@ def test_row_cap_refusal_rows_are_normalised_too(mock_estimate, mock_execute):
 
     assert result.status == "refused"
     assert result.rows == [{"b": base64.b64encode(b"\xff").decode("ascii")}]
+
+
+# Regression tests for the cooperative pre-dispatch cancellation hook (audit fingerprint
+# client-side-only-query-deadline-orphaned-on-process-exit). server.py binds
+# `before_execute` to anyio.from_thread.check_cancelled so an MCP cancel that arrived while
+# the estimate was running never starts the billable execution; direct callers (and these
+# tests, except where stated) leave it at its default None.
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_before_execute_called_exactly_once_after_caps_and_before_execute(
+    mock_estimate, mock_engine
+):
+    manager = MagicMock()
+    manager.estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    manager.execute.return_value = ([{"a": 1}], 1, False)
+    mock_estimate.side_effect = manager.estimate
+    mock_engine.execute_bounded.side_effect = manager.execute
+
+    result = run_query_bounded(
+        "bigquery",
+        "SELECT 1",
+        max_estimated_cost_usd=1.00,
+        max_bytes_billed=1_000_000,
+        before_execute=manager.hook,
+    )
+
+    assert result.status == "ok"
+    assert manager.hook.call_count == 1
+    assert [c[0] for c in manager.mock_calls] == ["estimate", "hook", "execute"]
+
+
+@pytest.mark.parametrize(
+    ("estimate", "caps"),
+    [
+        (_estimate(cost=10.00), {"max_estimated_cost_usd": 1.00}),
+        (_estimate(bytes_=10_000_000_000), {"max_bytes_billed": 1_000_000}),
+        (_estimate(cost=None), {"max_estimated_cost_usd": 1.00}),
+        (_estimate(bytes_=None), {"max_bytes_billed": 1_000_000}),
+    ],
+    ids=["cost_cap_exceeded", "byte_cap_exceeded", "cost_fail_closed", "byte_fail_closed"],
+)
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_before_execute_not_called_when_a_cap_refuses(mock_estimate, mock_engine, estimate, caps):
+    mock_estimate.return_value = estimate
+    hook = MagicMock()
+
+    result = run_query_bounded("bigquery", "SELECT * FROM t", before_execute=hook, **caps)
+
+    assert result.status == "refused"
+    hook.assert_not_called()
+    mock_engine.execute_bounded.assert_not_called()
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_before_execute_raising_prevents_dispatch_and_propagates(mock_estimate, mock_engine):
+    # asyncio.CancelledError is what anyio.from_thread.check_cancelled raises; it is a
+    # BaseException, so this also proves the hook is not wrapped in any except Exception.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    hook = MagicMock(side_effect=asyncio.CancelledError("cancelled via cancel scope"))
+
+    with pytest.raises(asyncio.CancelledError):
+        run_query_bounded("bigquery", "SELECT 1", before_execute=hook)
+
+    mock_engine.execute_bounded.assert_not_called()
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_before_execute_defaults_to_none_and_is_keyword_only(mock_estimate, mock_engine):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_engine.execute_bounded.return_value = ([], 0, False)
+
+    assert run_query_bounded("bigquery", "SELECT 1").status == "ok"
+
+    # Positional use must be rejected: the 8 positional tool parameters are the public
+    # contract server.py forwards, and the hook must never be confusable with one of them.
+    with pytest.raises(TypeError):
+        run_query_bounded("bigquery", "SELECT 1", None, None, None, None, None, None, MagicMock())

@@ -5,8 +5,10 @@ channel for stdio mode. All diagnostic output must go to stderr (the default
 for Python's `logging` module when no handler is configured, and for `print(..., file=sys.stderr)`).
 """
 
+import functools
 import os
 
+import anyio.from_thread
 import anyio.to_thread
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
@@ -74,17 +76,30 @@ async def _run_query_bounded_in_thread(
     # mcp.server.mcpserver.utilities.func_metadata.FuncMetadata.call_fn). abandon_on_cancel=True
     # makes cancellation prompt at the MCP bookkeeping level only - the abandoned thread (and
     # the warehouse-side query it's running) keeps going until the existing per-engine
-    # watchdog (~120s) cancels it; see README's Known limitations.
+    # watchdog (~120s) cancels it; see README's Known limitations and DECISIONS.md #14.
+    #
+    # before_execute=anyio.from_thread.check_cancelled is the cooperative half of that
+    # trade-off: the tool body calls it once, after the estimate and every cap check and
+    # immediately before the execution is dispatched, so a cancel that arrived during the
+    # estimate raises inside the (already abandoned) worker thread instead of letting it
+    # submit a billable query into a cancelled future nobody reads. It inspects the thread's
+    # anyio cancel-scope chain - the mcp dispatcher cancels the handler's CancelScope
+    # (peer_cancel_mode "interrupt"), which is what trips it; a bare asyncio Task.cancel()
+    # would not. Bound here, not in the tool body: check_cancelled raises NoEventLoopError
+    # when called outside an anyio worker thread.
     return await anyio.to_thread.run_sync(
-        _run_query_bounded,
-        engine,
-        sql,
-        max_bytes_billed,
-        max_rows,
-        max_estimated_cost_usd,
-        warehouse,
-        warehouse_size,
-        edition,
+        functools.partial(
+            _run_query_bounded,
+            engine,
+            sql,
+            max_bytes_billed,
+            max_rows,
+            max_estimated_cost_usd,
+            warehouse,
+            warehouse_size,
+            edition,
+            before_execute=anyio.from_thread.check_cancelled,
+        ),
         abandon_on_cancel=True,
     )
 

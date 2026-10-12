@@ -1,16 +1,22 @@
 import asyncio
 import base64
+import functools
 import hashlib
 import logging
-from unittest.mock import MagicMock, patch
+import threading
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import anyio
+import anyio.from_thread
 import pytest
 from dateutil.relativedelta import relativedelta
 from google.api_core.exceptions import BadRequest
 from google.cloud.bigquery.table import Row
 from mcp.server.mcpserver.exceptions import ToolError
 
+from cost_guard_mcp import server
 from cost_guard_mcp.server import mcp
+from cost_guard_mcp.types import AccuracyTier, CostEstimate
 
 
 def test_server_is_named_cost_guard_mcp():
@@ -303,3 +309,80 @@ def test_call_tool_run_query_bounded_row_cap_refusal_delivers_binary_cells(
     assert result.structured_content["rows"] == [
         {"digest": base64.b64encode(_DIGEST).decode("ascii")}
     ]
+
+
+# Regression tests for the cooperative pre-dispatch cancellation check (audit fingerprint
+# client-side-only-query-deadline-orphaned-on-process-exit).
+
+_RUN_QUERY_BOUNDED_ARGS = ("bigquery", "SELECT 1", None, None, None, None, None, None)
+
+
+async def test_run_query_bounded_in_thread_injects_check_cancelled_as_before_execute():
+    sentinel = MagicMock(name="bounded_result")
+    with patch("anyio.to_thread.run_sync", new=AsyncMock(return_value=sentinel)) as run_sync:
+        result = await server._run_query_bounded_in_thread(*_RUN_QUERY_BOUNDED_ARGS)
+
+    assert result is sentinel
+    run_sync.assert_awaited_once()
+    dispatched = run_sync.await_args.args[0]
+    assert isinstance(dispatched, functools.partial)
+    assert dispatched.args == _RUN_QUERY_BOUNDED_ARGS
+    # check_cancelled raises NoEventLoopError outside an anyio worker thread, so it must be
+    # injected by the server here - never called unconditionally inside the tool body.
+    assert dispatched.keywords["before_execute"] is anyio.from_thread.check_cancelled
+    # Prompt MCP detach (the v0.3.0 fix) is unchanged.
+    assert run_sync.await_args.kwargs["abandon_on_cancel"] is True
+
+
+async def test_cancel_received_during_the_estimate_never_dispatches_the_execution():
+    # The real tool body with a slow estimate: the MCP cancel arrives while the estimate is
+    # still running in the worker thread. Before the fix the detached thread went on to
+    # submit the billed execution into a cancelled future nobody reads. The cancel is issued
+    # through an anyio CancelScope, exactly as the mcp dispatcher does (peer_cancel_mode
+    # "interrupt" cancels the handler's scope) - a bare asyncio Task.cancel() would NOT
+    # trip anyio.from_thread.check_cancelled, which inspects the thread's cancel-scope
+    # chain, so this test deliberately does not use Task.cancel().
+    estimate_started = threading.Event()
+    release_estimate = threading.Event()
+    thread_finished = threading.Event()
+
+    def slow_estimate(*_args, **_kwargs):
+        estimate_started.set()
+        assert release_estimate.wait(5)
+        return CostEstimate(
+            engine="bigquery",
+            accuracy_tier=AccuracyTier.PRECISE,
+            estimated_bytes=1,
+            estimated_cost_usd=0.0,
+        )
+
+    real_run_query_bounded = server._run_query_bounded
+
+    def tracked_run_query_bounded(*args, **kwargs):
+        try:
+            return real_run_query_bounded(*args, **kwargs)
+        finally:
+            thread_finished.set()
+
+    mock_engine = MagicMock()
+    scopes: list[anyio.CancelScope] = []
+
+    async def handler():
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            await server._run_query_bounded_in_thread(*_RUN_QUERY_BOUNDED_ARGS)
+
+    with (
+        patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost", slow_estimate),
+        patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine", mock_engine),
+        patch("cost_guard_mcp.server._run_query_bounded", tracked_run_query_bounded),
+    ):
+        task = asyncio.create_task(handler())
+        assert await asyncio.to_thread(estimate_started.wait, 5)
+        scopes[0].cancel()
+        await asyncio.wait_for(task, 2)  # prompt detach; the scope swallows its own cancel
+        release_estimate.set()  # the abandoned thread now finishes its estimate...
+        assert await asyncio.to_thread(thread_finished.wait, 5)
+
+    # ...and must stop at the before_execute check instead of submitting the execution.
+    mock_engine.execute_bounded.assert_not_called()

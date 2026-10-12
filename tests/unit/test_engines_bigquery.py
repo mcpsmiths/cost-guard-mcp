@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from google.api_core.exceptions import BadRequest, InternalServerError
+from google.cloud import bigquery
 
 from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines.bigquery import (
@@ -624,3 +625,40 @@ def test_is_capacity_billed_bounds_reservation_search_timeout(mock_reservation_m
 
     kwargs = mock_client.search_all_assignments.call_args.kwargs
     assert kwargs["timeout"] == bigquery_engine._MAX_API_WAIT_SECONDS
+
+
+# Regression tests for the provider-side execution deadline (audit fingerprint
+# client-side-only-query-deadline-orphaned-on-process-exit). The client-side watchdog in
+# result(timeout=120) only exists while this process's worker thread is alive; jobTimeoutMs
+# makes BigQuery itself enforce the same 120 s bound after a SIGTERM/SIGKILL or an abandoned
+# thread. Both tests use the real QueryJobConfig class so the assertion is on the actual
+# wire field, not on a MagicMock attribute.
+
+
+@pytest.mark.parametrize(
+    ("max_bytes_billed", "expected_query_fields"),
+    [(None, {}), (1_000_000, {"maximumBytesBilled": "1000000"})],
+    ids=["uncapped_branch", "byte_capped_branch"],
+)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_sets_job_timeout_ms_equal_to_the_watchdog_on_both_branches(
+    mock_bq_module, max_bytes_billed, expected_query_fields
+):
+    mock_bq_module.QueryJobConfig = bigquery.QueryJobConfig  # the real class
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([])
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+
+    execute_bounded("SELECT 1", max_bytes_billed=max_bytes_billed, max_rows=None)
+
+    job_config = mock_client.query.call_args.kwargs["job_config"]
+    assert isinstance(job_config, bigquery.QueryJobConfig)
+    # The library stores jobTimeoutMs as its API string form; the wire field is what BigQuery
+    # enforces, so assert on the full API repr rather than on a Python attribute.
+    expected_ms = str(bigquery_engine._MAX_EXECUTION_WAIT_SECONDS * 1000)
+    assert expected_ms == "120000"
+    assert job_config.to_api_repr() == {"query": expected_query_fields, "jobTimeoutMs": expected_ms}

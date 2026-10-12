@@ -278,6 +278,13 @@ def execute_bounded(
         if max_bytes_billed is not None
         else bigquery.QueryJobConfig()
     )
+    # Provider-side deadline equal to the client watchdog below. result(timeout=...) only
+    # bounds the query while this process's worker thread is alive: after an MCP cancel the
+    # thread is abandoned, and a host that escalates to SIGTERM/SIGKILL after closing stdin
+    # (the reference MCP client does, ~2-4 s after EOF; in Docker the server is PID 1) kills
+    # the watchdog with the process and the job keeps billing. jobTimeoutMs makes BigQuery
+    # itself cancel the job at the same 120 s, whatever happens to this process.
+    job_config.job_timeout_ms = _MAX_EXECUTION_WAIT_SECONDS * 1000
     try:
         query_job = client.query(
             wrapped_sql,
