@@ -145,6 +145,12 @@ the session value wins.
   one. Previously the session's authority was whatever the user's `DEFAULT_SECONDARY_ROLES`
   made it (`('ALL')` by default), so model-written SQL could use every role granted to
   `SNOWFLAKE_USER`. `SYSTEM$CANCEL_QUERY` now interpolates the canonical UUID text only.
+- Snowflake: every statement that carries model-supplied text (`EXPLAIN USING JSON` in
+  `estimate_query_cost`, `execute_async` in `run_query_bounded`) is now submitted with
+  `MULTI_STATEMENT_COUNT=1` (per-call `num_statements=1` plus the same value as a login-time
+  session parameter), so Snowflake itself rejects `;`-separated multi-statement text instead
+  of deferring to the operator's account/user `MULTI_STATEMENT_COUNT`. No documented
+  behaviour changes - multi-statement Snowflake text was never supported.
 
 ## [0.3.3] - 2026-10-10
 

@@ -32,6 +32,18 @@ logger = logging.getLogger(__name__)
 _LOGIN_TIMEOUT_SECONDS = 30
 _NETWORK_TIMEOUT_SECONDS = 60
 
+# Security audit record snowflake-execute-unpinned-multi-statement-count: EXPLAIN USING JSON
+# and execute_async both carry model-supplied text. Without num_statements the connector sends
+# no MULTI_STATEMENT_COUNT, so whether a ';'-separated trailing statement executed - inside a
+# tool advertised read_only_hint=True, and ahead of run_query_bounded's cap gate - depended on
+# the operator's account/user MULTI_STATEMENT_COUNT parameter. Passing num_statements=1 makes
+# Snowflake itself reject any text that is not exactly one statement ("Actual statement count
+# N did not match the desired statement count 1"), regardless of that parameter; the same
+# value also goes in the login-time session_parameters as belt and braces for any future
+# execute added without the kwarg. tests/unit/test_snowflake_dependency_contract.py pins the
+# connector API this relies on.
+_SINGLE_STATEMENT_COUNT = 1
+
 
 @sanitize_exceptions("snowflake")
 def _connect() -> "snowflake.connector.SnowflakeConnection":
@@ -47,6 +59,11 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
     because the connector only WARNS on an unknown connect() kwarg (fail-open).
     """
     config = load_snowflake_config()
+    # Login-time session parameters (sent in the login request body, so in force before any
+    # statement). MULTI_STATEMENT_COUNT=1 is the session-level half of the single-statement
+    # pin described at _SINGLE_STATEMENT_COUNT; the per-call num_statements kwarg on the two
+    # statements that carry model text is the other half.
+    session_parameters = {"MULTI_STATEMENT_COUNT": _SINGLE_STATEMENT_COUNT}
 
     if config.private_key_path:
         return snowflake.connector.connect(
@@ -59,6 +76,7 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
             login_timeout=_LOGIN_TIMEOUT_SECONDS,
             network_timeout=_NETWORK_TIMEOUT_SECONDS,
             secondary_roles=config.secondary_roles,
+            session_parameters=session_parameters,
         )
 
     return snowflake.connector.connect(
@@ -69,6 +87,7 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
         login_timeout=_LOGIN_TIMEOUT_SECONDS,
         network_timeout=_NETWORK_TIMEOUT_SECONDS,
         secondary_roles=config.secondary_roles,
+        session_parameters=session_parameters,
     )
 
 
@@ -262,7 +281,11 @@ def explain_estimate(
         with conn.cursor() as cur:
             if warehouse is not None:
                 cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-            cur.execute(f"EXPLAIN USING JSON {sql}")
+            # num_statements=1: Snowflake rejects the whole text if it is not exactly one
+            # statement, so a ';'-separated trailing statement can neither execute inside this
+            # read-only-advertised estimate nor be silently discarded (see
+            # _SINGLE_STATEMENT_COUNT).
+            cur.execute(f"EXPLAIN USING JSON {sql}", num_statements=_SINGLE_STATEMENT_COUNT)
             row = cur.fetchone()
 
         if row is None:
@@ -389,7 +412,10 @@ def execute_bounded(
         with conn.cursor(snowflake.connector.DictCursor) as cur:
             if warehouse is not None:
                 cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-            cur.execute_async(wrapped_sql)
+            # execute_async forwards **kwargs to execute, so num_statements=1 reaches the
+            # request as statement_params {'MULTI_STATEMENT_COUNT': 1} - the billable path
+            # gets the same server-side single-statement pin as EXPLAIN above.
+            cur.execute_async(wrapped_sql, num_statements=_SINGLE_STATEMENT_COUNT)
             query_id = cur.sfqid
             if query_id is None:
                 raise SanitizedEngineError("execute_async did not return a query id")

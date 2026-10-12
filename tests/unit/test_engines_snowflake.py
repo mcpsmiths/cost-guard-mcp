@@ -10,6 +10,7 @@ from cost_guard_mcp.engines.snowflake import (
     _HISTORY_LOOKUP_TIMEOUT_SECONDS,
     _LOGIN_TIMEOUT_SECONDS,
     _NETWORK_TIMEOUT_SECONDS,
+    _SINGLE_STATEMENT_COUNT,
     _connect,
     _lookup_historical_runtime,
     _lookup_warehouse_generation,
@@ -48,6 +49,7 @@ def test_connect_uses_key_pair_when_private_key_path_set(mock_load_config, mock_
         login_timeout=_LOGIN_TIMEOUT_SECONDS,
         network_timeout=_NETWORK_TIMEOUT_SECONDS,
         secondary_roles="NONE",
+        session_parameters={"MULTI_STATEMENT_COUNT": 1},
     )
 
 
@@ -74,6 +76,7 @@ def test_connect_falls_back_to_password_when_no_key_pair(mock_load_config, mock_
         login_timeout=_LOGIN_TIMEOUT_SECONDS,
         network_timeout=_NETWORK_TIMEOUT_SECONDS,
         secondary_roles="NONE",
+        session_parameters={"MULTI_STATEMENT_COUNT": 1},
     )
 
 
@@ -226,6 +229,59 @@ def test_explain_estimate_rejects_empty_string_warehouse(mock_connect):
         explain_estimate("SELECT 1", warehouse="")
 
     mock_cursor.execute.assert_not_called()
+
+
+def test_single_statement_count_constant_is_one():
+    assert _SINGLE_STATEMENT_COUNT == 1
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_pins_statement_count_to_one_on_explain(mock_connect):
+    # Security audit snowflake-execute-unpinned-multi-statement-count: EXPLAIN USING JSON
+    # carries model-supplied text, and without num_statements the connector sends no
+    # MULTI_STATEMENT_COUNT, so whether ';'-separated trailing text executes was decided by
+    # the operator's account/user parameter. num_statements=1 makes Snowflake itself reject
+    # anything but exactly one statement, regardless of that parameter.
+    plan_json = json.dumps(
+        {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
+    )
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (plan_json,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    explain_estimate("SELECT 1; CREATE TABLE cg_probe(x INT)", warehouse=None)
+
+    explain_calls = [
+        call
+        for call in mock_cursor.execute.call_args_list
+        if call.args[0].startswith("EXPLAIN USING JSON")
+    ]
+    assert len(explain_calls) == 1
+    assert explain_calls[0].kwargs["num_statements"] == 1
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_statement_count_rejection_propagates_and_closes_connection(
+    mock_connect,
+):
+    # Simulates Snowflake's server-side rejection under MULTI_STATEMENT_COUNT=1. Nothing is
+    # fetched or estimated, the connection is still closed, and the caller sees a
+    # SanitizedEngineError (-> ToolError) rather than a normal CostEstimate.
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = Exception(
+        "Actual statement count 2 did not match the desired statement count 1."
+    )
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="did not match the desired statement count"):
+        explain_estimate("SELECT 1; CREATE TABLE cg_probe(x INT)", warehouse=None)
+
+    mock_cursor.fetchone.assert_not_called()
+    mock_conn.close.assert_called_once()
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
@@ -869,6 +925,65 @@ def test_execute_bounded_polls_until_done_then_fetches_results(mock_connect, _mo
     assert rows == [{"a": 1}]
     assert row_count == 1
     assert row_cap_hit is False
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_pins_statement_count_to_one_on_execute_async(mock_connect, _mock_sleep):
+    # Security audit snowflake-execute-unpinned-multi-statement-count: execute_async is the
+    # billable call. It forwards **kwargs to execute, so num_statements=1 becomes
+    # statement_params {'MULTI_STATEMENT_COUNT': 1} on the request (pinned by
+    # test_snowflake_dependency_contract.py).
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = []
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = False
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+
+    mock_cursor.execute_async.assert_called_once_with("SELECT 1", num_statements=1)
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_pins_statement_count_on_limit_wrapped_text_too(mock_connect, _mock_sleep):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = []
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = False
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT * FROM t", warehouse=None, max_rows=5)
+
+    mock_cursor.execute_async.assert_called_once_with(
+        "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6", num_statements=1
+    )
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_statement_count_rejection_propagates_and_closes_connection(
+    mock_connect, _mock_sleep
+):
+    mock_cursor = MagicMock()
+    mock_cursor.execute_async.side_effect = Exception(
+        "Actual statement count 2 did not match the desired statement count 1."
+    )
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="did not match the desired statement count"):
+        execute_bounded("SELECT 1; CREATE TABLE cg_probe(x INT)", warehouse=None, max_rows=None)
+
+    mock_conn.get_query_status.assert_not_called()
+    mock_cursor.fetchall.assert_not_called()
+    mock_conn.close.assert_called_once()
 
 
 @patch("cost_guard_mcp.engines.snowflake.time.sleep")
