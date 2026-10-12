@@ -48,6 +48,15 @@ Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no def
   granting those objects to `SNOWFLAKE_ROLE` instead; set `ALL` only if you accept that the
   agent's SQL runs with every role the user holds. `check_credentials` reports the active
   secondary-role set (`CURRENT_SECONDARY_ROLES()`) so you can confirm what is in force.
+- Every session also carries a Snowflake-side statement deadline
+  (`STATEMENT_TIMEOUT_IN_SECONDS`: 60 s for `check_credentials`/`estimate_query_cost`,
+  120 s for `run_query_bounded`, matching its watchdog) so a query cannot keep running —
+  and billing — if this process dies mid-call. The value is applied *read-then-lower*: the
+  server reads the session's effective value first and only issues `ALTER SESSION` when
+  that value is 0 (unbounded), unparseable, or above the target. A stricter account- or
+  user-level policy (say 30 s) is therefore never raised; note that a session-level value
+  would otherwise override account/user levels in Snowflake's parameter hierarchy (only the
+  warehouse level combines lowest-wins).
 
 ### Databricks
 Set `DATABRICKS_SERVER_HOSTNAME` and `DATABRICKS_HTTP_PATH` (from the SQL warehouse's

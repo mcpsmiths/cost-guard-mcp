@@ -44,10 +44,78 @@ _NETWORK_TIMEOUT_SECONDS = 60
 # connector API this relies on.
 _SINGLE_STATEMENT_COUNT = 1
 
+# Provider-side statement deadline (security audit record client-side-only-query-deadline-
+# orphaned-on-process-exit, Snowflake leg; plan-review amendment A8). execute_bounded's
+# poll/cancel watchdog and the connector's network_timeout are both client-side: if this
+# process dies mid-call (host closes stdin, SIGTERM, OOM) the warehouse keeps running - and
+# billing - the query until Snowflake's own STATEMENT_TIMEOUT_IN_SECONDS fires, whose shipped
+# default is 172800 s (two days). A session-level value is therefore set so the deadline
+# survives this process. It is applied read-then-only-lower, NOT as a blind login-time
+# session parameter: a SESSION-level value OVERRIDES the account- and user-level values (only
+# the warehouse level combines lowest-wins), so blindly setting 120 would RAISE an operator's
+# stricter 30 s user policy. SHOW PARAMETERS ... IN SESSION is metadata-only (no warehouse)
+# and bounded by the same short client-side timeout the other metadata probes use.
+_SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS = 5
+_STATEMENT_TIMEOUT_PARAMETER = "STATEMENT_TIMEOUT_IN_SECONDS"
+
+
+def _parse_effective_statement_timeout(row: tuple | None) -> int | None:
+    """The `value` column of a SHOW PARAMETERS row as a positive int, else None.
+
+    SHOW PARAMETERS rows are (key, value, default, level, description, type). 0 means "no
+    timeout" in Snowflake - the LEAST bounded value, so it is reported as None (needs
+    lowering), exactly like an unparseable or missing value.
+    """
+    if row is None or len(row) < 2:
+        return None
+    try:
+        effective = int(str(row[1]).strip())
+    except (TypeError, ValueError):
+        return None
+    return effective if effective > 0 else None
+
+
+def _apply_statement_timeout(
+    conn: "snowflake.connector.SnowflakeConnection", target_seconds: int
+) -> None:
+    """Lower the session's STATEMENT_TIMEOUT_IN_SECONDS to `target_seconds` unless an operator
+    policy is already at or below it; never raise an existing stricter value.
+
+    Fails closed: an effective value of 0 (unbounded), a missing row or an unparseable value
+    all result in ALTER SESSION to the target. Any exception closes the connection before
+    re-raising so a half-configured session is never handed back; the @sanitize_exceptions
+    decorator on _connect() turns it into a SanitizedEngineError. `target_seconds` is always
+    one of this module's own int constants, never caller input.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SHOW PARAMETERS LIKE '{_STATEMENT_TIMEOUT_PARAMETER}' IN SESSION",
+                timeout=_SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS,
+            )
+            effective = _parse_effective_statement_timeout(cur.fetchone())
+            if effective is not None and effective <= target_seconds:
+                return
+            cur.execute(
+                f"ALTER SESSION SET {_STATEMENT_TIMEOUT_PARAMETER} = {int(target_seconds)}",
+                timeout=_SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS,
+            )
+    except Exception:
+        # Best-effort close, mirroring explain_estimate/execute_bounded's own discipline - a
+        # failed close must never mask the real failure being re-raised.
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
+        raise
+
 
 @sanitize_exceptions("snowflake")
-def _connect() -> "snowflake.connector.SnowflakeConnection":
-    """Open a per-call connection whose session authority is exactly SNOWFLAKE_ROLE.
+def _connect(
+    statement_timeout_seconds: int = _NETWORK_TIMEOUT_SECONDS,
+) -> "snowflake.connector.SnowflakeConnection":
+    """Open a per-call connection whose session authority is exactly SNOWFLAKE_ROLE and whose
+    statements carry a provider-side deadline of at most `statement_timeout_seconds`.
 
     `role=` only sets the session's PRIMARY role; Snowflake authorizes each statement against
     the primary role plus every ACTIVE secondary role, and the active set at login defaults to
@@ -57,6 +125,10 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
     USE WAREHOUSE or any model-supplied text, with no extra round trip and no pre-pin
     window. tests/unit/test_snowflake_dependency_contract.py guards the kwarg's existence
     because the connector only WARNS on an unknown connect() kwarg (fail-open).
+
+    `statement_timeout_seconds` defaults to the read-only paths' network timeout (60 s);
+    execute_bounded passes its own 120 s watchdog bound. See _apply_statement_timeout for why
+    it is applied read-then-lower rather than as a login-time session parameter.
     """
     config = load_snowflake_config()
     # Login-time session parameters (sent in the login request body, so in force before any
@@ -66,7 +138,7 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
     session_parameters = {"MULTI_STATEMENT_COUNT": _SINGLE_STATEMENT_COUNT}
 
     if config.private_key_path:
-        return snowflake.connector.connect(
+        conn = snowflake.connector.connect(
             account=config.account,
             user=config.user,
             role=config.role,
@@ -78,17 +150,20 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
             secondary_roles=config.secondary_roles,
             session_parameters=session_parameters,
         )
+    else:
+        conn = snowflake.connector.connect(
+            account=config.account,
+            user=config.user,
+            role=config.role,
+            password=config.password,
+            login_timeout=_LOGIN_TIMEOUT_SECONDS,
+            network_timeout=_NETWORK_TIMEOUT_SECONDS,
+            secondary_roles=config.secondary_roles,
+            session_parameters=session_parameters,
+        )
 
-    return snowflake.connector.connect(
-        account=config.account,
-        user=config.user,
-        role=config.role,
-        password=config.password,
-        login_timeout=_LOGIN_TIMEOUT_SECONDS,
-        network_timeout=_NETWORK_TIMEOUT_SECONDS,
-        secondary_roles=config.secondary_roles,
-        session_parameters=session_parameters,
-    )
+    _apply_statement_timeout(conn, statement_timeout_seconds)
+    return conn
 
 
 _WAREHOUSE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
@@ -397,7 +472,9 @@ def _cancel_query(conn: "snowflake.connector.SnowflakeConnection", query_id: str
 def execute_bounded(
     sql: str, warehouse: str | None, max_rows: int | None
 ) -> tuple[list[dict], int, bool]:
-    conn = _connect()
+    # The session deadline matches this function's own watchdog bound, so the warehouse-side
+    # query dies on its own even if this process is gone before _cancel_query can run.
+    conn = _connect(statement_timeout_seconds=_MAX_EXECUTION_WAIT_SECONDS)
     try:
         wrapped_sql = sql
         if max_rows is not None:

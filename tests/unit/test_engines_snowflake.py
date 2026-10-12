@@ -9,8 +9,11 @@ from cost_guard_mcp.engines.snowflake import (
     _GENERATION_LOOKUP_TIMEOUT_SECONDS,
     _HISTORY_LOOKUP_TIMEOUT_SECONDS,
     _LOGIN_TIMEOUT_SECONDS,
+    _MAX_EXECUTION_WAIT_SECONDS,
     _NETWORK_TIMEOUT_SECONDS,
+    _SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS,
     _SINGLE_STATEMENT_COUNT,
+    _apply_statement_timeout,
     _connect,
     _lookup_historical_runtime,
     _lookup_warehouse_generation,
@@ -103,6 +106,218 @@ def test_connect_passes_secondary_roles_all_opt_out_through_unchanged(
     assert mock_connect.call_args.kwargs["secondary_roles"] == "ALL"
 
 
+_SHOW_PARAMETERS_SQL = "SHOW PARAMETERS LIKE 'STATEMENT_TIMEOUT_IN_SECONDS' IN SESSION"
+
+
+def _connection_reporting_statement_timeout(effective_value):
+    """A mocked connection whose SHOW PARAMETERS probe returns `effective_value` in the
+    documented (key, value, default, level, description, type) row shape; None means the
+    probe returned no row at all."""
+    mock_cursor = MagicMock()
+    if effective_value is None:
+        mock_cursor.fetchone.return_value = None
+    else:
+        mock_cursor.fetchone.return_value = (
+            "STATEMENT_TIMEOUT_IN_SECONDS",
+            effective_value,
+            "172800",
+            "USER",
+            "Timeout in seconds for statements",
+            "NUMBER",
+        )
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    return mock_conn, mock_cursor
+
+
+def _statements(mock_cursor):
+    return [call.args[0] for call in mock_cursor.execute.call_args_list]
+
+
+def test_session_parameter_probe_timeout_is_short_and_bounded():
+    assert 0 < _SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS <= _HISTORY_LOOKUP_TIMEOUT_SECONDS
+
+
+def test_apply_statement_timeout_keeps_a_stricter_operator_policy():
+    # Plan-review amendment A8: a SESSION-level STATEMENT_TIMEOUT_IN_SECONDS OVERRIDES the
+    # account- and user-level values (only the warehouse level combines lowest-wins), so a
+    # blind ALTER SESSION to 60 would RAISE an operator's stricter 30 s user policy.
+    # Read-then-only-lower never does: 30 <= 60 -> leave it alone.
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("30")
+
+    _apply_statement_timeout(mock_conn, 60)
+
+    assert _statements(mock_cursor) == [_SHOW_PARAMETERS_SQL]
+    assert mock_cursor.execute.call_args_list[0].kwargs == {
+        "timeout": _SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS
+    }
+    mock_conn.close.assert_not_called()
+
+
+def test_apply_statement_timeout_keeps_a_value_equal_to_the_target():
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("60")
+
+    _apply_statement_timeout(mock_conn, 60)
+
+    assert _statements(mock_cursor) == [_SHOW_PARAMETERS_SQL]
+
+
+def test_apply_statement_timeout_lowers_the_snowflake_default():
+    # 172800 (2 days) is Snowflake's shipped default - far above anything a pre-flight tool
+    # should let a query run for once the client-side watchdog has died with the process.
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("172800")
+
+    _apply_statement_timeout(mock_conn, 60)
+
+    assert _statements(mock_cursor) == [
+        _SHOW_PARAMETERS_SQL,
+        "ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 60",
+    ]
+    assert mock_cursor.execute.call_args_list[1].kwargs == {
+        "timeout": _SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS
+    }
+
+
+def test_apply_statement_timeout_lowers_a_value_just_above_the_target():
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("61")
+
+    _apply_statement_timeout(mock_conn, 60)
+
+    assert _statements(mock_cursor)[-1] == "ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 60"
+
+
+def test_apply_statement_timeout_treats_zero_as_unbounded_and_lowers_it():
+    # 0 means "no timeout" in Snowflake - the least bounded possible value, not "stricter".
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("0")
+
+    _apply_statement_timeout(mock_conn, 60)
+
+    assert _statements(mock_cursor)[-1] == "ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 60"
+
+
+@pytest.mark.parametrize("unparseable", ["abc", "", None, "  ", "12abc"])
+def test_apply_statement_timeout_fails_closed_to_the_target_when_value_is_unparseable(
+    unparseable,
+):
+    # Unknown row shape -> fail closed to the project target rather than trusting nothing.
+    # (The live integration run after merge confirms the 'value' column parses as an int.)
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout(unparseable)
+
+    _apply_statement_timeout(mock_conn, 60)
+
+    assert _statements(mock_cursor)[-1] == "ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 60"
+
+
+def test_apply_statement_timeout_fails_closed_when_probe_returns_no_row():
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout(None)
+
+    _apply_statement_timeout(mock_conn, 60)
+
+    assert _statements(mock_cursor)[-1] == "ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = 60"
+
+
+def test_apply_statement_timeout_accepts_an_integer_typed_value():
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout(45)
+
+    _apply_statement_timeout(mock_conn, 60)
+
+    assert _statements(mock_cursor) == [_SHOW_PARAMETERS_SQL]
+
+
+def test_apply_statement_timeout_closes_connection_and_reraises_on_probe_failure():
+    # A half-configured session must not be handed back to the caller: close it and let the
+    # @sanitize_exceptions decorator on _connect turn the failure into a SanitizedEngineError.
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("172800")
+    mock_cursor.execute.side_effect = RuntimeError("SHOW PARAMETERS failed")
+
+    with pytest.raises(RuntimeError, match="SHOW PARAMETERS failed"):
+        _apply_statement_timeout(mock_conn, 60)
+
+    mock_conn.close.assert_called_once()
+
+
+def test_apply_statement_timeout_reraises_even_when_close_also_fails():
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("172800")
+    mock_cursor.execute.side_effect = RuntimeError("SHOW PARAMETERS failed")
+    mock_conn.close.side_effect = RuntimeError("close also failed")
+
+    with pytest.raises(RuntimeError, match="SHOW PARAMETERS failed"):
+        _apply_statement_timeout(mock_conn, 60)
+
+
+@patch("cost_guard_mcp.engines.snowflake.snowflake.connector.connect")
+@patch("cost_guard_mcp.engines.snowflake.load_snowflake_config")
+def test_connect_defaults_statement_timeout_target_to_the_network_timeout(
+    mock_load_config, mock_connect
+):
+    # Read-only paths (explain_estimate, check_credentials) use the default 60 s target; the
+    # session-level deadline then survives even if this process dies mid-call.
+    mock_load_config.return_value = MagicMock(
+        account="abc123",
+        user="svc_user",
+        role="COST_GUARD_READER",
+        private_key_path=None,
+        private_key_passphrase=None,
+        password="hunter2",
+        secondary_roles="NONE",
+    )
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("172800")
+    mock_connect.return_value = mock_conn
+
+    returned = _connect()
+
+    assert returned is mock_conn
+    assert _statements(mock_cursor) == [
+        _SHOW_PARAMETERS_SQL,
+        f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {_NETWORK_TIMEOUT_SECONDS}",
+    ]
+
+
+@patch("cost_guard_mcp.engines.snowflake.snowflake.connector.connect")
+@patch("cost_guard_mcp.engines.snowflake.load_snowflake_config")
+def test_connect_honours_an_explicit_statement_timeout_target(mock_load_config, mock_connect):
+    mock_load_config.return_value = MagicMock(
+        account="abc123",
+        user="svc_user",
+        role="COST_GUARD_READER",
+        private_key_path="/tmp/rsa_key.p8",
+        private_key_passphrase=None,
+        password=None,
+        secondary_roles="NONE",
+    )
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("172800")
+    mock_connect.return_value = mock_conn
+
+    _connect(statement_timeout_seconds=_MAX_EXECUTION_WAIT_SECONDS)
+
+    assert _statements(mock_cursor)[-1] == (
+        f"ALTER SESSION SET STATEMENT_TIMEOUT_IN_SECONDS = {_MAX_EXECUTION_WAIT_SECONDS}"
+    )
+
+
+@patch("cost_guard_mcp.engines.snowflake.snowflake.connector.connect")
+@patch("cost_guard_mcp.engines.snowflake.load_snowflake_config")
+def test_connect_sanitizes_and_closes_when_the_timeout_probe_fails(mock_load_config, mock_connect):
+    mock_load_config.return_value = MagicMock(
+        account="abc123",
+        user="svc_user",
+        role="COST_GUARD_READER",
+        private_key_path=None,
+        private_key_passphrase=None,
+        password="hunter2",
+        secondary_roles="NONE",
+    )
+    mock_conn, mock_cursor = _connection_reporting_statement_timeout("172800")
+    mock_cursor.execute.side_effect = RuntimeError("probe failed, password=hunter2")
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="probe failed") as excinfo:
+        _connect()
+
+    assert "hunter2" not in str(excinfo.value)
+    mock_conn.close.assert_called_once()
+
+
 @patch("cost_guard_mcp.engines.snowflake._connect")
 def test_explain_estimate_pins_warehouse_and_parses_global_stats(mock_connect):
     plan_json = json.dumps(
@@ -122,6 +337,9 @@ def test_explain_estimate_pins_warehouse_and_parses_global_stats(mock_connect):
 
     estimate = explain_estimate("SELECT * FROM t", warehouse="COMPUTE_WH", warehouse_size="SMALL")
 
+    # Read-only path: the default (60 s) session statement-timeout target, never the
+    # execute path's 120 s.
+    mock_connect.assert_called_once_with()
     executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
     assert "USE WAREHOUSE COMPUTE_WH" in executed_sql[0]
     assert "EXPLAIN USING JSON SELECT * FROM t" in executed_sql[1]
@@ -768,6 +986,7 @@ def test_check_credentials_ok_and_pins_warehouse_when_given(mock_connect):
 
     result = check_credentials(warehouse="COMPUTE_WH")
 
+    mock_connect.assert_called_once_with()  # read-only: default statement-timeout target
     executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
     assert "USE WAREHOUSE COMPUTE_WH" in executed_sql[0]
     assert result.engine == "snowflake"
@@ -920,6 +1139,9 @@ def test_execute_bounded_polls_until_done_then_fetches_results(mock_connect, _mo
 
     rows, row_count, row_cap_hit = execute_bounded("SELECT 1", warehouse=None, max_rows=None)
 
+    # The billable path asks for a session deadline matching its own 120 s watchdog, so the
+    # warehouse-side query dies on its own even if this process is gone before cancel runs.
+    mock_connect.assert_called_once_with(statement_timeout_seconds=_MAX_EXECUTION_WAIT_SECONDS)
     mock_conn.get_query_status_throw_if_error.assert_called_once_with(mock_cursor.sfqid)
     mock_cursor.get_results_from_sfqid.assert_called_once_with(mock_cursor.sfqid)
     assert rows == [{"a": 1}]

@@ -138,6 +138,12 @@ the session value wins.
   those objects to `SNOWFLAKE_ROLE`). `ACCOUNTADMIN`, `SECURITYADMIN` and `ORGADMIN` are now
   rejected as `SNOWFLAKE_ROLE` at startup. `check_credentials` reports the active
   secondary-role set.
+- **Snowflake sessions now carry a provider-side statement deadline** -
+  `STATEMENT_TIMEOUT_IN_SECONDS` is lowered to 60 s (read-only tools) or 120 s
+  (`run_query_bounded`) so a query cannot outlive this process. Applied read-then-lower
+  (`SHOW PARAMETERS ... IN SESSION`, then `ALTER SESSION` only when the effective value is
+  0, unparseable or above the target), so a stricter operator policy at account or user
+  level is never raised. Costs one or two metadata statements per connection.
 
 ### Security
 
