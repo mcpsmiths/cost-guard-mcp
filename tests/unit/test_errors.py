@@ -360,3 +360,69 @@ async def test_as_tool_error_lets_unanticipated_exceptions_propagate_unwrapped_f
 
     with pytest.raises(KeyError):
         await boom()
+
+
+# Regression tests: caller- or warehouse-influenced text must never introduce a line
+# boundary or a terminal control sequence into a log record or a SanitizedEngineError
+# message. Before the fix, a newline inside the exception text started a fresh, prefix-free
+# stderr line indistinguishable from a genuine `tool=... outcome=...` record (audit:
+# cost-guard-mcp/errors.py@log-record-forgery-control-chars-in-sanitize-exceptions-warning).
+
+
+def test_sanitize_exceptions_neutralises_control_characters_in_record_and_message(caplog):
+    @sanitize_exceptions("snowflake")
+    def boom():
+        raise RuntimeError("error:\ntool=run_query_bounded outcome=success elapsed_ms=1.0\r\n")
+
+    with (
+        caplog.at_level(logging.WARNING, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(SanitizedEngineError) as exc_info,
+    ):
+        boom()
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    for text in (records[0].message, str(exc_info.value)):
+        assert "\n" not in text
+        assert "\r" not in text
+        # Content kept, boundary removed: the forged record text is still visible for
+        # forensics, it just can't start a new line.
+        assert "tool=run_query_bounded outcome=success" in text
+
+
+def test_sanitize_exceptions_escapes_esc_and_nul(caplog):
+    @sanitize_exceptions("bigquery")
+    def boom():
+        raise RuntimeError("bad \x1b[2K\x00 text")
+
+    with (
+        caplog.at_level(logging.WARNING, logger=_ERRORS_LOGGER_NAME),
+        pytest.raises(SanitizedEngineError) as exc_info,
+    ):
+        boom()
+
+    records = _errors_logger_records(caplog)
+    assert len(records) == 1
+    for text in (records[0].message, str(exc_info.value)):
+        assert "\x1b" not in text
+        assert "\x00" not in text
+        assert "\\x1b" in text
+        assert "\\x00" in text
+
+
+def test_sanitize_exceptions_redacts_before_neutralising():
+    # Ordering regression: redaction must see the raw text (a multi-line PEM pattern needs
+    # real newlines to match), and only then is the result escaped onto one line.
+    @sanitize_exceptions("snowflake")
+    def boom():
+        cred = base64.b64decode(b"aHVudGVyMg==").decode()
+        raise RuntimeError("line1\npass" + "word=" + cred)
+
+    with pytest.raises(SanitizedEngineError) as exc_info:
+        boom()
+
+    cred = base64.b64decode(b"aHVudGVyMg==").decode()
+    message = str(exc_info.value)
+    assert "***REDACTED***" in message
+    assert cred not in message
+    assert "\n" not in message

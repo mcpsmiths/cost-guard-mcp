@@ -53,7 +53,7 @@ def dbus_per_hour(warehouse_size: str) -> float:
     size = warehouse_size.upper()
     if size not in _DBUS_PER_HOUR:
         raise ValueError(
-            f"unknown Databricks warehouse size '{warehouse_size}'. "
+            f"unknown Databricks warehouse size {warehouse_size!r}. "
             f"Known sizes: {sorted(_DBUS_PER_HOUR)}."
         )
     return _DBUS_PER_HOUR[size]

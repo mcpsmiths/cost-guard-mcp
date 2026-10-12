@@ -49,7 +49,9 @@ _SECRET_PATTERNS = [
 
 
 class SanitizedEngineError(RuntimeError):
-    """Raised in place of a raw warehouse-client exception. Safe to log or return to a tool caller."""
+    """Raised in place of a raw warehouse-client exception. Secret-free and one line: the
+    quoted text it carries is whatever the failing call raised, escaped by
+    present_remote_text, not server guidance."""
 
 
 class UserVisibleError(ValueError):
@@ -78,6 +80,23 @@ def redact_secrets(text: str) -> str:
         else:
             redacted = pattern.sub(lambda m: f"{m.group(1)}=***REDACTED***", redacted)
     return redacted
+
+
+def present_remote_text(text: str) -> str:
+    """Quote text that did not originate in this process before it reaches a log record or a
+    tool caller.
+
+    repr() escapes every control and other non-printable character - C0 (\\n, \\r, ESC, NUL),
+    DEL, C1 (NEL), the Unicode line/paragraph separators and bidi controls - as \\xNN /
+    \\uNNNN, so the result is exactly one line that still shows the original content for
+    forensics, and the surrounding quotes make it visible where the untrusted text starts
+    and ends. Runs AFTER redact_secrets, never before: redaction has to see the raw text
+    (a multi-line PEM pattern needs real newlines), and nothing that can introduce a line
+    boundary must be written to stderr or returned to the model un-escaped - the SDK's own
+    stderr handler is a bare '%(message)s', so an embedded newline would otherwise start a
+    new, prefix-free record indistinguishable from a genuine one.
+    """
+    return repr(text)
 
 
 def _log_tool_outcome(tool_name: str, start_monotonic: float, outcome: str) -> None:
@@ -167,11 +186,11 @@ def sanitize_exceptions(engine: str) -> Callable[[Callable[P, T]], Callable[P, T
             except SanitizedEngineError:
                 raise
             except Exception as exc:  # noqa: BLE001 - intentionally catching all exceptions to sanitize
-                safe_message = redact_secrets(str(exc))
+                presented = present_remote_text(redact_secrets(str(exc)))
                 logger.warning(
-                    "engine=%s warehouse_client_call_failed message=%s", engine, safe_message
+                    "engine=%s warehouse_client_call_failed message=%s", engine, presented
                 )
-                raise SanitizedEngineError(f"{engine} client call failed: {safe_message}") from None
+                raise SanitizedEngineError(f"{engine} client call failed: {presented}") from None
 
         return wrapper
 

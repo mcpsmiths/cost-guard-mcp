@@ -6,6 +6,16 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+### Security
+
+- **Log records and `SanitizedEngineError` text can no longer be forged by control characters.**
+  `sanitize_exceptions` now `repr()`-quotes the (already secret-redacted) exception text
+  before logging it or raising it, so a newline, carriage return, ESC or NUL in a
+  model-supplied `warehouse_size`/`edition` or in warehouse-returned error text is escaped
+  as `\xNN` instead of starting a new, prefix-free stderr line that reads as a genuine
+  `tool=... outcome=...` or `run_query_bounded refused ...` record. The three pricing
+  `ValueError`s echo the offending argument with `!r` for the same reason.
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not
