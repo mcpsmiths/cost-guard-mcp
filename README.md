@@ -57,6 +57,11 @@ Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no def
   user-level policy (say 30 s) is therefore never raised; note that a session-level value
   would otherwise override account/user levels in Snowflake's parameter hierarchy (only the
   warehouse level combines lowest-wins).
+- Snowflake sessions are also pinned to one statement per call: `EXPLAIN USING JSON` and the
+  `run_query_bounded` execution are submitted with `num_statements=1` and the session logs in
+  with `MULTI_STATEMENT_COUNT=1`, so Snowflake itself rejects `;`-separated text that the
+  server-side scanner (see Known limitations) did not already refuse. There is no opt-out;
+  multi-statement Snowflake text was never supported.
 
 ### Databricks
 Set `DATABRICKS_SERVER_HOSTNAME` and `DATABRICKS_HTTP_PATH` (from the SQL warehouse's

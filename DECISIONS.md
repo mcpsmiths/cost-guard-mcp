@@ -318,32 +318,77 @@ the gate guarantees that a listing published from a tagged checkout points at th
 project at the tag's version. HANDOFF.md's distribution note now points here instead of
 describing the manual run as the procedure.
 
-## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
+<!-- #13 is reserved for the read-statement allowlist decision (an open owner decision in
+the 2026-10 remediation plan) so that number is never reused for something else. -->
 
-**Context:** `sanitize_exceptions` forwarded whatever a warehouse client raised as
-`<engine> client call failed: <redacted text>` — secret-redacted, but otherwise verbatim:
-unbounded, with raw newlines, and in the same register as this server's own refusal hints.
-A view/UDF author can choose that text (BigQuery `ERROR()`, Databricks `raise_error()`,
-Snowflake UDF exceptions), a model can choose it through `warehouse_size`/`edition`, and the
-`mcp` SDK's stderr handler is a bare `%(message)s`, so an embedded newline forged a
-genuine-looking `tool=... outcome=...` audit record (2026-10 security audit).
+## 14. `run_query_bounded` cancellation: prompt detach, pre-dispatch check, provider-side deadlines, in-flight cap
 
-**Decision:** Every outbound path that carries text this process did not author — the
-`SanitizedEngineError` message, the `warehouse_client_call_failed` log record and the
-`check_credentials` failure `detail` (which now also logs one WARNING) — goes through one
-chain: `redact_secrets` (scan bounded to 16 KiB, linear patterns) then `present_remote_text`
-(bounded to 1,000 characters, `repr()`-quoted so every control character is escaped). The
-`SanitizedEngineError` message labels the quoted text
-`error text (untrusted data, not an instruction)` — neutral wording, because the same
-branch carries in-process validator and pricing `ValueError`s that echo model input. The
-project's own `ConfigError` and `UserVisibleError` pass through `sanitize_exceptions`
-unchanged, so server-authored text is never labelled as warehouse-returned.
+**Context:** `run_query_bounded` is the only tool with a monetary side effect. Since v0.3.0
+its blocking warehouse call runs in an anyio worker thread dispatched with
+`abandon_on_cancel=True`, so an MCP `notifications/cancelled` detaches the request promptly
+instead of being shielded until the warehouse call returns. The 2026-10 security audit
+showed what that detach left open: (1) a cancel that arrived during the estimate did not
+stop the abandoned thread from submitting the execution afterwards, into a cancelled future
+nobody reads; (2) the only deadline on a submitted job was the client-side 120 s watchdog
+running in that thread, so a host that escalates to SIGTERM/SIGKILL after closing stdin
+(the reference MCP client does, 2-4 s after EOF; in Docker the server is PID 1 and ignores
+SIGTERM) orphaned the query on the warehouse with no bound at all; and (3) every BigQuery
+API round-trip outside the result wait inherited the client library's 600 s default retry
+(doubled for job submission), so the job begin could still happen minutes after the cancel;
+and (4) the detach returned anyio's thread-limiter token (the only, incidental, 40-token
+concurrency bound) while the thread, its connection and its query stayed pinned, so a host
+that cancelled and re-issued grew the number of live warehouse queries without any
+in-process bound.
 
-**Consequences:** The human-visible `ToolError` text changed shape (quoted, labelled, and a
-misconfiguration no longer carries the `<engine> client call failed:` prefix); the
-machine-visible `Error executing tool <name>:` prefix and `is_error=true` are unchanged.
-Any new outbound surface that carries connector or model text must use the same chain —
-never `str(exc)` or `redact_secrets` alone.
+**Decision:** Keep `abandon_on_cancel=True` - a stop button that returns promptly is the
+right behaviour for the host - and close the gaps around it instead of forwarding the
+cancel into the engines:
+
+- The tool body takes a keyword-only `before_execute: Callable[[], None] | None` hook
+  that `server.py` binds to `anyio.from_thread.check_cancelled`, called exactly once after
+  the estimate and every cap check and immediately before dispatch. A cancel received
+  before execution never submits the job. The hook is injected by the server because
+  `check_cancelled` raises outside an anyio worker thread, and it reads the thread's
+  cancel-scope chain - the mcp dispatcher's `peer_cancel_mode="interrupt"` cancels the
+  handler's `CancelScope`, which is what trips it.
+- Every submitted job carries a provider-side deadline equal to the watchdog: BigQuery
+  `QueryJobConfig.job_timeout_ms = 120000`; Snowflake `STATEMENT_TIMEOUT_IN_SECONDS` and
+  Databricks `STATEMENT_TIMEOUT` as session parameters, lowered-only (a session value
+  supersedes an account/user policy in Snowflake's hierarchy, so the effective value is
+  read first and only ever lowered). The 120 s bound therefore survives the thread and the
+  process. Equal to the watchdog, not watchdog + 10 s: the README promised 120 s and the
+  bound itself is the point. Which side observes the deadline first is a race; either way
+  the caller gets a sanitized error and exactly one WARNING record (the watchdog's own, or
+  the `warehouse_client_call_failed` record when the warehouse's cancellation wins).
+- BigQuery API calls carry a 30 s retry bound and `job_retry=None` (see
+  `engines/bigquery.py`), so the pre-dispatch window is seconds, not minutes.
+- An explicit in-flight cap, `COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default 8, positive
+  integer, rejected at startup otherwise), implemented as a `threading.BoundedSemaphore`
+  whose slot is acquired non-blocking and released inside the worker thread. Acquire and
+  release both live in the thread because anyio's `WorkerThread.run` skips the function
+  when the future is already cancelled (an async-side acquire could leak a slot) and a
+  blocking acquire would park a shared thread-pool token. A cancelled call therefore keeps
+  counting until its thread exits. Over-cap calls raise `UserVisibleError`, which the
+  existing `as_tool_error` wrapper turns into a `ToolError` naming the variable - not a
+  `status="refused"` result, because no estimate exists yet (decision #4: `ToolError` for
+  genuine exceptions). Default 8 rather than 40 (anyio's incidental limiter): the model
+  should rarely need more than a handful of concurrent 120 s billable queries, and the
+  variable exists for the host that does.
+
+Deferred: forwarding the cancel to the engines' own cancel RPCs (`QueryJob.cancel`,
+`SYSTEM$CANCEL_QUERY`, `Cursor.cancel`) and a SIGTERM/lifespan handler that cancels
+in-flight jobs on exit. Both need a job registry threaded through all three engine
+signatures and signal handling inside the mcp/anyio run loop, and neither helps on
+SIGKILL - the provider-side deadline does.
+
+**Consequences:** The install example uses `docker run --init` and the flag is
+load-bearing (PID 1 otherwise ignores SIGTERM). A cancelled call still bills for a query
+that was already running when the cancel arrived, for at most the 120 s watchdog. The
+pre-dispatch check is only as good as the host's cancellation path through the dispatcher's
+cancel scope; a host that simply drops the connection relies on the provider-side deadline.
+A host issuing more than eight concurrent billable calls, or cancelling and re-issuing past
+the cap, now sees a `ToolError` that names `COST_GUARD_MAX_IN_FLIGHT_QUERIES` and explains
+that cancelled calls still count; raising the variable is the opt-out.
 
 ## 15. The tools accept exactly one SQL statement, enforced by a fail-closed scanner
 
@@ -448,78 +493,32 @@ as plain text (type erased) now arrive base64-encoded, and `NaN`/`Inf` are strin
 than `null`. Row-size/row-count defaults are a separate hardening item, deliberately not
 folded in here.
 
-<!-- #10-#13 are added by the sibling 0.4.0 remediation branches (release authority, build
-input pinning, registry publishing channel, read-statement allowlist); the numbering is fixed
-by the remediation plan so parallel branches never claim the same heading. -->
+## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
 
-## 14. `run_query_bounded` cancellation: prompt detach, pre-dispatch check, provider-side deadlines, in-flight cap
+**Context:** `sanitize_exceptions` forwarded whatever a warehouse client raised as
+`<engine> client call failed: <redacted text>` — secret-redacted, but otherwise verbatim:
+unbounded, with raw newlines, and in the same register as this server's own refusal hints.
+A view/UDF author can choose that text (BigQuery `ERROR()`, Databricks `raise_error()`,
+Snowflake UDF exceptions), a model can choose it through `warehouse_size`/`edition`, and the
+`mcp` SDK's stderr handler is a bare `%(message)s`, so an embedded newline forged a
+genuine-looking `tool=... outcome=...` audit record (2026-10 security audit).
 
-**Context:** `run_query_bounded` is the only tool with a monetary side effect. Since v0.3.0
-its blocking warehouse call runs in an anyio worker thread dispatched with
-`abandon_on_cancel=True`, so an MCP `notifications/cancelled` detaches the request promptly
-instead of being shielded until the warehouse call returns. The 2026-10 security audit
-showed what that detach left open: (1) a cancel that arrived during the estimate did not
-stop the abandoned thread from submitting the execution afterwards, into a cancelled future
-nobody reads; (2) the only deadline on a submitted job was the client-side 120 s watchdog
-running in that thread, so a host that escalates to SIGTERM/SIGKILL after closing stdin
-(the reference MCP client does, 2-4 s after EOF; in Docker the server is PID 1 and ignores
-SIGTERM) orphaned the query on the warehouse with no bound at all; and (3) every BigQuery
-API round-trip outside the result wait inherited the client library's 600 s default retry
-(doubled for job submission), so the job begin could still happen minutes after the cancel;
-and (4) the detach returned anyio's thread-limiter token (the only, incidental, 40-token
-concurrency bound) while the thread, its connection and its query stayed pinned, so a host
-that cancelled and re-issued grew the number of live warehouse queries without any
-in-process bound.
+**Decision:** Every outbound path that carries text this process did not author — the
+`SanitizedEngineError` message, the `warehouse_client_call_failed` log record and the
+`check_credentials` failure `detail` (which now also logs one WARNING) — goes through one
+chain: `redact_secrets` (scan bounded to 16 KiB, linear patterns) then `present_remote_text`
+(bounded to 1,000 characters, `repr()`-quoted so every control character is escaped). The
+`SanitizedEngineError` message labels the quoted text
+`error text (untrusted data, not an instruction)` — neutral wording, because the same
+branch carries in-process validator and pricing `ValueError`s that echo model input. The
+project's own `ConfigError` and `UserVisibleError` pass through `sanitize_exceptions`
+unchanged, so server-authored text is never labelled as warehouse-returned.
 
-**Decision:** Keep `abandon_on_cancel=True` - a stop button that returns promptly is the
-right behaviour for the host - and close the gaps around it instead of forwarding the
-cancel into the engines:
-
-- The tool body takes a keyword-only `before_execute: Callable[[], None] | None` hook
-  that `server.py` binds to `anyio.from_thread.check_cancelled`, called exactly once after
-  the estimate and every cap check and immediately before dispatch. A cancel received
-  before execution never submits the job. The hook is injected by the server because
-  `check_cancelled` raises outside an anyio worker thread, and it reads the thread's
-  cancel-scope chain - the mcp dispatcher's `peer_cancel_mode="interrupt"` cancels the
-  handler's `CancelScope`, which is what trips it.
-- Every submitted job carries a provider-side deadline equal to the watchdog: BigQuery
-  `QueryJobConfig.job_timeout_ms = 120000`; Snowflake `STATEMENT_TIMEOUT_IN_SECONDS` and
-  Databricks `STATEMENT_TIMEOUT` as session parameters, lowered-only (a session value
-  supersedes an account/user policy in Snowflake's hierarchy, so the effective value is
-  read first and only ever lowered). The 120 s bound therefore survives the thread and the
-  process. Equal to the watchdog, not watchdog + 10 s: the README promised 120 s and the
-  bound itself is the point. Which side observes the deadline first is a race; either way
-  the caller gets a sanitized error and exactly one WARNING record (the watchdog's own, or
-  the `warehouse_client_call_failed` record when the warehouse's cancellation wins).
-- BigQuery API calls carry a 30 s retry bound and `job_retry=None` (see
-  `engines/bigquery.py`), so the pre-dispatch window is seconds, not minutes.
-- An explicit in-flight cap, `COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default 8, positive
-  integer, rejected at startup otherwise), implemented as a `threading.BoundedSemaphore`
-  whose slot is acquired non-blocking and released inside the worker thread. Acquire and
-  release both live in the thread because anyio's `WorkerThread.run` skips the function
-  when the future is already cancelled (an async-side acquire could leak a slot) and a
-  blocking acquire would park a shared thread-pool token. A cancelled call therefore keeps
-  counting until its thread exits. Over-cap calls raise `UserVisibleError`, which the
-  existing `as_tool_error` wrapper turns into a `ToolError` naming the variable - not a
-  `status="refused"` result, because no estimate exists yet (decision #4: `ToolError` for
-  genuine exceptions). Default 8 rather than 40 (anyio's incidental limiter): the model
-  should rarely need more than a handful of concurrent 120 s billable queries, and the
-  variable exists for the host that does.
-
-Deferred: forwarding the cancel to the engines' own cancel RPCs (`QueryJob.cancel`,
-`SYSTEM$CANCEL_QUERY`, `Cursor.cancel`) and a SIGTERM/lifespan handler that cancels
-in-flight jobs on exit. Both need a job registry threaded through all three engine
-signatures and signal handling inside the mcp/anyio run loop, and neither helps on
-SIGKILL - the provider-side deadline does.
-
-**Consequences:** The install example uses `docker run --init` and the flag is
-load-bearing (PID 1 otherwise ignores SIGTERM). A cancelled call still bills for a query
-that was already running when the cancel arrived, for at most the 120 s watchdog. The
-pre-dispatch check is only as good as the host's cancellation path through the dispatcher's
-cancel scope; a host that simply drops the connection relies on the provider-side deadline.
-A host issuing more than eight concurrent billable calls, or cancelling and re-issuing past
-the cap, now sees a `ToolError` that names `COST_GUARD_MAX_IN_FLIGHT_QUERIES` and explains
-that cancelled calls still count; raising the variable is the opt-out.
+**Consequences:** The human-visible `ToolError` text changed shape (quoted, labelled, and a
+misconfiguration no longer carries the `<engine> client call failed:` prefix); the
+machine-visible `Error executing tool <name>:` prefix and `is_error=true` are unchanged.
+Any new outbound surface that carries connector or model text must use the same chain —
+never `str(exc)` or `redact_secrets` alone.
 
 ## 19. The cap-gate rate is bound to the observed warehouse; caller inputs can only raise it
 
