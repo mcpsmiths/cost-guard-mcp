@@ -159,6 +159,51 @@ README's "Known limitations" - the `referencedRoutines` research question stays
 unresolved for exactly this reason). Any future addition to `integration.yml` needing
 broader access should get its own narrowly-scoped grant, not a widened role on this one.
 
+## 10. Release authority is bound to reviewed `main` history, not to whoever can push a tag
+
+**Context:** `release.yml` runs on any `refs/tags/v*` push, checks out the tag's commit, and
+its only pre-publish check compared the tag string with version fields read from that same
+checkout - a check the tag pusher authors. The `pypi` environment and `id-token: write` are
+declared in the same pusher-controlled file. The documented review gate (PR -> CI green ->
+squash-merge, branch protection on `main`) governs `main`, not the tag that releases: a
+`contents:write` principal other than the release maintainer (source shows
+pre-commit-ci[bot] and dependabot[bot] pushing branches) could tag an unmerged commit and
+publish unreviewed code to PyPI carrying repository-identity PEP 740/SLSA attestations,
+where floating `uvx cost-guard-mcp` installs pick it up. Whether such a principal exists,
+and whether a tag ruleset, environment protection or PyPI's publisher binding already closes
+the path, is hosted configuration - not visible in source. Found by the 2026-10 security
+audit.
+
+**Decision:** Release authority is bound in four places, three of them hosted:
+1. A tag ruleset on `refs/tags/v*` (Settings -> Rules -> Rulesets -> new tag ruleset,
+   pattern `v*`, restrict creations/updates/deletions, bypass list: Repository admin only).
+2. The `pypi` GitHub Environment admits deployments only from tag refs matching `v*`
+   ("Selected branches and tags"); required reviewers are added only if the write-principal
+   inventory finds a non-maintainer human or a third-party App with `contents:write`.
+3. PyPI's Trusted Publisher row for `cost-guard-mcp` names Environment `pypi` - a blank
+   environment would let a tag pusher delete `environment: pypi` from the workflow and
+   bypass 2.
+4. In-repo defence in depth: the build job checks out with `fetch-depth: 0` and refuses,
+   before building, any tag whose commit is not an ancestor of `origin/main`. It
+   dereferences `HEAD^{commit}` rather than `$GITHUB_SHA` because the release tags are
+   annotated and the runner may resolve the ref to the tag object, which `merge-base`
+   rejects. `tests/unit/test_release_metadata.py` pins the step's text and runs its script
+   against a fixture repository holding an annotated tag off `main`.
+
+`live-integration` (decision #9) deliberately stays unprotected: its triggers are
+`schedule` and `workflow_dispatch`, which run the default branch's own workflow under a
+write-access actor; `release.yml`'s trigger is a tag push by any write principal at any
+commit, which is why `pypi` needs the policy and `live-integration` does not.
+
+**Consequences:** A release requires the tagged commit to be merged history on `main` -
+which the PR gate already made true of every release to date, so no release procedure
+changes. Steps 1-3 are applied by the maintainer out of band (the owner steps in the audit's
+remediation plan, which inventory the write principals first and verify the PyPI publisher
+row); step 4 alone cannot be the control, because the pusher controls `release.yml` at the
+tagged commit, but it turns an unmerged tag into a loud, early failure and records the
+intent in source. Never push a test `v*` tag to try it - any such push starts the release
+workflow.
+
 ## 11. Build inputs are pinned by reviewed source: `hatchling==1.32.4` and uv 0.12.23
 
 **Context:** A security audit (2026-10) found that the two inputs which execute during every

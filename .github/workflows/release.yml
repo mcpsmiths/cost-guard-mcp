@@ -25,6 +25,24 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Full history: the ancestry check below needs origin/main's commits, not just
+          # the tag's own commit that the default shallow checkout provides.
+          fetch-depth: 0
+      # Defence in depth, not the authorization control: the tag pusher controls this
+      # file at the tagged commit, so what actually binds release authority is the tag
+      # ruleset, the `pypi` environment's tag-only deployment policy and PyPI's publisher
+      # binding to that environment - see DECISIONS.md #10. HEAD^{commit} rather than
+      # $GITHUB_SHA because the release tags are annotated and $GITHUB_SHA can be the tag
+      # object itself, which merge-base rejects.
+      - name: Verify tagged commit is on main
+        run: |
+          git fetch --no-tags origin main
+          TAGGED_COMMIT="$(git rev-parse 'HEAD^{commit}')"
+          if ! git merge-base --is-ancestor "$TAGGED_COMMIT" origin/main; then
+            echo "Tag $GITHUB_REF_NAME at $TAGGED_COMMIT is not an ancestor of origin/main - release tags must point at reviewed, merged history"
+            exit 1
+          fi
       - name: Verify tag matches pyproject.toml and server.json version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"

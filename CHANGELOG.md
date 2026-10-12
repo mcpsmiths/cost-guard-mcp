@@ -53,6 +53,10 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   uv build constraint recorded in `uv.lock`) and every CI `setup-uv` step pins uv 0.12.23,
   equal to the pre-commit `uv-lock` rev, so a new hatchling or uv release can no longer
   change the published, attested artifacts without a repository diff (DECISIONS.md #11).
+- **Security (release):** `release.yml` now checks out full history and refuses to build a
+  `v*` tag whose commit is not an ancestor of `origin/main`; the hosted controls that
+  actually bind release authority (tag ruleset, `pypi` environment tag-only deployment
+  policy, PyPI publisher bound to that environment) are recorded in DECISIONS.md #10.
 
 ## [0.3.3] - 2026-10-10
 
