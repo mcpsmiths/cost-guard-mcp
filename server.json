@@ -88,6 +88,12 @@
           "description": "Databricks: OAuth machine-to-machine service-principal client secret. Requires DATABRICKS_CLIENT_ID as well.",
           "isRequired": false,
           "isSecret": true
+        },
+        {
+          "name": "COST_GUARD_ALLOW_MULTI_STATEMENT_SQL",
+          "description": "Set to 1 to let estimate_query_cost/run_query_bounded accept text containing more than one SQL statement. Off by default: the cost cap is only known to cover the single statement the dry run/EXPLAIN priced.",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

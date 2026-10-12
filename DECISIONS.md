@@ -325,3 +325,34 @@ misconfiguration no longer carries the `<engine> client call failed:` prefix); t
 machine-visible `Error executing tool <name>:` prefix and `is_error=true` are unchanged.
 Any new outbound surface that carries connector or model text must use the same chain —
 never `str(exc)` or `redact_secrets` alone.
+
+## 10. The tools accept exactly one SQL statement, enforced by a fail-closed scanner
+
+**Context:** A security audit traced the cost-cap gate end to end: `run_query_bounded`
+prices the submitted text once (one dry run / one `EXPLAIN`), compares two numbers, and
+hands the identical text to the engine. Nothing pinned the statement count, so
+`SELECT 1; DELETE FROM big_t` would be gated by whatever subset of the script the provider's
+estimate happened to price and then execute in full. Whether each provider's dry run covers
+every child statement is a provider fact the audit could not settle offline; a tool-layer
+pin enforces the invariant regardless.
+
+**Decision:** `sql_scope.assert_single_statement(sql, engine)` runs first in both
+`estimate_query_cost` and `run_query_bounded`, before any estimate or execute call. It is a
+small scanner (no SQL-parser dependency: the text is model-controlled input and a parser's
+error path is its own attack surface) that models only the literal/comment forms each
+dialect is known to have, and refuses whenever two plausible readings could disagree about
+where a literal or comment ends - an identifier glued to a quote (a raw/bytes/hex prefix in
+some dialects), a backslash right before the closing delimiter of a raw/hex literal or
+quoted identifier, a `/*` inside a block comment, or any unterminated construct. A single
+trailing `;` stays allowed (the LIMIT wrappers already strip it). The refusal is a
+`UserVisibleError` -> `ToolError` (a client-side parse rejection, nothing to structure -
+consistent with decision #4). `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1`, read at call time,
+is the operator opt-out.
+
+**Consequences:** Multi-statement scripts (BigQuery `DECLARE ...; SELECT ...;`) are refused
+unless the operator opts out; a handful of legitimate single statements are refused as
+deliberate false positives in the safe direction (`THEN'x'` without whitespace,
+`DATE'2020-01-01'`, raw strings ending in an odd run of backslashes, nested block comments)
+and the hint says how to rewrite them. Every scanner mistake must stay in the refuse
+direction: a new dialect construct is added only once its quoting rules are certain, and an
+uncertain construct is refused, never guessed.

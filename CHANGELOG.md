@@ -66,6 +66,17 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   `credentials*.json` - the credential files README tells operators to create at the
   project root.
 
+- **Changed (breaking, opt-out available):** `estimate_query_cost` and `run_query_bounded`
+  now accept exactly one SQL statement per call and refuse, before any dry run/EXPLAIN or
+  execution, text with a top-level `;` followed by more SQL (a single trailing `;` is still
+  fine). The new fail-closed scanner (`sql_scope.py`) also refuses shapes it cannot resolve
+  with certainty: unterminated literals/comments, an identifier glued to a quote, a backslash
+  right before the closing quote of a raw/hex literal or quoted identifier, and `/*` inside a
+  block comment. Set `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1` to restore the old behaviour.
+  The two tools' descriptions gained the one-statement sentence (a description-only
+  `tools/list` change; names, annotations and schemas are unchanged). Security audit
+  remediation; see DECISIONS.md #10.
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not

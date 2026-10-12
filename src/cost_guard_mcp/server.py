@@ -128,6 +128,8 @@ def estimate_query_cost(
     """Estimate the cost of a SQL query before running it. ALWAYS call this before running
     an expensive-looking query. The response's accuracy_tier tells you how much to trust
     the number: PRECISE (exact), UPPER_BOUND (real cap, may overstate), HEURISTIC (rough).
+    Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
+    more statements is refused before anything is estimated.
 
     warehouse_size (Snowflake/Databricks only, e.g. "SMALL", "X-Large") and edition
     (Snowflake only, e.g. "enterprise") default to the smallest/standard tier if omitted —
@@ -151,6 +153,8 @@ async def run_query_bounded(
     otherwise (check result.status — "refused" means it did NOT run and result.hint explains
     why). NOTE: unlike estimate_query_cost, a successful call here has a real monetary/quota
     side effect — don't call this repeatedly without inspecting the result of each call.
+    Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
+    more statements is refused before anything is estimated or run.
 
     warehouse_size/edition (see estimate_query_cost) default to the smallest/standard tier
     if omitted - set them to match the warehouse you actually run on, since max_estimated_cost_usd

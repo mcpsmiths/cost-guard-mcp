@@ -4,6 +4,7 @@ from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines import databricks as databricks_engine
 from cost_guard_mcp.engines import snowflake as snowflake_engine
 from cost_guard_mcp.errors import UserVisibleError
+from cost_guard_mcp.sql_scope import assert_single_statement
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
 
@@ -20,6 +21,12 @@ def run_query_bounded(
     warehouse_size: str | None = None,
     edition: str | None = None,
 ) -> BoundedQueryResult:
+    # The text priced below must be the text executed below, as exactly one statement:
+    # a second statement behind a top-level ';' would run under a cap that was never
+    # checked against it. Explicit here (estimate_query_cost checks too) so the pin holds
+    # even when the estimate is replaced or skipped.
+    assert_single_statement(sql, engine)
+
     # warehouse_size/edition must reach the cap-check estimate below, not just
     # estimate_query_cost's own public tool - otherwise the cost cap here would always be
     # checked against the smallest warehouse's rate regardless of which warehouse the

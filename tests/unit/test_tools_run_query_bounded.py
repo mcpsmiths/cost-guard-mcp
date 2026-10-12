@@ -138,3 +138,41 @@ def test_run_query_bounded_rejects_unsupported_engine(mock_estimate):
 
     with pytest.raises(UserVisibleError, match="is not yet supported"):
         run_query_bounded("redshift", "SELECT 1")
+
+
+_MULTI_STATEMENT_SQL = "SELECT 1; DELETE FROM big_t WHERE TRUE"
+
+
+@pytest.mark.parametrize("engine", ["bigquery", "snowflake", "databricks"])
+@patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.snowflake_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_refuses_multi_statement_text_before_any_estimate_or_execute(
+    mock_estimate, mock_bigquery, mock_snowflake, mock_databricks, engine
+):
+    # The cost cap prices the submitted text as ONE unit; a second statement riding behind
+    # a top-level ';' would execute under an estimate that never covered it. The pin must
+    # fire before the estimate (which itself costs a dry run / EXPLAIN) and before dispatch.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+
+    with pytest.raises(UserVisibleError, match="exactly one SQL statement"):
+        run_query_bounded(engine, _MULTI_STATEMENT_SQL, max_estimated_cost_usd=1.0)
+
+    mock_estimate.assert_not_called()
+    for engine_module in (mock_bigquery, mock_snowflake, mock_databricks):
+        engine_module.execute_bounded.assert_not_called()
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_single_statement_with_trailing_semicolon_still_runs(mock_estimate, mock_engine):
+    # Positive control for the pin: the existing LIMIT-wrapper contract strips one
+    # trailing ';', so that shape must keep flowing through to the engine.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_engine.execute_bounded.return_value = ([{"a": 1}], 1, False)
+
+    result = run_query_bounded("bigquery", "SELECT 1;", max_rows=5)
+
+    assert result.status == "ok"
+    mock_engine.execute_bounded.assert_called_once()

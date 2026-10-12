@@ -184,3 +184,31 @@ def test_call_tool_check_credentials_end_to_end(mock_bq_module):
 
     assert result.structured_content["engine"] == "bigquery"
     assert result.structured_content["ok"] is True
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_refuses_multi_statement_text_as_a_tool_error(
+    mock_bq_module, _mock_capacity
+):
+    # Through the SDK's own dispatch: the refusal reaches the client as a ToolError whose
+    # text names the one-statement contract, and the warehouse client is never touched.
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_bq_module.Client.return_value = mock_client
+
+    with pytest.raises(ToolError, match="exactly one SQL statement"):
+        _call_tool(
+            "run_query_bounded",
+            {"engine": "bigquery", "sql": "SELECT 1; DELETE FROM t WHERE TRUE"},
+        )
+
+    mock_client.query.assert_not_called()
+
+
+def test_estimate_and_run_tool_descriptions_state_the_one_statement_contract():
+    # The one-statement contract is part of the tools' public description (an intended,
+    # description-only tools/list change) so a model learns it before its first refusal.
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    for name in ("estimate_query_cost", "run_query_bounded"):
+        assert "exactly one SQL statement" in tools[name].description, name
