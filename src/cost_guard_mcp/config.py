@@ -29,7 +29,7 @@ class SnowflakeConfig:
     secondary_roles: str = "NONE"
     # Account edition (SNOWFLAKE_EDITION) sets the USD/credit price of every estimate. It is
     # operator configuration because the server cannot observe it without ORGADMIN; the
-    # per-call `edition` tool argument may only raise it (DECISIONS.md #15).
+    # per-call `edition` tool argument may only raise it (DECISIONS.md #19).
     edition: str = _DEFAULT_SNOWFLAKE_EDITION
 
 

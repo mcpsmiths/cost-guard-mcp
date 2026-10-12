@@ -194,7 +194,7 @@ the session value wins.
 
 - **Snowflake/Databricks cost estimates are priced at the observed warehouse, never below it**
   (security audit `cap-gate-rate-from-caller-asserted-warehouse-size-not-observed-warehouse`;
-  DECISIONS.md #15). The cap gate used to price at whatever `warehouse_size`/`edition` the
+  DECISIONS.md #19). The cap gate used to price at whatever `warehouse_size`/`edition` the
   caller supplied, defaulting to the cheapest tier, so an omitted size admitted a query costing
   up to 512x (Snowflake) / 174x (Databricks) the approved cap and labelled it `UPPER_BOUND`.
   Snowflake now reads the pinned warehouse's `SHOW WAREHOUSES` row directly (size/type/

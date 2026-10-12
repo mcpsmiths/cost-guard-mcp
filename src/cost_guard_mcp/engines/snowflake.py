@@ -361,7 +361,7 @@ def _lookup_warehouse_facts(
     size, type, generation and state from its SHOW WAREHOUSES row, plus the account's cloud
     provider from CURRENT_REGION() - used by explain_estimate() to bind the cap-gate rate to
     the warehouse that will actually execute instead of to the caller's warehouse_size string
-    (DECISIONS.md #15). Mirrors _lookup_historical_runtime's contract exactly: any failure at
+    (DECISIONS.md #19). Mirrors _lookup_historical_runtime's contract exactly: any failure at
     all - permission, network, malformed response shape, timeout, no resolvable warehouse -
     returns None, never raises; explain_estimate() then degrades to the caller-asserted/Gen1
     rate plus an explicit caveat.
@@ -453,7 +453,7 @@ def _rate_for(
     run_query_bounded refuses a dollar cap (DECISIONS.md #5: an unenforceable cap must never
     look enforced). A failed lookup (facts is None) keeps the caller-asserted/default size at
     the Gen1 rate with an explicit caveat, so roles that cannot run SHOW WAREHOUSES keep
-    working (DECISIONS.md #15).
+    working (DECISIONS.md #19).
     """
     if facts is None:
         caveat = (
@@ -576,7 +576,7 @@ def explain_estimate(
     SHOW WAREHOUSES (size/type/generation) - never below it: `warehouse_size` and `edition`
     can only raise the estimate. Warehouse types the rate table does not model, and a plan
     without a usable bytesAssigned, yield estimated_cost_usd=None so run_query_bounded fails
-    closed on a dollar cap (DECISIONS.md #5, #15).
+    closed on a dollar cap (DECISIONS.md #5, #19).
     """
     # Validate every caller-asserted input before connecting: an unknown warehouse name, size
     # or edition is a clear (sanitized) ValueError that never costs a connection or a lookup.

@@ -261,7 +261,7 @@ def _lookup_warehouse(config: DatabricksConfig) -> _WarehouseFacts | None:
     """Best-effort observation of the SQL warehouse DATABRICKS_HTTP_PATH binds to, through the
     already-depended-on databricks-sdk, used by explain_estimate() to bind the cap-gate rate to
     the warehouse that will actually execute instead of to the caller's warehouse_size string
-    (DECISIONS.md #15). Any failure - a non-warehouse http_path, a principal without
+    (DECISIONS.md #19). Any failure - a non-warehouse http_path, a principal without
     CAN_VIEW/CAN_USE on the warehouse, network, timeout - returns None (the sanitized reason is
     logged by @sanitize_exceptions) and explain_estimate keeps the caller-asserted rate with a
     caveat. Worst case is about 2 x _MAX_API_WAIT_SECONDS (host-metadata probe + GET); the
@@ -297,7 +297,7 @@ def _rate_for(
     rate table lacks; explain_estimate then returns estimated_cost_usd=None so run_query_bounded
     refuses a dollar cap (DECISIONS.md #5). A failed lookup (facts is None) keeps the
     caller-asserted/default size with an explicit caveat so principals without CAN_VIEW/CAN_USE
-    on the warehouse keep working (DECISIONS.md #15).
+    on the warehouse keep working (DECISIONS.md #19).
     """
     asserted_rate = dbus_per_hour(warehouse_size)
     if facts is None:
@@ -361,7 +361,7 @@ def explain_estimate(
     observed through the Warehouses API (cluster size, Serverless or not) - never below it:
     `warehouse_size` can only raise the estimate. Non-Serverless (Classic/Pro) warehouses and
     unrecognised sizes yield estimated_cost_usd=None so run_query_bounded fails closed on a
-    dollar cap (DECISIONS.md #5, #15).
+    dollar cap (DECISIONS.md #5, #19).
     """
     # Validate the caller-asserted size before any lookup or connection: an unknown size is a
     # clear (sanitized) ValueError that never costs an API call.

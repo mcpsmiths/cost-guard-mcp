@@ -521,7 +521,7 @@ A host issuing more than eight concurrent billable calls, or cancelling and re-i
 the cap, now sees a `ToolError` that names `COST_GUARD_MAX_IN_FLIGHT_QUERIES` and explains
 that cancelled calls still count; raising the variable is the opt-out.
 
-## 15. The cap-gate rate is bound to the observed warehouse; caller inputs can only raise it
+## 19. The cap-gate rate is bound to the observed warehouse; caller inputs can only raise it
 
 **Context:** A security audit (fingerprint
 `cap-gate-rate-from-caller-asserted-warehouse-size-not-observed-warehouse`) showed that

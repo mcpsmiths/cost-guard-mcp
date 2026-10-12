@@ -53,7 +53,7 @@ def test_run_query_bounded_refuses_on_impossible_byte_cap():
 
 
 def test_lookup_warehouse_facts_reads_the_live_show_warehouses_row_shape():
-    # Release gate for observed-warehouse pricing (DECISIONS.md #15): the SHOW WAREHOUSES
+    # Release gate for observed-warehouse pricing (DECISIONS.md #19): the SHOW WAREHOUSES
     # `size`/`type`/`generation` text must map onto the pricing table on a real account, and
     # CURRENT_WAREHOUSE() must resolve the session's warehouse when no argument is given.
     from cost_guard_mcp.engines.snowflake import _connect, _lookup_warehouse_facts
