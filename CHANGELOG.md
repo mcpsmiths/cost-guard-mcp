@@ -130,6 +130,22 @@ Release gate before 0.4.0: an owner live run confirming the workspace accepts
 `session_configuration` `STATEMENT_TIMEOUT` and recording whether the warehouse-level or
 the session value wins.
 
+### Changed
+
+- **Snowflake sessions now activate only `SNOWFLAKE_ROLE`** - secondary roles are pinned to
+  `NONE` in the login request (breaking for deployments that reached objects only through a
+  secondary role; set `SNOWFLAKE_SECONDARY_ROLES=ALL` to opt out, or - preferred - grant
+  those objects to `SNOWFLAKE_ROLE`). `ACCOUNTADMIN`, `SECURITYADMIN` and `ORGADMIN` are now
+  rejected as `SNOWFLAKE_ROLE` at startup. `check_credentials` reports the active
+  secondary-role set.
+
+### Security
+
+- Snowflake: the documented authorization boundary (`SNOWFLAKE_ROLE`) is now the enforced
+  one. Previously the session's authority was whatever the user's `DEFAULT_SECONDARY_ROLES`
+  made it (`('ALL')` by default), so model-written SQL could use every role granted to
+  `SNOWFLAKE_USER`. `SYSTEM$CANCEL_QUERY` now interpolates the canonical UUID text only.
+
 ## [0.3.3] - 2026-10-10
 
 Fixed: Snowflake private-key auth failed with "Password was given but private key is not

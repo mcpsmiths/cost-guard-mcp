@@ -37,7 +37,13 @@
         },
         {
           "name": "SNOWFLAKE_ROLE",
-          "description": "Snowflake: role to assume. Required to use the snowflake engine; has no default and must never be ACCOUNTADMIN.",
+          "description": "Snowflake: role to assume. Required to use the snowflake engine; has no default and must never be ACCOUNTADMIN (ACCOUNTADMIN, SECURITYADMIN and ORGADMIN are rejected at startup).",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SNOWFLAKE_SECONDARY_ROLES",
+          "description": "Snowflake: secondary roles activated at login. NONE (default) means only SNOWFLAKE_ROLE is active in the session; ALL is the explicit opt-out that activates every role granted to SNOWFLAKE_USER.",
           "isRequired": false,
           "isSecret": false
         },

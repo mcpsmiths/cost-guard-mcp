@@ -36,6 +36,19 @@ Set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key file path (or run 
 ### Snowflake
 Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no default, never `ACCOUNTADMIN`), and either `SNOWFLAKE_PRIVATE_KEY_PATH` (preferred) or `SNOWFLAKE_PASSWORD` (discouraged).
 
+- `SNOWFLAKE_ROLE` is the *only* authorization boundary for the SQL an agent sends through
+  this server, so it is enforced, not just documented: `ACCOUNTADMIN`, `SECURITYADMIN` and
+  `ORGADMIN` are rejected at startup (case-insensitively, quoted or not), and every session
+  activates **only** that role — secondary roles are pinned to `NONE` in the login request,
+  so a user whose Snowflake `DEFAULT_SECONDARY_ROLES` is `('ALL')` no longer lends every
+  other role it holds to model-written SQL. `SNOWFLAKE_USER` should ideally hold no role
+  other than `SNOWFLAKE_ROLE`.
+- `SNOWFLAKE_SECONDARY_ROLES` (optional, default `NONE`; the only other value is `ALL`) is
+  the opt-out for deployments that reached objects only through a secondary role. Prefer
+  granting those objects to `SNOWFLAKE_ROLE` instead; set `ALL` only if you accept that the
+  agent's SQL runs with every role the user holds. `check_credentials` reports the active
+  secondary-role set (`CURRENT_SECONDARY_ROLES()`) so you can confirm what is in force.
+
 ### Databricks
 Set `DATABRICKS_SERVER_HOSTNAME` and `DATABRICKS_HTTP_PATH` (from the SQL warehouse's
 Connection Details tab), and either `DATABRICKS_TOKEN` (a personal access token,
@@ -140,6 +153,7 @@ BIGQUERY_PROJECT = "your-project-id"
 SNOWFLAKE_ACCOUNT = "your-account"
 SNOWFLAKE_USER = "your-user"
 SNOWFLAKE_ROLE = "your-role"
+SNOWFLAKE_SECONDARY_ROLES = "NONE"
 SNOWFLAKE_PRIVATE_KEY_PATH = "/path/to/rsa_key.p8"
 DATABRICKS_SERVER_HOSTNAME = "your-workspace.cloud.databricks.com"
 DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/your-warehouse-id"

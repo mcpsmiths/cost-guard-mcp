@@ -33,6 +33,7 @@ def test_connect_uses_key_pair_when_private_key_path_set(mock_load_config, mock_
         private_key_path="/tmp/rsa_key.p8",
         private_key_passphrase="pw",
         password=None,
+        secondary_roles="NONE",
     )
 
     _connect()
@@ -46,6 +47,7 @@ def test_connect_uses_key_pair_when_private_key_path_set(mock_load_config, mock_
         private_key_file_pwd="pw",
         login_timeout=_LOGIN_TIMEOUT_SECONDS,
         network_timeout=_NETWORK_TIMEOUT_SECONDS,
+        secondary_roles="NONE",
     )
 
 
@@ -59,6 +61,7 @@ def test_connect_falls_back_to_password_when_no_key_pair(mock_load_config, mock_
         private_key_path=None,
         private_key_passphrase=None,
         password="hunter2",
+        secondary_roles="NONE",
     )
 
     _connect()
@@ -70,7 +73,31 @@ def test_connect_falls_back_to_password_when_no_key_pair(mock_load_config, mock_
         password="hunter2",
         login_timeout=_LOGIN_TIMEOUT_SECONDS,
         network_timeout=_NETWORK_TIMEOUT_SECONDS,
+        secondary_roles="NONE",
     )
+
+
+@patch("cost_guard_mcp.engines.snowflake.snowflake.connector.connect")
+@patch("cost_guard_mcp.engines.snowflake.load_snowflake_config")
+def test_connect_passes_secondary_roles_all_opt_out_through_unchanged(
+    mock_load_config, mock_connect
+):
+    # SNOWFLAKE_SECONDARY_ROLES=ALL is the documented opt-out for deployments that reached
+    # objects only through a secondary role; the engine must forward exactly what config
+    # validated, never re-derive or default it here.
+    mock_load_config.return_value = MagicMock(
+        account="abc123",
+        user="svc_user",
+        role="COST_GUARD_READER",
+        private_key_path="/tmp/rsa_key.p8",
+        private_key_passphrase=None,
+        password=None,
+        secondary_roles="ALL",
+    )
+
+    _connect()
+
+    assert mock_connect.call_args.kwargs["secondary_roles"] == "ALL"
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
@@ -673,7 +700,12 @@ def test_explain_estimate_uses_tiered_heuristic_when_no_historical_signal(
 @patch("cost_guard_mcp.engines.snowflake._connect")
 def test_check_credentials_ok_and_pins_warehouse_when_given(mock_connect):
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = ("COST_GUARD_READER", "COMPUTE_WH", "ABC12345")
+    mock_cursor.fetchone.return_value = (
+        "COST_GUARD_READER",
+        '{"roles":"","value":""}',
+        "COMPUTE_WH",
+        "ABC12345",
+    )
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -690,9 +722,40 @@ def test_check_credentials_ok_and_pins_warehouse_when_given(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_probes_and_reports_secondary_roles(mock_connect):
+    # Security audit snowflake-role-pin-does-not-bound-session-authority-secondary-roles-
+    # default-all: the operator's one in-tool identity check must show the effective
+    # authority (primary role AND the active secondary-role set), not CURRENT_ROLE() alone.
+    secondary = '{"roles":"","value":""}'
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = ("DUMMY_ROLE", secondary, "DUMMY_WH", "DUMMYACCT")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    result = check_credentials(warehouse=None)
+
+    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    assert len(executed_sql) == 1
+    assert "CURRENT_ROLE()" in executed_sql[0]
+    assert "CURRENT_SECONDARY_ROLES()" in executed_sql[0]
+    assert result.ok is True
+    assert "DUMMY_ROLE" in result.detail
+    assert "secondary roles" in result.detail
+    assert secondary in result.detail
+    assert "DUMMYACCT" in result.detail
+    assert "DUMMY_WH" in result.detail
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
 def test_check_credentials_skips_use_warehouse_when_none(mock_connect):
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = ("COST_GUARD_READER", None, "ABC12345")
+    mock_cursor.fetchone.return_value = (
+        "COST_GUARD_READER",
+        '{"roles":"","value":""}',
+        None,
+        "ABC12345",
+    )
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -759,7 +822,12 @@ def test_check_credentials_rejects_invalid_warehouse_name_as_failure_not_a_raise
 @patch("cost_guard_mcp.engines.snowflake._connect")
 def test_check_credentials_closes_connection_on_success(mock_connect):
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = ("COST_GUARD_READER", "COMPUTE_WH", "ABC12345")
+    mock_cursor.fetchone.return_value = (
+        "COST_GUARD_READER",
+        '{"roles":"","value":""}',
+        "COMPUTE_WH",
+        "ABC12345",
+    )
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_connect.return_value = mock_conn
@@ -857,6 +925,41 @@ def test_execute_bounded_cancels_and_raises_when_wait_times_out(mock_connect, mo
     executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
     assert any("SYSTEM$CANCEL_QUERY" in stmt for stmt in executed_sql)
     mock_conn.get_query_status_throw_if_error.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("raw_query_id", "canonical_query_id"),
+    [
+        ("{11111111-1111-1111-1111-111111111111}", "11111111-1111-1111-1111-111111111111"),
+        ("11111111-1111-1111-1111-11111111111A", "11111111-1111-1111-1111-11111111111a"),
+        (
+            "urn:uuid:11111111-1111-1111-1111-111111111111",
+            "11111111-1111-1111-1111-111111111111",
+        ),
+    ],
+)
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_cancel_interpolates_normalised_uuid_text(
+    mock_connect, _mock_sleep, raw_query_id, canonical_query_id
+):
+    # Plan-review amendment A17: uuid.UUID() accepts braces/urn/upper-case forms, so
+    # validating and then interpolating the RAW string still lets non-canonical text into
+    # the SYSTEM$CANCEL_QUERY literal. Interpolate str(uuid.UUID(...)) - canonical only.
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = raw_query_id
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = True  # never finishes
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="was cancelled"):
+        execute_bounded("SELECT * FROM huge_table", warehouse=None, max_rows=None)
+
+    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
+    cancel_statements = [stmt for stmt in executed_sql if "SYSTEM$CANCEL_QUERY" in stmt]
+    assert cancel_statements == [f"SELECT SYSTEM$CANCEL_QUERY('{canonical_query_id}')"]
+    assert raw_query_id not in cancel_statements[0] or raw_query_id == canonical_query_id
 
 
 @patch("cost_guard_mcp.engines.snowflake.time.sleep")

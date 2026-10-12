@@ -108,6 +108,25 @@ clear `ConfigError` if it's missing, rather than silently defaulting to any role
 **Consequences:** Slightly more setup friction for a new user, in exchange for making it
 structurally impossible to run this tool as an accidental `ACCOUNTADMIN`.
 
+Amended after the 2026-10 security audit, which found the role pin did not bound the
+session's authority: `role=` only sets Snowflake's *primary* role, and each statement is
+authorized against the primary role plus every *active* secondary role — which, for users
+created after behavior-change bundle 2024_07, defaults to `('ALL')` of the user's grants.
+So the documented boundary (the configured role) was not the enforced one. Three
+consequences now follow from this decision rather than from prose alone:
+
+- `load_snowflake_config()` rejects `ACCOUNTADMIN`, `SECURITYADMIN` and `ORGADMIN` (after
+  strip/unquote/upper-case normalisation) with a static `ConfigError` — "never
+  `ACCOUNTADMIN`" is a check, not a request.
+- Every session pins secondary roles to `NONE` in the login request itself (the
+  connector's `secondary_roles` parameter, present since 4.3.0), so the pin is in force
+  before `USE WAREHOUSE` or any model-supplied text, with no extra round trip.
+  `SNOWFLAKE_SECONDARY_ROLES=ALL` is the explicit, documented opt-out for deployments that
+  reached objects only via a secondary role (granting those objects to `SNOWFLAKE_ROLE` is
+  the preferred fix). `SNOWFLAKE_USER` should hold no role other than `SNOWFLAKE_ROLE`.
+- `check_credentials` reports `CURRENT_SECONDARY_ROLES()` next to `CURRENT_ROLE()`, so the
+  one in-tool identity check shows the authority actually in force.
+
 ## 8. PyPI releases publish via Trusted Publishing, not a stored API token
 
 **Context:** v0.1.0 published via a manually-run `uv publish` using a locally-stored PyPI

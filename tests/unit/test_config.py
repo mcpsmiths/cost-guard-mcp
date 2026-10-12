@@ -102,6 +102,94 @@ def test_snowflake_config_does_not_leak_secrets_in_repr():
     assert "READER" in config_repr
 
 
+def _set_minimal_snowflake_env(monkeypatch, role="COST_GUARD_READER"):
+    monkeypatch.setenv("SNOWFLAKE_ACCOUNT", "abc123")
+    monkeypatch.setenv("SNOWFLAKE_USER", "svc_user")
+    monkeypatch.setenv("SNOWFLAKE_ROLE", role)
+    monkeypatch.setenv("SNOWFLAKE_PRIVATE_KEY_PATH", "/tmp/rsa_key.p8")
+    monkeypatch.delenv("SNOWFLAKE_PASSWORD", raising=False)
+
+
+def test_load_snowflake_config_secondary_roles_default_to_none(monkeypatch):
+    # Security audit snowflake-role-pin-does-not-bound-session-authority-secondary-roles-
+    # default-all: without an explicit pin, Snowflake activates the user's
+    # DEFAULT_SECONDARY_ROLES (documented default ('ALL')), so SNOWFLAKE_ROLE alone never
+    # bounded what model-supplied SQL could touch. Unset must mean NONE, not "whatever the
+    # provider default is".
+    _set_minimal_snowflake_env(monkeypatch)
+    monkeypatch.delenv("SNOWFLAKE_SECONDARY_ROLES", raising=False)
+    config = load_snowflake_config()
+    assert config.secondary_roles == "NONE"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("all", "ALL"), ("none", "NONE"), (" ALL ", "ALL"), ("None", "NONE")],
+)
+def test_load_snowflake_config_secondary_roles_normalises_case_and_whitespace(
+    monkeypatch, raw, expected
+):
+    _set_minimal_snowflake_env(monkeypatch)
+    monkeypatch.setenv("SNOWFLAKE_SECONDARY_ROLES", raw)
+    assert load_snowflake_config().secondary_roles == expected
+
+
+def test_load_snowflake_config_secondary_roles_treats_empty_env_as_unset(monkeypatch):
+    # Same CI shape as the empty-passphrase regression above: a workflow env var referencing
+    # a missing value is "", not unset - and "" must fall to the secure default, never error.
+    _set_minimal_snowflake_env(monkeypatch)
+    monkeypatch.setenv("SNOWFLAKE_SECONDARY_ROLES", "")
+    assert load_snowflake_config().secondary_roles == "NONE"
+
+
+def test_load_snowflake_config_rejects_unknown_secondary_roles_value(monkeypatch):
+    # Snowflake's login-time SECONDARY_ROLES accepts only ALL or NONE; a role name here is a
+    # misconfiguration that must fail loudly, naming the variable and the two legal values.
+    _set_minimal_snowflake_env(monkeypatch)
+    monkeypatch.setenv("SNOWFLAKE_SECONDARY_ROLES", "SYSADMIN")
+    with pytest.raises(ConfigError, match="SNOWFLAKE_SECONDARY_ROLES") as excinfo:
+        load_snowflake_config()
+    assert "NONE" in str(excinfo.value)
+    assert "ALL" in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    "role",
+    [
+        "ACCOUNTADMIN",
+        " accountadmin ",
+        '"SECURITYADMIN"',
+        "securityadmin",
+        "ORGADMIN",
+        '"orgadmin"',
+    ],
+)
+def test_load_snowflake_config_rejects_account_wide_admin_roles(monkeypatch, role):
+    # DECISIONS.md #7 / README / server.json all promise "never ACCOUNTADMIN"; until now that
+    # was prose only. The comparison is normalised (strip, unquote, upper) so a quoted or
+    # lower-case env value cannot slip past it (plan-review amendment A17).
+    _set_minimal_snowflake_env(monkeypatch, role=role)
+    with pytest.raises(ConfigError, match="SNOWFLAKE_ROLE"):
+        load_snowflake_config()
+
+
+def test_load_snowflake_config_admin_role_error_text_is_static(monkeypatch):
+    # The rejection message must not echo the env value back (it is operator config, but the
+    # text reaches the MCP client via ToolError) - every rejected role gets identical text.
+    messages = set()
+    for role in ("ACCOUNTADMIN", '"orgadmin"', " SecurityAdmin "):
+        _set_minimal_snowflake_env(monkeypatch, role=role)
+        with pytest.raises(ConfigError) as excinfo:
+            load_snowflake_config()
+        messages.add(str(excinfo.value))
+    assert len(messages) == 1
+
+
+def test_load_snowflake_config_accepts_non_admin_role_unchanged(monkeypatch):
+    _set_minimal_snowflake_env(monkeypatch, role="SYSADMIN")
+    assert load_snowflake_config().role == "SYSADMIN"
+
+
 def test_load_databricks_config_requires_server_hostname(monkeypatch):
     monkeypatch.delenv("DATABRICKS_SERVER_HOSTNAME", raising=False)
     monkeypatch.setenv("DATABRICKS_HTTP_PATH", "/sql/1.0/warehouses/abc123")

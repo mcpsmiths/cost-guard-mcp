@@ -35,6 +35,17 @@ _NETWORK_TIMEOUT_SECONDS = 60
 
 @sanitize_exceptions("snowflake")
 def _connect() -> "snowflake.connector.SnowflakeConnection":
+    """Open a per-call connection whose session authority is exactly SNOWFLAKE_ROLE.
+
+    `role=` only sets the session's PRIMARY role; Snowflake authorizes each statement against
+    the primary role plus every ACTIVE secondary role, and the active set at login defaults to
+    the user's DEFAULT_SECONDARY_ROLES (('ALL') for users created after behavior-change
+    bundle 2024_07). `secondary_roles=` travels in the login request itself
+    (SECONDARY_ROLES=NONE unless the operator opted into ALL), so the pin is in force before
+    USE WAREHOUSE or any model-supplied text, with no extra round trip and no pre-pin
+    window. tests/unit/test_snowflake_dependency_contract.py guards the kwarg's existence
+    because the connector only WARNS on an unknown connect() kwarg (fail-open).
+    """
     config = load_snowflake_config()
 
     if config.private_key_path:
@@ -47,6 +58,7 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
             private_key_file_pwd=config.private_key_passphrase,
             login_timeout=_LOGIN_TIMEOUT_SECONDS,
             network_timeout=_NETWORK_TIMEOUT_SECONDS,
+            secondary_roles=config.secondary_roles,
         )
 
     return snowflake.connector.connect(
@@ -56,6 +68,7 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
         password=config.password,
         login_timeout=_LOGIN_TIMEOUT_SECONDS,
         network_timeout=_NETWORK_TIMEOUT_SECONDS,
+        secondary_roles=config.secondary_roles,
     )
 
 
@@ -345,11 +358,14 @@ def _cancel_query(conn: "snowflake.connector.SnowflakeConnection", query_id: str
     `query_id` is connector-generated (cur.sfqid), not caller input — but it still gets
     validated as a UUID before reaching raw SQL text, same defense-in-depth discipline as
     _validate_warehouse and _validate_project_id use for genuinely caller-supplied values.
+    The CANONICAL text (str(uuid.UUID(...))) is what gets interpolated, never the raw string:
+    uuid.UUID() also accepts braces, urn: prefixes and upper-case hex, so validating and then
+    interpolating the original would still let non-canonical text into the SQL literal.
     """
     try:
-        uuid.UUID(query_id)
+        canonical_query_id = str(uuid.UUID(query_id))
         with conn.cursor() as cur:
-            cur.execute(f"SELECT SYSTEM$CANCEL_QUERY('{query_id}')")
+            cur.execute(f"SELECT SYSTEM$CANCEL_QUERY('{canonical_query_id}')")
     except Exception:  # noqa: BLE001, S110
         pass
 
@@ -434,11 +450,17 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
         with conn.cursor() as cur:
             if warehouse is not None:
                 cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-            cur.execute("SELECT CURRENT_ROLE(), CURRENT_WAREHOUSE(), CURRENT_ACCOUNT()")
+            # CURRENT_SECONDARY_ROLES() is reported so the operator can SEE the effective
+            # authority of this session (primary role plus active secondary roles), not just
+            # the primary role the config asked for - see _connect().
+            cur.execute(
+                "SELECT CURRENT_ROLE(), CURRENT_SECONDARY_ROLES(), CURRENT_WAREHOUSE(), "
+                "CURRENT_ACCOUNT()"
+            )
             row = cur.fetchone()
             if row is None:
                 raise SanitizedEngineError("session context query returned no rows")
-            role, current_warehouse, account = row
+            role, secondary_roles, current_warehouse, account = row
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
         raw_detail = str(exc)
         safe_detail = present_remote_text(redact_secrets(raw_detail), total_chars=len(raw_detail))
@@ -457,7 +479,7 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
         engine="snowflake",
         ok=True,
         detail=(
-            f"Authenticated as role '{role}' on account '{account}', "
-            f"warehouse '{current_warehouse}'."
+            f"Authenticated as role '{role}' (secondary roles: {secondary_roles}) on "
+            f"account '{account}', warehouse '{current_warehouse}'."
         ),
     )

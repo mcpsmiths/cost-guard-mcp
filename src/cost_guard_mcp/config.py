@@ -19,6 +19,9 @@ class SnowflakeConfig:
     private_key_path: str | None
     private_key_passphrase: str | None = field(repr=False)
     password: str | None = field(repr=False)
+    # Login-time SECONDARY_ROLES pin: "NONE" (default) or "ALL" (explicit opt-out). See
+    # load_snowflake_config() and DECISIONS.md #7.
+    secondary_roles: str = "NONE"
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,41 @@ def load_bigquery_config() -> BigQueryConfig:
     return BigQueryConfig(google_application_credentials=creds)
 
 
+# Account-wide administrative roles that SNOWFLAKE_ROLE may never be set to. DECISIONS.md #7,
+# README and server.json have always promised "never ACCOUNTADMIN"; this makes the promise a
+# load-time check instead of prose. SECURITYADMIN and ORGADMIN carry the same class of
+# account-wide authority (grant management / organization administration) and are rejected
+# for the same reason. Compared after .strip().strip('"').upper() so a quoted or lower-case
+# env value cannot slip past (security audit, plan-review amendment A17).
+_REJECTED_SNOWFLAKE_ADMIN_ROLES = frozenset({"ACCOUNTADMIN", "SECURITYADMIN", "ORGADMIN"})
+
+# The only values Snowflake's login-time SECONDARY_ROLES accepts. "NONE" is the secure default:
+# without an explicit pin, Snowflake activates the user's DEFAULT_SECONDARY_ROLES - documented
+# as ('ALL') for users created after behavior-change bundle 2024_07 - so model-supplied SQL
+# would be authorized by EVERY role granted to SNOWFLAKE_USER, not by SNOWFLAKE_ROLE alone.
+_ALLOWED_SNOWFLAKE_SECONDARY_ROLES = frozenset({"NONE", "ALL"})
+
+
+def _normalize_snowflake_role_name(role: str) -> str:
+    return role.strip().strip('"').upper()
+
+
+def _load_snowflake_secondary_roles() -> str:
+    # An empty string (what CI / secret stores set for a missing value) is treated as unset,
+    # exactly like the empty-passphrase handling below - it falls to the secure default.
+    raw = os.environ.get("SNOWFLAKE_SECONDARY_ROLES", "").strip().upper()
+    if not raw:
+        return "NONE"
+    if raw not in _ALLOWED_SNOWFLAKE_SECONDARY_ROLES:
+        raise ConfigError(
+            "SNOWFLAKE_SECONDARY_ROLES must be either NONE (default: only SNOWFLAKE_ROLE is "
+            "active in the session) or ALL (opt-out: every role granted to SNOWFLAKE_USER is "
+            "active). Individual role names are not accepted here - grant the objects to "
+            "SNOWFLAKE_ROLE instead."
+        )
+    return raw
+
+
 def load_snowflake_config() -> SnowflakeConfig:
     account = os.environ.get("SNOWFLAKE_ACCOUNT")
     user = os.environ.get("SNOWFLAKE_USER")
@@ -56,6 +94,17 @@ def load_snowflake_config() -> SnowflakeConfig:
             "to any role (in particular, never ACCOUNTADMIN). Set it to a "
             "least-privilege role scoped to the objects you want cost-estimated."
         )
+    if _normalize_snowflake_role_name(role) in _REJECTED_SNOWFLAKE_ADMIN_ROLES:
+        # Static text on purpose: the value is operator config, but this message reaches
+        # the MCP client as a ToolError, so it never echoes the env value back.
+        raise ConfigError(
+            "SNOWFLAKE_ROLE must not be an account-wide administrative role (ACCOUNTADMIN, "
+            "SECURITYADMIN or ORGADMIN) - cost-guard-mcp runs model-supplied SQL under this "
+            "role. Set it to a least-privilege role scoped to the objects you want "
+            "cost-estimated."
+        )
+
+    secondary_roles = _load_snowflake_secondary_roles()
 
     private_key_path = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH")
     password = os.environ.get("SNOWFLAKE_PASSWORD")
@@ -79,6 +128,7 @@ def load_snowflake_config() -> SnowflakeConfig:
         # meaningfully different from no passphrase.
         private_key_passphrase=os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None,
         password=password,
+        secondary_roles=secondary_roles,
     )
 
 
