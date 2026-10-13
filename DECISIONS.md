@@ -117,7 +117,9 @@ consequences now follow from this decision rather than from prose alone:
 
 - `load_snowflake_config()` rejects `ACCOUNTADMIN`, `SECURITYADMIN` and `ORGADMIN` (after
   strip/unquote/upper-case normalisation) with a static `ConfigError` — "never
-  `ACCOUNTADMIN`" is a check, not a request.
+  `ACCOUNTADMIN`" is a check, not a request. The loader runs on the first Snowflake tool
+  call, not at process start, so the refusal is a failed `check_credentials` or a tool
+  error issued before any connection is opened — the process itself starts regardless.
 - Every session pins secondary roles to `NONE` in the login request itself (the
   connector's `secondary_roles` parameter, present since 4.3.0), so the pin is in force
   before `USE WAREHOUSE` or any model-supplied text, with no extra round trip.

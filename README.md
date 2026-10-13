@@ -37,12 +37,16 @@ Set `GOOGLE_APPLICATION_CREDENTIALS` to a service-account key file path (or run 
 Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no default, never `ACCOUNTADMIN`), and either `SNOWFLAKE_PRIVATE_KEY_PATH` (preferred) or `SNOWFLAKE_PASSWORD` (discouraged). Optionally set `SNOWFLAKE_EDITION` to the account's edition — `standard` (default), `enterprise`, `business_critical` or `vps` — which sets the USD/credit price of every estimate; the per-call `edition` argument can only raise it.
 
 - `SNOWFLAKE_ROLE` is the *only* authorization boundary for the SQL an agent sends through
-  this server, so it is enforced, not just documented: `ACCOUNTADMIN`, `SECURITYADMIN` and
-  `ORGADMIN` are rejected at startup (case-insensitively, quoted or not), and every session
-  activates **only** that role — secondary roles are pinned to `NONE` in the login request,
-  so a user whose Snowflake `DEFAULT_SECONDARY_ROLES` is `('ALL')` no longer lends every
-  other role it holds to model-written SQL. `SNOWFLAKE_USER` should ideally hold no role
-  other than `SNOWFLAKE_ROLE`.
+  this server, so it is enforced, not just documented. `ACCOUNTADMIN`, `SECURITYADMIN` and
+  `ORGADMIN` are rejected (case-insensitively, quoted or not) before any Snowflake
+  connection is opened: the check runs when the Snowflake configuration is first loaded,
+  which is on the first Snowflake tool call, so the server process itself starts regardless
+  of the value and a bad role surfaces as `check_credentials` returning `ok: false` (or as a
+  tool error from `estimate_query_cost`/`run_query_bounded`), not as a startup exit. Every
+  session also activates **only** that role — secondary roles are pinned to `NONE` in the
+  login request, so a user whose Snowflake `DEFAULT_SECONDARY_ROLES` is `('ALL')` no longer
+  lends every other role it holds to model-written SQL. `SNOWFLAKE_USER` should ideally hold
+  no role other than `SNOWFLAKE_ROLE`.
 - `SNOWFLAKE_SECONDARY_ROLES` (optional, default `NONE`; the only other value is `ALL`) is
   the opt-out for deployments that reached objects only through a secondary role. Prefer
   granting those objects to `SNOWFLAKE_ROLE` instead; set `ALL` only if you accept that the

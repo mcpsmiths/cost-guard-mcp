@@ -136,7 +136,10 @@ and the README. Design rationale: `DECISIONS.md` #10-#12 and #14-#19.
   `NONE` in the login request (breaking for deployments that reached objects only through a
   secondary role; set `SNOWFLAKE_SECONDARY_ROLES=ALL` to opt out, or - preferred - grant
   those objects to `SNOWFLAKE_ROLE`). `ACCOUNTADMIN`, `SECURITYADMIN` and `ORGADMIN` are now
-  rejected as `SNOWFLAKE_ROLE` at startup. `check_credentials` reports the active
+  rejected as `SNOWFLAKE_ROLE` before any Snowflake connection is opened - the check runs
+  when the Snowflake configuration is first loaded, on the first Snowflake tool call, so the
+  process starts regardless and a bad role surfaces as a failed `check_credentials` or a
+  tool error rather than a startup exit. `check_credentials` reports the active
   secondary-role set.
 - **Snowflake sessions now carry a provider-side statement deadline** -
   `STATEMENT_TIMEOUT_IN_SECONDS` is lowered to 60 s (read-only tools) or 120 s

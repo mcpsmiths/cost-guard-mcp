@@ -365,6 +365,14 @@ def _server_json() -> dict:
     return json.loads(SERVER_JSON_PATH.read_text(encoding="utf-8"))
 
 
+def _env_var_description(name: str) -> str:
+    return next(
+        entry["description"]
+        for entry in _server_json()["packages"][0]["environmentVariables"]
+        if entry["name"] == name
+    )
+
+
 def test_server_json_versions_match_pyproject():
     server_json = _server_json()
     project_version = _pyproject()["project"]["version"]
@@ -585,3 +593,22 @@ def test_gitignore_covers_the_host_layouts_and_key_names_the_readme_documents(tm
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("tracked\n", encoding="utf-8")
         assert not _is_ignored(rel, cwd=repo, env=env), f"{rel} must stay committable"
+
+
+# --- PR #86 runtime verification: documented claims the live server contradicted -----------
+
+
+def test_admin_role_rejection_is_not_documented_as_a_startup_check():
+    # The container and the console script were started with SNOWFLAKE_ROLE=ACCOUNTADMIN
+    # (evidence/docker-cli/13-docker-snowflake-role-admin.log): both served initialize and
+    # tools/list, and the refusal fired when load_snowflake_config() ran on the first
+    # Snowflake tool call (check_credentials -> ok:false, estimate/run -> ToolError), before
+    # any connection or DNS lookup. The security property holds; "rejected at startup" did
+    # not. The manifest and README must describe that timing, so an operator does not read
+    # a running process as proof the role passed the check.
+    role_description = _env_var_description("SNOWFLAKE_ROLE")
+    readme = README_PATH.read_text(encoding="utf-8")
+    assert "rejected at startup" not in role_description
+    assert "rejected at startup" not in readme
+    assert "first Snowflake tool call" in role_description
+    assert "first Snowflake tool call" in readme

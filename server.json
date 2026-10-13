@@ -37,7 +37,7 @@
         },
         {
           "name": "SNOWFLAKE_ROLE",
-          "description": "Snowflake: role to assume. Required to use the snowflake engine; has no default and must never be ACCOUNTADMIN (ACCOUNTADMIN, SECURITYADMIN and ORGADMIN are rejected at startup).",
+          "description": "Snowflake: role to assume. Required to use the snowflake engine; has no default and must never be ACCOUNTADMIN (ACCOUNTADMIN, SECURITYADMIN and ORGADMIN are rejected before any Snowflake connection is opened - the check runs when the Snowflake configuration is first loaded, on the first Snowflake tool call; the server process itself starts regardless, so a bad role surfaces as a failed check_credentials or a tool error, not as a startup exit).",
           "isRequired": false,
           "isSecret": false
         },
