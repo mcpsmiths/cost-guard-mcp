@@ -7,6 +7,7 @@ for Python's `logging` module when no handler is configured, and for `print(...,
 
 import functools
 import os
+import re
 import threading
 from collections.abc import Callable
 
@@ -68,16 +69,19 @@ _estimate_query_cost_safe = as_tool_error(_estimate_query_cost)
 # or not. Positive integer, default 8; a bad value fails at startup naming the variable.
 _MAX_IN_FLIGHT_QUERIES_ENV_VAR = "COST_GUARD_MAX_IN_FLIGHT_QUERIES"
 _DEFAULT_MAX_IN_FLIGHT_QUERIES = 8
+# A plain positive decimal integer, nothing else: int() would also accept a sign, a leading
+# zero, "_" separators and non-ASCII digits, so the value an operator meant and the value
+# the process ran with could differ (PR #86 runtime verification, container/CLI matrix).
+_POSITIVE_DECIMAL_INTEGER_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
 
 
 def _load_max_in_flight_queries() -> int:
     raw = os.environ.get(_MAX_IN_FLIGHT_QUERIES_ENV_VAR)
-    if not raw:  # unset or empty (what GitHub Actions passes for an unset secret) -> default
+    # Unset or blank (what GitHub Actions passes for an unset secret) -> default.
+    text = "" if raw is None else raw.strip()
+    if not text:
         return _DEFAULT_MAX_IN_FLIGHT_QUERIES
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
+    value = int(text) if _POSITIVE_DECIMAL_INTEGER_RE.fullmatch(text) else 0
     if value < 1:
         # Names only the variable - never echoes the rejected text into the error.
         raise ConfigError(

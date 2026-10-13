@@ -178,7 +178,9 @@ def test_default_in_flight_cap_is_eight_and_the_module_semaphore_is_bounded():
     assert isinstance(server._RUN_QUERY_BOUNDED_IN_FLIGHT, type(threading.BoundedSemaphore()))
 
 
-@pytest.mark.parametrize(("raw", "expected"), [(None, 8), ("", 8), ("3", 3), ("40", 40)])
+@pytest.mark.parametrize(
+    ("raw", "expected"), [(None, 8), ("", 8), ("  ", 8), ("3", 3), ("40", 40), (" 8 ", 8)]
+)
 def test_load_max_in_flight_queries_accepts_unset_and_positive_integers(monkeypatch, raw, expected):
     if raw is None:
         monkeypatch.delenv(_ENV_VAR, raising=False)
@@ -187,7 +189,12 @@ def test_load_max_in_flight_queries_accepts_unset_and_positive_integers(monkeypa
     assert server._load_max_in_flight_queries() == expected
 
 
-@pytest.mark.parametrize("raw", ["0", "-1", "abc", "3.5", "8 queries"])
+# Python int() tolerates a sign, a leading zero, "_" separators, hex-looking text and
+# non-ASCII digits; a cap is a plain positive decimal integer and nothing else
+# (PR #86 runtime verification, container/CLI matrix).
+@pytest.mark.parametrize(
+    "raw", ["0", "-1", "abc", "3.5", "8 queries", "+3", "08", "1_0", "0x10", "\u0663", "1 2"]
+)
 def test_load_max_in_flight_queries_rejects_non_positive_or_non_integer_values(monkeypatch, raw):
     monkeypatch.setenv(_ENV_VAR, raw)
     with pytest.raises(ConfigError, match=_ENV_VAR) as excinfo:
