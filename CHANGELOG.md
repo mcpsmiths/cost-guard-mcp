@@ -50,7 +50,10 @@ and the README. Design rationale: `DECISIONS.md` #10-#12 and #14-#19.
   channel itself is recorded as a proposed decision (DECISIONS.md #12).
 - **Hygiene:** `.gitignore` now excludes `*.p8`, `*.pem`, `*.key`, `.mcp.json` and
   `credentials*.json` - the credential files README tells operators to create at the
-  project root.
+  project root - plus the host configs README's tool table points real credentials at
+  (`.cursor/mcp.json`, `.vscode/mcp.json`), `*service-account*.json` and `.env.*`;
+  `.env.example` is re-included so a committed example with placeholder values is not
+  silently hidden by the `.env.*` rule.
 - Snowflake: the documented authorization boundary (`SNOWFLAKE_ROLE`) is now the enforced
   one. Previously the session's authority was whatever the user's `DEFAULT_SECONDARY_ROLES`
   made it (`('ALL')` by default), so model-written SQL could use every role granted to
@@ -61,6 +64,22 @@ and the README. Design rationale: `DECISIONS.md` #10-#12 and #14-#19.
   session parameter), so Snowflake itself rejects `;`-separated multi-statement text instead
   of deferring to the operator's account/user `MULTI_STATEMENT_COUNT`. No documented
   behaviour changes - multi-statement Snowflake text was never supported.
+- **Snowflake warehouse facts resolve by exact identifier, and ambiguity fails closed.** The
+  pinned warehouse's `SHOW WAREHOUSES` row is matched by its exact identifier, and a result
+  that still leaves more than one candidate (`COMPUTE_WH` next to a quoted `"compute_wh"`)
+  yields no dollar estimate - so a `max_estimated_cost_usd` cap refuses - instead of degrading
+  to the caller-asserted size, which let a query on a 6X-Large pass a $0.05 cap priced as
+  X-Small (PR #86 runtime verification, probe p45).
+- **Warehouse-returned text is bounded and `repr()`-quoted on the success paths too.**
+  Estimate caveats that echo the observed warehouse and the `check_credentials` success
+  `detail` (`CURRENT_ROLE()`, `CURRENT_WAREHOUSE()`, project id, `current_user()`) now go
+  through `present_remote_text` like failure text, so a control character or line separator
+  in a warehouse-chosen value reaches the model escaped and the quoting can no longer be
+  sliced away; connector-returned job/query ids in the watchdog's `cancelled job_id=` /
+  `cancelled query_id=` WARNING records and in error text are presented the same way, closing
+  the last prefix-free stderr line (probes p28, p5a-c, p5e).
+- Snowflake: admin role names in single quotes (`SNOWFLAKE_ROLE='ACCOUNTADMIN'`) are rejected
+  too - the normalisation that already stripped double quotes strips both.
 
 ### Added
 
@@ -178,6 +197,17 @@ and the README. Design rationale: `DECISIONS.md` #10-#12 and #14-#19.
   This is the no-regret part of audit records `read-only-tools-resume-suspended-warehouse`
   and `read-only-tools-auto-start-stopped-warehouse`; the warehouse-state guards remain open
   owner decisions. Description-only `tools/list` diff.
+- **Documentation corrections from the PR #86 runtime verification.** The admin-role
+  refusal (`ACCOUNTADMIN`/`SECURITYADMIN`/`ORGADMIN`) is described as running when the
+  Snowflake configuration is first loaded, on the first Snowflake tool call - the process
+  starts regardless - rather than "at startup" (README, `server.json`, this file,
+  DECISIONS.md #7); the `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1` opt-out now states that it
+  skips only this server's scanner, does not apply on Snowflake (`MULTI_STATEMENT_COUNT=1`
+  still rejects the text) and must be used without `max_rows` (README, `server.json`,
+  DECISIONS.md #15); and the README Observability section lists the `mcp` SDK's own
+  `Tool '<name>' failed:` / `rejected arguments:` stderr records, which this project's
+  one-line rule does not shape, and tells operators to key on the `tool=<name> outcome=`
+  records.
 
 ### Fixed
 
@@ -206,6 +236,25 @@ and the README. Design rationale: `DECISIONS.md` #10-#12 and #14-#19.
   re-checks for cancellation immediately before dispatch (`before_execute`, bound to
   `anyio.from_thread.check_cancelled`), and every BigQuery job carries
   `jobTimeoutMs=120000` so BigQuery enforces the same bound after the process is gone.
+- **`max_rows` wraps exactly the statement body.** The row-cap `LIMIT` wrapper only did
+  `rstrip(";")`, so SQL ending in a line comment, or in `;` followed by a comment, produced
+  `SELECT * FROM (SELECT 1 -- c) AS cost_guard_row_cap LIMIT n` and a provider syntax error
+  after the estimate had already run on the warehouse. The single-statement scanner now
+  reports where the statement proper ends and all three engines wrap exactly that text, with
+  the trailing `;` and trailing comments stripped dialect-aware (`#` is a comment on BigQuery
+  and plain text on Databricks) (PR #86 runtime verification, probes s02-s08).
+- `run_query_bounded` result-row strings containing a lone surrogate are escaped instead of
+  making the SDK's UTF-8 serialisation fail after the billed run, where the model saw only
+  `Error executing tool run_query_bounded` and the rows were lost (probe p11).
+- `warehouse_size` accepts Snowflake's own spellings (`X-Large`, `2X-Large`, ...) alongside
+  the `XLARGE`/`X2LARGE` keys, so a size copied from the Snowflake console no longer fails
+  validation.
+- `COST_GUARD_MAX_IN_FLIGHT_QUERIES` is parsed strictly: only a plain positive decimal
+  integer is accepted, not the sign, whitespace, `_`-separator or non-ASCII-digit spellings
+  Python's `int()` tolerates.
+- Databricks caveats no longer contradict a `None` estimate: a plan without size statistics
+  no longer says it was "priced at the caller-asserted ... size" or that the cost "assumes a
+  baseline 30-second runtime" next to `estimated_cost_usd: null`.
 
 ## [0.3.3] - 2026-10-10
 
