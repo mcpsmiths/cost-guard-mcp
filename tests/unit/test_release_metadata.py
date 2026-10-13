@@ -612,3 +612,24 @@ def test_admin_role_rejection_is_not_documented_as_a_startup_check():
     assert "rejected at startup" not in readme
     assert "first Snowflake tool call" in role_description
     assert "first Snowflake tool call" in readme
+
+
+def test_multi_statement_opt_out_documents_its_snowflake_and_max_rows_limits():
+    # Verifier T5 (evidence/T5/f2-i, f2-j) set COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1 and sent
+    # two statements to Snowflake: the per-call MULTI_STATEMENT_COUNT=1 pin still refused them
+    # ("Actual statement count 2 did not match the desired statement count 1."). Prober 1
+    # (evidence/probe-1/o01) combined the opt-out with max_rows on BigQuery and the whole
+    # script was wrapped in one LIMIT subquery - `SELECT * FROM (SELECT 1; DROP TABLE t) AS
+    # cost_guard_row_cap LIMIT 6` - which is not valid SQL. Wherever the opt-out is offered
+    # it must state both limits, or an operator enables it for a script that cannot run.
+    description = _env_var_description("COST_GUARD_ALLOW_MULTI_STATEMENT_SQL")
+    assert "Snowflake" in description
+    assert "max_rows" in description
+    readme = README_PATH.read_text(encoding="utf-8")
+    opt_out_entry = next(
+        line
+        for line in readme.splitlines()
+        if line.startswith("- ") and "COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1" in line
+    )
+    assert "MULTI_STATEMENT_COUNT=1" in opt_out_entry
+    assert "max_rows" in opt_out_entry

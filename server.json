@@ -103,7 +103,7 @@
         },
         {
           "name": "COST_GUARD_ALLOW_MULTI_STATEMENT_SQL",
-          "description": "Set to 1 to let estimate_query_cost/run_query_bounded accept text containing more than one SQL statement. Off by default: the cost cap is only known to cover the single statement the dry run/EXPLAIN priced.",
+          "description": "Set to 1 to let estimate_query_cost/run_query_bounded accept text containing more than one SQL statement. Off by default: the cost cap is only known to cover the single statement the dry run/EXPLAIN priced. Skips only this server's scanner: Snowflake still rejects multi-statement text (sessions are pinned to MULTI_STATEMENT_COUNT=1), and max_rows wraps the whole text in one LIMIT subquery, so use the opt-out without max_rows.",
           "isRequired": false,
           "isSecret": false
         },

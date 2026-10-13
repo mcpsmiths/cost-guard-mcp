@@ -416,7 +416,11 @@ consistent with decision #4). `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1`, read at 
 is the operator opt-out.
 
 **Consequences:** Multi-statement scripts (BigQuery `DECLARE ...; SELECT ...;`) are refused
-unless the operator opts out; a handful of legitimate single statements are refused as
+unless the operator opts out. The opt-out disables only this scanner: on Snowflake the
+per-call `MULTI_STATEMENT_COUNT=1` pin in `engines/snowflake.py` still rejects the text, and
+`max_rows` wraps the whole submitted text in one LIMIT subquery, so a script has to run
+without a row cap (both observed by the PR #86 runtime verification). A handful of
+legitimate single statements are refused as
 deliberate false positives in the safe direction (`THEN'x'` without whitespace,
 `DATE'2020-01-01'`, raw strings ending in an odd run of backslashes, nested block comments)
 and the hint says how to rewrite them. Every scanner mistake must stay in the refuse
