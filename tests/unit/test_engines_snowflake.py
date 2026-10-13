@@ -802,6 +802,51 @@ def test_lookup_warehouse_facts_returns_none_when_current_warehouse_fails_the_al
     assert not any(stmt.startswith("SHOW WAREHOUSES") for stmt in cursor.executed)
 
 
+def test_lookup_warehouse_facts_pins_the_current_warehouse_by_its_stored_name_verbatim(
+    snowflake_fakes,
+):
+    # PR #86 round-2 review of 885c055: _connect() passes no warehouse=, so with `warehouse`
+    # omitted the session runs on the user's DEFAULT_WAREHOUSE, and CURRENT_WAREHOUSE()
+    # returns that warehouse's STORED name - a quoted lower-case "compute_wh" included.
+    # Upper-casing it looked for a COMPUTE_WH that does not exist and refused every dollar
+    # cap for such a deployment although the warehouse WAS observed (fail-closed regression
+    # against the pre-885c055 code). Only a caller-supplied unquoted argument upper-cases.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("compute_wh", "6X-Large")],
+        current_warehouse="compute_wh",
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), None)
+
+    assert isinstance(facts, _WarehouseFacts)
+    assert facts.name == "compute_wh"
+    assert facts.size_key == "X6LARGE"
+    assert cursor.executed[1] == "SHOW WAREHOUSES LIKE 'compute_wh'"
+
+
+def test_lookup_warehouse_facts_never_binds_the_current_warehouse_to_an_upper_cased_sibling(
+    snowflake_fakes,
+):
+    # The p45 defect class in the omitted-warehouse path: the session is on the quoted
+    # "compute_wh" (6X-Large) and an upper-cased COMPUTE_WH (X-Small) sibling exists. The
+    # upper-cased pinned name bound to the sibling, so the query ran on the 6X-Large under a
+    # cap priced at X-Small. The row that binds is the one named exactly as CURRENT_WAREHOUSE()
+    # returned it.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[
+            snowflake_fakes.show_row("COMPUTE_WH", "X-Small"),
+            snowflake_fakes.show_row("compute_wh", "6X-Large"),
+        ],
+        current_warehouse="compute_wh",
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), None)
+
+    assert isinstance(facts, _WarehouseFacts)
+    assert facts.name == "compute_wh"
+    assert facts.size_key == "X6LARGE"
+
+
 def test_lookup_warehouse_facts_upper_cases_the_caller_argument_to_the_stored_name(
     snowflake_fakes,
 ):
@@ -1289,6 +1334,32 @@ def test_explain_estimate_prices_the_exact_row_when_a_quoted_lower_case_sibling_
     expected = round(512.0 * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6)
     assert estimate.estimated_cost_usd == expected
     assert any("understated" in c and "6X-Large" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_prices_the_session_warehouse_row_not_its_upper_cased_sibling(
+    snowflake_fakes,
+):
+    # End to end for the omitted-warehouse path (PR #86 round-2 review of 885c055): the
+    # session's default warehouse is the quoted "compute_wh" (6X-Large); an upper-cased
+    # COMPUTE_WH (X-Small) sibling exists. The estimate must be priced at the 6X-Large row the
+    # query runs on (512 credits/h), never at the sibling's X-Small rate.
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[
+            snowflake_fakes.show_row("COMPUTE_WH", "X-Small", generation="1"),
+            snowflake_fakes.show_row("compute_wh", "6X-Large", generation="1"),
+        ],
+        warehouse=None,
+        current_warehouse="compute_wh",
+    )
+
+    expected = round(512.0 * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6)
+    assert estimate.estimated_cost_usd == expected
+    assert not any("USE WAREHOUSE" in stmt for stmt in cursor.executed)
+    assert any(
+        "understated" in c and "compute_wh" in c and "6X-Large" in c for c in estimate.caveats
+    )
+    assert not any("could not be resolved" in c for c in estimate.caveats)
 
 
 def test_explain_estimate_fails_closed_when_no_row_names_the_pinned_warehouse(snowflake_fakes):

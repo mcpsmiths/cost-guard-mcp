@@ -302,8 +302,10 @@ class _WarehouseFacts:
 @dataclass(frozen=True)
 class _UnresolvedWarehouse:
     """SHOW WAREHOUSES answered, but its rows did not contain exactly one named `pinned_name`
-    (the upper-cased, allowlisted name the query is pinned to) - so the warehouse the query
-    will run on was not observed, and nothing else in the result may stand in for it.
+    - the allowlisted STORED name of the warehouse the query is pinned to: the upper-cased
+    caller argument, or CURRENT_WAREHOUSE() verbatim when the caller gave none - so the
+    warehouse the query will run on was not observed, and nothing else in the result may
+    stand in for it.
 
     Distinct from the None a failed lookup returns on purpose: None takes DECISIONS.md #19's
     fail-open-with-caveat path (roles that cannot run SHOW WAREHOUSES keep working at the
@@ -428,22 +430,28 @@ def _lookup_warehouse_facts(
     CURRENT_WAREHOUSE() first - it is what EXPLAIN just ran against and what execute_bounded
     will run against. The resolved name is interpolated into SHOW WAREHOUSES LIKE '<name>'
     exactly like a caller-supplied one, so it passes the same allowlist (DECISIONS.md #6).
+    It is NOT upper-cased: _connect() passes no warehouse=, so the session warehouse is the
+    user's DEFAULT_WAREHOUSE as stored, and CURRENT_WAREHOUSE() returns that stored name
+    verbatim - a quoted lower- or mixed-case identifier included.
 
     The row is read straight from the SHOW result via fetchall()/cursor.description - no
     RESULT_SCAN(LAST_QUERY_ID(-1)) SELECT (one statement fewer, same data). SHOW's LIKE is
     case-insensitive and treats '_' as a single-character wildcard, so the result can hold
     sibling warehouses: MYAWH for MY_WH, or a quoted lower-case "compute_wh" next to
-    COMPUTE_WH. Exactly one row may bind - the one whose name EQUALS the upper-cased pinned
-    name. USE WAREHOUSE on an unquoted identifier (the only kind _WAREHOUSE_NAME_RE admits)
-    resolves to the upper-cased stored name, so that row is the warehouse the query runs on,
-    and a differently-cased quoted sibling is a DIFFERENT warehouse, not another spelling of
-    the same one. When SHOW answered with rows but no single row carries that name the result
-    is an _UnresolvedWarehouse, never None, so _rate_for fails closed: PR #86 runtime
-    verification (probe-3 p45) drove the old case-insensitive match with COMPUTE_WH (6X-Large)
-    plus "compute_wh" (X-Small), got two matches -> None, and the 6X-Large query ran under a
-    cap priced at X-Small. `generation` is a real SHOW WAREHOUSES column (behavior-change
-    bundle 2025_07/bcr-2110, "currently either 1 or 2"); the `size`/`type` text shapes are
-    pinned by tests/integration/test_snowflake_live.py.
+    COMPUTE_WH. Exactly one row may bind - the one whose name EQUALS the pinned warehouse's
+    STORED name. For a caller-supplied argument that is the upper-cased argument: USE
+    WAREHOUSE on an unquoted identifier (the only kind _WAREHOUSE_NAME_RE admits) resolves to
+    the upper-cased stored name. For an omitted argument it is CURRENT_WAREHOUSE() verbatim,
+    which already IS the stored name - upper-casing it would bind a session on a quoted
+    "compute_wh" to a COMPUTE_WH sibling (the same mispricing in the other direction) or to
+    nothing. Either way a differently-cased sibling is a DIFFERENT warehouse, not another
+    spelling of the same one. When SHOW answered with rows but no single row carries that
+    name the result is an _UnresolvedWarehouse, never None, so _rate_for fails closed: PR #86
+    runtime verification (probe-3 p45) drove the old case-insensitive match with COMPUTE_WH
+    (6X-Large) plus "compute_wh" (X-Small), got two matches -> None, and the 6X-Large query
+    ran under a cap priced at X-Small. `generation` is a real SHOW WAREHOUSES column
+    (behavior-change bundle 2025_07/bcr-2110, "currently either 1 or 2"); the `size`/`type`
+    text shapes are pinned by tests/integration/test_snowflake_live.py.
 
     SHOW WAREHOUSES, CURRENT_WAREHOUSE() and CURRENT_REGION() are all ordinary, non-privileged
     SQL - no ACCOUNTADMIN or elevated grant is required (AGENTS.md / DECISIONS.md #7).
@@ -457,8 +465,13 @@ def _lookup_warehouse_facts(
                 current = cur.fetchone()
             if current is None or not isinstance(current[0], str):
                 return None
-            warehouse = current[0]
-        validated_warehouse = _validate_warehouse(warehouse)
+            # The stored name as Snowflake holds it (see the docstring): pin it verbatim.
+            validated_warehouse = _validate_warehouse(current[0])
+            pinned_name = validated_warehouse
+        else:
+            # An unquoted caller argument resolves to its upper-cased stored name.
+            validated_warehouse = _validate_warehouse(warehouse)
+            pinned_name = validated_warehouse.upper()
         with conn.cursor() as cur:
             cur.execute(
                 f"SHOW WAREHOUSES LIKE '{validated_warehouse}'",
@@ -474,7 +487,6 @@ def _lookup_warehouse_facts(
 
     if not rows:
         return None
-    pinned_name = validated_warehouse.upper()
     matching = [row for row in rows if row.get("name") == pinned_name]
     if len(matching) != 1:
         return _UnresolvedWarehouse(
@@ -537,8 +549,9 @@ def _rate_for(
         )
         return credits_per_hour(asserted_size_key), asserted_size_key, [caveat]
     if isinstance(facts, _UnresolvedWarehouse):
-        # pinned_name passed _WAREHOUSE_NAME_RE and is upper-cased, so it is safe to echo raw;
-        # the candidate names are warehouse-returned text and arrive already presented.
+        # pinned_name passed _WAREHOUSE_NAME_RE (it is the upper-cased caller argument, or
+        # CURRENT_WAREHOUSE() verbatim), so it is safe to echo raw; the candidate names are
+        # warehouse-returned text and arrive already presented.
         shown = ", ".join(facts.candidates_presented)
         hidden = facts.candidate_count - len(facts.candidates_presented)
         if hidden > 0:
@@ -546,9 +559,10 @@ def _rate_for(
         caveat = (
             f"Warehouse {facts.pinned_name} could not be resolved to exactly one SHOW WAREHOUSES "
             f"row: the {facts.candidate_count} row(s) returned ({shown}) do not contain exactly "
-            f"one named {facts.pinned_name} (unquoted identifiers are stored upper-cased, so a "
-            "differently-cased quoted warehouse is a different warehouse), and the pinned "
-            f"warehouse's size and type were not observed — {_FAIL_CLOSED_HINT}"
+            f"one named {facts.pinned_name} (the stored name - the upper-cased unquoted "
+            "argument, or CURRENT_WAREHOUSE() as returned - so a differently-cased warehouse "
+            f"is a different warehouse), and the pinned warehouse's size and type were not "
+            f"observed — {_FAIL_CLOSED_HINT}"
         )
         return None, asserted_size_key, [caveat]
     # facts.name is the pinned name - it passed _WAREHOUSE_NAME_RE and the exact-match rule in
