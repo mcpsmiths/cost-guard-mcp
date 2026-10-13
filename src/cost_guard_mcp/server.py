@@ -73,6 +73,9 @@ _DEFAULT_MAX_IN_FLIGHT_QUERIES = 8
 # zero, "_" separators and non-ASCII digits, so the value an operator meant and the value
 # the process ran with could differ (PR #86 runtime verification, container/CLI matrix).
 _POSITIVE_DECIMAL_INTEGER_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
+# Above this the cap is no cap: a 20-digit value started the server and ran every parallel
+# call (delta verification), which is never what an operator meant.
+_MAX_IN_FLIGHT_QUERIES_UPPER_BOUND = 1000
 
 
 def _load_max_in_flight_queries() -> int:
@@ -82,10 +85,11 @@ def _load_max_in_flight_queries() -> int:
     if not text:
         return _DEFAULT_MAX_IN_FLIGHT_QUERIES
     value = int(text) if _POSITIVE_DECIMAL_INTEGER_RE.fullmatch(text) else 0
-    if value < 1:
+    if not 1 <= value <= _MAX_IN_FLIGHT_QUERIES_UPPER_BOUND:
         # Names only the variable - never echoes the rejected text into the error.
         raise ConfigError(
-            f"{_MAX_IN_FLIGHT_QUERIES_ENV_VAR} must be a positive integer: the maximum number "
+            f"{_MAX_IN_FLIGHT_QUERIES_ENV_VAR} must be a positive integer no larger than "
+            f"{_MAX_IN_FLIGHT_QUERIES_UPPER_BOUND}: the maximum number "
             f"of run_query_bounded calls allowed in flight at once (default "
             f"{_DEFAULT_MAX_IN_FLIGHT_QUERIES})."
         )

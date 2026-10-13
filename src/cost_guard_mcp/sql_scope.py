@@ -313,7 +313,10 @@ def assert_single_statement(sql: str, engine: Engine) -> None:
         )
         return
     try:
-        _scan(sql, _DIALECTS.get(engine, _FALLBACK))
+        if _scan(sql, _DIALECTS.get(engine, _FALLBACK)) == 0:
+            # Comment-only, whitespace-only or lone-';' text is not a statement: nothing
+            # to price, and with max_rows an empty subquery would reach the provider.
+            raise _refuse("found no SQL statement (empty, whitespace or comments only)", 0)
     except UserVisibleError as exc:
         logger.info("engine=%s single_statement_check=refused detail=%s", engine, exc)
         raise

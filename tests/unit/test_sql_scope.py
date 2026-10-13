@@ -335,3 +335,12 @@ def test_single_statement_body_keeps_the_old_semicolon_strip_when_the_text_is_un
     monkeypatch.setenv(ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, "1")
     assert single_statement_body("SELECT 'x;", "bigquery") == "SELECT 'x"
     assert single_statement_body("SELECT 1; SELECT 2;", "bigquery") == "SELECT 1; SELECT 2"
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("sql", ["", "   ", "-- c\n", "/* c */", ";", "-- c\n;", "/* a */ ; -- b"])
+def test_refuses_text_with_no_sql_statement(sql, engine):
+    # PR #86 delta verification: comment-only, whitespace-only and lone-';' texts passed the
+    # gate, the estimate was dispatched on the raw text and, with max_rows, an empty subquery
+    # 'SELECT * FROM () AS cost_guard_row_cap LIMIT n' reached the provider.
+    _refuses(sql, engine, match="no SQL statement")

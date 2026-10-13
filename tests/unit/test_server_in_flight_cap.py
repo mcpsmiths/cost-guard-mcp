@@ -179,7 +179,8 @@ def test_default_in_flight_cap_is_eight_and_the_module_semaphore_is_bounded():
 
 
 @pytest.mark.parametrize(
-    ("raw", "expected"), [(None, 8), ("", 8), ("  ", 8), ("3", 3), ("40", 40), (" 8 ", 8)]
+    ("raw", "expected"),
+    [(None, 8), ("", 8), ("  ", 8), ("3", 3), ("40", 40), (" 8 ", 8), ("1000", 1000)],
 )
 def test_load_max_in_flight_queries_accepts_unset_and_positive_integers(monkeypatch, raw, expected):
     if raw is None:
@@ -193,11 +194,32 @@ def test_load_max_in_flight_queries_accepts_unset_and_positive_integers(monkeypa
 # non-ASCII digits; a cap is a plain positive decimal integer and nothing else
 # (PR #86 runtime verification, container/CLI matrix).
 @pytest.mark.parametrize(
-    "raw", ["0", "-1", "abc", "3.5", "8 queries", "+3", "08", "1_0", "0x10", "\u0663", "1 2"]
+    "raw",
+    [
+        "0",
+        "-1",
+        "abc",
+        "3.5",
+        "8 queries",
+        "+3",
+        "08",
+        "1_0",
+        "0x10",
+        "\u0663",
+        "1 2",
+        # No upper bound meant a 20-digit value silently disabled the cap (delta verification).
+        "1001",
+        "99999999999999999999",
+    ],
 )
 def test_load_max_in_flight_queries_rejects_non_positive_or_non_integer_values(monkeypatch, raw):
     monkeypatch.setenv(_ENV_VAR, raw)
     with pytest.raises(ConfigError, match=_ENV_VAR) as excinfo:
         server._load_max_in_flight_queries()
-    # Names the variable, never echoes the rejected value (no untrusted text in the error).
-    assert raw not in str(excinfo.value)
+    # Names the variable, never echoes the rejected value: the text is static, identical for
+    # every rejected spelling (a bare substring check trips on the bound's own digits).
+    monkeypatch.setenv(_ENV_VAR, "not-a-number")
+    with pytest.raises(ConfigError) as reference:
+        server._load_max_in_flight_queries()
+    assert str(excinfo.value) == str(reference.value)
+    assert len(raw) < 2 or raw not in str(excinfo.value)

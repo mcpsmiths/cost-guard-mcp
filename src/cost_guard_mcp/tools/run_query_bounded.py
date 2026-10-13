@@ -140,8 +140,10 @@ def run_query_bounded(
     # used to reach the provider as `LIMIT 0` / `LIMIT -1` and then be reported as a
     # row-cap refusal after the billed run; a byte cap outside int64 cannot be attached
     # to a BigQuery job and would surface as an opaque provider error instead.
-    if max_rows is not None and max_rows < 1:
-        raise UserVisibleError(f"max_rows must be at least 1 (got {max_rows}).")
+    if max_rows is not None and not 1 <= max_rows <= _INT64_MAX:
+        # The upper bound mirrors max_bytes_billed: a LIMIT literal above int64 is dispatched
+        # after the estimate ran and only fails at the provider (delta verification).
+        raise UserVisibleError(f"max_rows must be between 1 and {_INT64_MAX} (got {max_rows}).")
     if max_bytes_billed is not None and not 1 <= max_bytes_billed <= _INT64_MAX:
         raise UserVisibleError(
             f"max_bytes_billed must be between 1 and {_INT64_MAX} bytes (got {max_bytes_billed})."
