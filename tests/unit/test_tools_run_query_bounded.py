@@ -12,7 +12,7 @@ from pydantic_core import PydanticSerializationError
 
 from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
 from cost_guard_mcp.errors import UserVisibleError, as_tool_error
-from cost_guard_mcp.tools.run_query_bounded import _json_safe_rows, run_query_bounded
+from cost_guard_mcp.tools.run_query_bounded import _format_usd, _json_safe_rows, run_query_bounded
 from cost_guard_mcp.types import AccuracyTier, BoundedQueryResult, CostEstimate, RefusalReason
 
 _RUN_QUERY_BOUNDED_LOGGER_NAME = "cost_guard_mcp.tools.run_query_bounded"
@@ -687,3 +687,45 @@ def test_surrogate_row_text_reaches_the_caller_escaped_with_a_success_outcome(
     assert [r.message.split(" elapsed_ms=")[0] for r in records] == [
         "tool=run_query_bounded outcome=success"
     ]
+
+
+# --- runtime-verification follow-through (PR #86 adversarial probe-2 p01c/p06) ---------------
+# The refusal-hint formatter and the int64 byte-cap validation landed together; the formatter
+# had no direct test and the cap's accepted edge was asserted only by refusal of 2**63.
+
+
+@pytest.mark.parametrize(
+    ("amount", "expected"),
+    [
+        (1.0, "1.0000"),
+        (0, "0.0000"),
+        (0.00001, "1e-05"),
+        (-0.00001, "-1e-05"),
+        (1e300, "1e+300"),
+    ],
+    ids=["ordinary", "zero", "rounds_to_zero", "negative_rounds_to_zero", "huge"],
+)
+def test_format_usd_keeps_fixed_point_unless_it_would_hide_the_value(amount, expected):
+    # Fixed four decimals for the values they render faithfully (including a true zero);
+    # the shortest significant form only when `.4f` would show 0.0000 for a non-zero amount
+    # or a wall of digits for a huge one.
+    assert _format_usd(amount) == expected
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_byte_cap_int64_maximum_is_accepted_and_one_above_is_refused(mock_estimate, mock_execute):
+    # maximumBytesBilled is an int64 API field: its maximum must reach the engine unchanged,
+    # and the first value past it must be refused before any estimate, naming the parameter.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([], 0, False)
+
+    result = run_query_bounded("bigquery", "SELECT 1", max_bytes_billed=2**63 - 1)
+
+    assert result.status == "ok"
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] == 2**63 - 1
+
+    mock_estimate.reset_mock()
+    with pytest.raises(UserVisibleError, match="max_bytes_billed"):
+        run_query_bounded("bigquery", "SELECT 1", max_bytes_billed=2**63)
+    mock_estimate.assert_not_called()
