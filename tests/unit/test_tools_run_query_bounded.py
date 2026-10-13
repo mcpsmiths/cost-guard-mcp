@@ -584,3 +584,36 @@ def test_snowflake_cost_cap_still_admits_a_query_on_a_small_observed_warehouse(
     assert result.status == "ok"
     assert result.estimate.estimated_cost_usd < 0.10
     mock_execute.assert_called_once()
+
+
+# --- runtime-verification follow-ups (PR #86 adversarial probes P6/P13) --------------------
+
+
+@pytest.mark.parametrize("max_rows", [0, -1, -2])
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_rejects_max_rows_below_one_before_estimating_or_executing(mock_estimate, max_rows):
+    # max_rows=0/-1 used to dispatch `LIMIT 0` / `LIMIT -1` to the provider and then report
+    # a row-cap *refusal* after the billed execution, contradicting the tool description.
+    with pytest.raises(UserVisibleError, match="max_rows"):
+        run_query_bounded("bigquery", "SELECT 1", max_rows=max_rows)
+    mock_estimate.assert_not_called()
+
+
+@pytest.mark.parametrize("max_bytes_billed", [0, -1, 2**63, 2**70])
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_rejects_byte_caps_outside_the_int64_range_before_estimating(
+    mock_estimate, max_bytes_billed
+):
+    with pytest.raises(UserVisibleError, match="max_bytes_billed"):
+        run_query_bounded("bigquery", "SELECT 1", max_bytes_billed=max_bytes_billed)
+    mock_estimate.assert_not_called()
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_cost_cap_refusal_hint_shows_a_tiny_cap_exactly(mock_estimate):
+    # `.4f` rendered max_estimated_cost_usd=0.00001 as "$0.0000", hiding the real value.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    result = run_query_bounded("bigquery", "SELECT 1", max_estimated_cost_usd=0.00001)
+    assert result.status == "refused"
+    assert "1e-05" in result.hint
+    assert "$0.0000" not in result.hint

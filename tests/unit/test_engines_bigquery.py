@@ -17,7 +17,7 @@ from cost_guard_mcp.engines.bigquery import (
     is_capacity_billed,
 )
 from cost_guard_mcp.errors import SanitizedEngineError
-from cost_guard_mcp.pricing.bigquery_pricing import TIB_IN_BYTES
+from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
 from cost_guard_mcp.types import AccuracyTier
 
 
@@ -662,3 +662,56 @@ def test_execute_bounded_sets_job_timeout_ms_equal_to_the_watchdog_on_both_branc
     expected_ms = str(bigquery_engine._MAX_EXECUTION_WAIT_SECONDS * 1000)
     assert expected_ms == "120000"
     assert job_config.to_api_repr() == {"query": expected_query_fields, "jobTimeoutMs": expected_ms}
+
+
+# --- runtime-verification follow-ups (PR #86 adversarial probes P6/P9/P13) -----------------
+
+_INT64_MAX = 2**63 - 1
+
+
+@pytest.mark.parametrize("cap", [1e200, 1e300, 1e308])
+def test_cost_cap_to_max_bytes_billed_clamps_huge_finite_caps_to_int64(cap):
+    # maximumBytesBilled is an int64 on the BigQuery API. A finite cap large enough to
+    # overflow float->int (>= ~1e297) crashed with OverflowError, and caps between
+    # ~$5.24e7 and that produced 200-digit values the real API would reject with a 400.
+    # Both now clamp to int64 max, which BigQuery accepts and which is "no effective cap".
+    assert cost_cap_to_max_bytes_billed(cap) == _INT64_MAX
+
+
+def test_cost_cap_to_max_bytes_billed_never_exceeds_int64_at_the_boundary():
+    boundary_usd = _INT64_MAX / TIB_IN_BYTES * ON_DEMAND_USD_PER_TIB
+    assert cost_cap_to_max_bytes_billed(boundary_usd) <= _INT64_MAX
+    assert cost_cap_to_max_bytes_billed(boundary_usd * 0.5) < _INT64_MAX
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_cancel_round_trip_is_bounded_like_every_other_api_call(mock_bq_module):
+    # The 120 s watchdog's QueryJob.cancel() is a BigQuery API round-trip too; without an
+    # explicit retry/timeout it inherits the library's 600 s DEFAULT_RETRY and can pin the
+    # worker thread (and its in-flight slot) for ten more minutes while Google is unreachable.
+    mock_client = MagicMock()
+    mock_query_job = MagicMock()
+    mock_query_job.job_id = "job-789"
+    mock_query_job.result.side_effect = concurrent.futures.TimeoutError()
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    with pytest.raises(SanitizedEngineError, match="Query exceeded 120s and was cancelled"):
+        execute_bounded("SELECT * FROM huge_table", max_bytes_billed=None, max_rows=None)
+
+    from cost_guard_mcp.engines.bigquery import _API_RETRY, _MAX_API_WAIT_SECONDS
+
+    mock_query_job.cancel.assert_called_once_with(retry=_API_RETRY, timeout=_MAX_API_WAIT_SECONDS)
+
+
+def test_provider_byte_cap_exceeded_without_an_attached_cap_blames_the_project_default():
+    # Reachable when the project/org has a default maximumBytesBilled and this server
+    # attached none (no caps, or an infinite cost cap): the message must not claim a
+    # "limit of None bytes attached to the job".
+    message = str(ProviderByteCapExceeded(None))
+    assert "None" not in message
+    assert "outside this server" in message
+    assert "Nothing was billed" in message
+    attached = str(ProviderByteCapExceeded(10 * _MIB))
+    assert "10485760" in attached

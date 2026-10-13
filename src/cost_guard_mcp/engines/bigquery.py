@@ -184,6 +184,9 @@ _MIB = 1024**2
 # BigQuery bills every on-demand query a 10 MiB minimum (and 10 MiB per referenced table), so
 # a maximumBytesBilled below this would make every uncached query fail at the provider.
 _MIN_MAXIMUM_BYTES_BILLED = 10 * _MIB
+_INT64_MAX = 2**63 - 1  # maximumBytesBilled is an int64 (string-encoded) API field
+# The smallest dollar cap whose derived byte cap would reach the int64 ceiling.
+_INT64_MAX_USD_CAP = _INT64_MAX / TIB_IN_BYTES * ON_DEMAND_USD_PER_TIB
 # The errors[].reason BigQuery attaches when a job would bill more than its
 # maximumBytesBilled. Matched by reason, not exception class: the API path raises
 # BadRequest (400) while the pinned client maps a failed job with this reason to
@@ -200,9 +203,16 @@ def cost_cap_to_max_bytes_billed(max_estimated_cost_usd: float) -> int:
     admits => the provider admits" for single-table queries; without it a query estimated
     within a MiB of the cap would pass the gate and then be rejected by the provider.
     """
+    # maximumBytesBilled is an int64 on the API. Compare in float space BEFORE converting,
+    # so a huge finite cap neither overflows int() (>= ~1e297 USD raised OverflowError)
+    # nor produces a 200-digit value the API would reject with a 400: anything at or
+    # above the int64 ceiling is clamped to it, which BigQuery accepts and which simply
+    # means "no effective server-side cap" (the pre-flight gate still applies).
+    if max_estimated_cost_usd >= _INT64_MAX_USD_CAP:
+        return _INT64_MAX
     raw_bytes = int(max_estimated_cost_usd / ON_DEMAND_USD_PER_TIB * TIB_IN_BYTES)
     rounded_up_to_mib = -(-raw_bytes // _MIB) * _MIB
-    return max(rounded_up_to_mib, _MIN_MAXIMUM_BYTES_BILLED)
+    return min(max(rounded_up_to_mib, _MIN_MAXIMUM_BYTES_BILLED), _INT64_MAX)
 
 
 class ProviderByteCapExceeded(SanitizedEngineError):
@@ -212,11 +222,22 @@ class ProviderByteCapExceeded(SanitizedEngineError):
     it to a structured refusal instead of a ToolError."""
 
     def __init__(self, maximum_bytes_billed: int | None) -> None:
-        super().__init__(
-            "BigQuery refused to run this query because it would bill more than the "
-            f"server-side maximumBytesBilled limit of {maximum_bytes_billed} bytes attached "
-            "to the job. Nothing was billed."
-        )
+        if maximum_bytes_billed is None:
+            # Reachable when the project or organisation carries a default
+            # maximumBytesBilled and this server attached none (no caps, or an infinite
+            # cost cap): say so instead of asserting a cap "of None bytes".
+            message = (
+                "BigQuery refused to run this query because it would exceed a "
+                "maximumBytesBilled limit configured outside this server (cost-guard "
+                "attached no byte cap to the job). Nothing was billed."
+            )
+        else:
+            message = (
+                "BigQuery refused to run this query because it would bill more than the "
+                f"server-side maximumBytesBilled limit of {maximum_bytes_billed} bytes "
+                "attached to the job. Nothing was billed."
+            )
+        super().__init__(message)
         self.maximum_bytes_billed = maximum_bytes_billed
 
 
@@ -308,7 +329,10 @@ def execute_bounded(
         raise
     except concurrent.futures.TimeoutError:
         try:
-            query_job.cancel()
+            # A cancel is a BigQuery API round-trip too: bound it like every other call,
+            # or an unreachable Google pins this worker thread (and its in-flight slot)
+            # for the library's 600 s DEFAULT_RETRY deadline.
+            query_job.cancel(retry=_API_RETRY, timeout=_MAX_API_WAIT_SECONDS)
         except Exception:  # noqa: BLE001, S110 - best-effort cancel; the TimeoutError below is
             # the message that matters to the caller, a failed cancel must not mask it
             pass

@@ -9,13 +9,36 @@ from decimal import Decimal
 from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines import databricks as databricks_engine
 from cost_guard_mcp.engines import snowflake as snowflake_engine
-from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
+from cost_guard_mcp.engines.bigquery import (
+    _INT64_MAX,
+    ProviderByteCapExceeded,
+    cost_cap_to_max_bytes_billed,
+)
 from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.sql_scope import assert_single_statement
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
 
 logger = logging.getLogger(__name__)
+
+# Above this, fixed four-decimal dollars become a wall of digits; fall back to %g.
+_FIXED_POINT_USD_LIMIT = 1e12
+
+
+def _format_usd(amount: float) -> str:
+    """Render a dollar amount for a refusal hint without hiding its magnitude.
+
+    Fixed four decimals read naturally for ordinary caps ($1.00, $10.00) but rendered a
+    $0.00001 cap as "$0.0000", contradicting the refusal it explains, and would turn a
+    huge cap into a 300-digit string. Use the shortest significant form only when
+    fixed-point would lose the value.
+    """
+    fixed = f"{amount:.4f}"
+    is_rounded_to_zero = amount != 0 and float(fixed) == 0
+    if is_rounded_to_zero or abs(amount) >= _FIXED_POINT_USD_LIMIT:
+        return f"{amount:.6g}"
+    return fixed
+
 
 # Cell types pydantic serialises natively in JSON mode (Decimal -> str, datetime/date/time ->
 # ISO 8601, timedelta -> ISO 8601 duration, UUID -> str); passed through untouched.
@@ -84,6 +107,17 @@ def run_query_bounded(
     if max_estimated_cost_usd is not None and math.isnan(max_estimated_cost_usd):
         raise UserVisibleError("max_estimated_cost_usd must be a finite number, not NaN.")
 
+    # Validate the remaining bounds before any estimate or execution: max_rows below 1
+    # used to reach the provider as `LIMIT 0` / `LIMIT -1` and then be reported as a
+    # row-cap refusal after the billed run; a byte cap outside int64 cannot be attached
+    # to a BigQuery job and would surface as an opaque provider error instead.
+    if max_rows is not None and max_rows < 1:
+        raise UserVisibleError(f"max_rows must be at least 1 (got {max_rows}).")
+    if max_bytes_billed is not None and not 1 <= max_bytes_billed <= _INT64_MAX:
+        raise UserVisibleError(
+            f"max_bytes_billed must be between 1 and {_INT64_MAX} bytes (got {max_bytes_billed})."
+        )
+
     # warehouse_size/edition must reach the cap-check estimate below, not just
     # estimate_query_cost's own public tool - otherwise the cost cap here would always be
     # checked against the smallest warehouse's rate regardless of which warehouse the
@@ -122,8 +156,9 @@ def run_query_bounded(
                 reason=RefusalReason.COST_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
-                    f"Estimated cost ${estimate.estimated_cost_usd:.4f} exceeds "
-                    f"max_estimated_cost_usd=${max_estimated_cost_usd:.4f}. Narrow the query "
+                    f"Estimated cost ${_format_usd(estimate.estimated_cost_usd)} exceeds "
+                    f"max_estimated_cost_usd=${_format_usd(max_estimated_cost_usd)}. "
+                    "Narrow the query "
                     "or raise the bound."
                 ),
             )
@@ -229,8 +264,8 @@ def run_query_bounded(
             exc.maximum_bytes_billed,
         )
         cap_origin = (
-            f"derived from max_estimated_cost_usd=${max_estimated_cost_usd:.4f}"
-            if byte_cap_derived_from_cost_cap
+            f"derived from max_estimated_cost_usd=${_format_usd(max_estimated_cost_usd)}"
+            if byte_cap_derived_from_cost_cap and max_estimated_cost_usd is not None
             else f"your max_bytes_billed={max_bytes_billed}"
         )
         return BoundedQueryResult(
