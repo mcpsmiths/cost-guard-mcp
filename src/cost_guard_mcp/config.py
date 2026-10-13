@@ -70,12 +70,18 @@ _ALLOWED_SNOWFLAKE_SECONDARY_ROLES = frozenset({"NONE", "ALL"})
 
 
 def _normalize_snowflake_role_name(role: str) -> str:
-    """The comparison form of SNOWFLAKE_ROLE for the admin-role check: outer whitespace, then
-    either quoting style a shell or secret store can leave around the value (double OR single
-    quotes - PR #86 runtime verification T5 found "'ACCOUNTADMIN'" passing a normaliser that
-    stripped only double quotes and reaching connect(role=...)), then whitespace the quotes
-    may have enclosed, upper-cased. The value handed to the connector is the raw env string."""
-    return role.strip().strip("\"'").strip().upper()
+    """The comparison form of SNOWFLAKE_ROLE for the admin-role check: every layer of outer
+    whitespace and of either quoting style (double OR single quotes) a shell or secret store
+    can leave around the value is peeled until the text stops changing, then upper-cased. One
+    layer was not enough: PR #86 verification found "'ACCOUNTADMIN'" passing a double-quote-only
+    normaliser (T5) and the delta round found " 'ACCOUNTADMIN' " - whitespace between two
+    layers - passing the one-layer version (probe d04)."""
+    text = role
+    while True:
+        peeled = text.strip().strip("\"'")
+        if peeled == text:
+            return text.upper()
+        text = peeled
 
 
 def _load_snowflake_secondary_roles() -> str:

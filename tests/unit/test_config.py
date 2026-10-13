@@ -168,6 +168,11 @@ def test_load_snowflake_config_rejects_unknown_secondary_roles_value(monkeypatch
         "'ACCOUNTADMIN'",
         " 'orgadmin' ",
         "'\"SECURITYADMIN\"'",
+        # PR #86 delta verification (probe d04): whitespace BETWEEN two quote layers defeated
+        # a normaliser that peeled exactly one layer.
+        " 'ACCOUNTADMIN' ",
+        ' "ACCOUNTADMIN" ',
+        "  ' \"securityadmin\" '  ",
     ],
 )
 def test_load_snowflake_config_rejects_account_wide_admin_roles(monkeypatch, role):
