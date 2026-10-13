@@ -219,13 +219,16 @@ COST_GUARD_MAX_IN_FLIGHT_QUERIES = "8"
     warehouse-client exception message — the same `redact_secrets` + `present_remote_text`
     chain that produces what a tool caller sees is applied before anything is logged.
   - The `mcp` SDK writes its own records to the same stderr, and this project's one-line
-    rule does not shape them. Every tool error is followed by the SDK's
+    rule does not shape them. Every tool error this project raises is followed by the SDK's
     `Tool '<name>' failed: '<text>'` INFO record (the SDK `repr()`s the text, so it stays
     on one line, but it duplicates what the caller received); a call whose arguments
     pydantic rejects logs `Tool '<name>' rejected arguments: ['sql']` and nothing else — the
     tool body never ran, so there is no `tool=<name> outcome=` record for it — and the
     validation text that call returns to the caller (raw newlines, the offending input value
-    echoed verbatim) is the SDK's, not this project's bounded, quoted presentation.
+    echoed verbatim) is the SDK's, not this project's bounded, quoted presentation. An
+    exception this project did not convert into a tool error (`as_tool_error` converts only
+    its own `SanitizedEngineError`, `ConfigError` and `UserVisibleError`) is logged by the
+    SDK with its traceback instead.
     Operators parsing stderr should key on the `tool=<name> outcome=` records above and
     treat every other line as free text.
 

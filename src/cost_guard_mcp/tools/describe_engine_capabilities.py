@@ -46,7 +46,9 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "warehouse when no warehouse argument is given; warehouse_size and edition "
                 "(operator-configured via SNOWFLAKE_EDITION) can only raise the estimate, never "
                 "lower it. If that lookup fails (e.g. the role cannot run SHOW WAREHOUSES) the "
-                "estimate falls back to the caller-asserted size at Gen1 rates with a caveat."
+                "estimate falls back to the caller-asserted size at Gen1 rates with a caveat; "
+                "if SHOW WAREHOUSES lists rows but none named exactly like the pinned "
+                "warehouse, no dollar figure is produced and a dollar cap refuses."
             ),
             (
                 "Only STANDARD warehouses are priced: a Snowpark-optimized (or any other "

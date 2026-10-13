@@ -66,7 +66,8 @@ and the README. Design rationale: `DECISIONS.md` #10-#12 and #14-#19.
   behaviour changes - multi-statement Snowflake text was never supported.
 - **Snowflake warehouse facts resolve by exact identifier, and ambiguity fails closed.** The
   pinned warehouse's `SHOW WAREHOUSES` row is matched by its exact identifier, and a result
-  that still leaves more than one candidate (`COMPUTE_WH` next to a quoted `"compute_wh"`)
+  that lists rows but none named exactly like the pinned warehouse, or more than one
+  (`COMPUTE_WH` next to a quoted `"compute_wh"`),
   yields no dollar estimate - so a `max_estimated_cost_usd` cap refuses - instead of degrading
   to the caller-asserted size, which let a query on a 6X-Large pass a $0.05 cap priced as
   X-Small (PR #86 runtime verification, probe p45).

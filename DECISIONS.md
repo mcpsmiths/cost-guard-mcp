@@ -540,8 +540,11 @@ correctness to the model, the very principal the gate exists to constrain.
 
 **Decision:** The estimate is priced at the warehouse the query will execute on as the server
 observes it — Snowflake: the `SHOW WAREHOUSES` row (size/type/generation, read via
-`fetchall()`/`description`, matched by exact case-insensitive name because LIKE's `_` is a
-wildcard), resolving `CURRENT_WAREHOUSE()` when no warehouse argument is given; Databricks:
+`fetchall()`/`description`, matched by its exact identifier - the upper-cased caller argument,
+or the `CURRENT_WAREHOUSE()` name verbatim - because LIKE's `_` is a wildcard and a quoted
+lower-case sibling is a different warehouse; a result that lists rows but none named exactly
+like the pinned warehouse, or more than one, fails closed with no dollar estimate), resolving
+`CURRENT_WAREHOUSE()` when no warehouse argument is given; Databricks:
 `GET /api/2.0/sql/warehouses/{id}` for the `DATABRICKS_HTTP_PATH` warehouse, with `auth_type`
 pinned and 60 s bounds — at `max(caller-asserted, observed)`. Edition is operator configuration
 (`SNOWFLAKE_EDITION`, default `standard`) because the server cannot observe it without
