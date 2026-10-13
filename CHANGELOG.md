@@ -12,6 +12,26 @@ and the README. Design rationale: `DECISIONS.md` #10-#12 and #14-#19.
 
 ### Security
 
+- **Runtime-verification fix round, continued.** The release gate compares the tagged commit
+  against the fully qualified `refs/remotes/origin/main` and refuses to release when that ref
+  is unavailable after the fetch, so a tag or branch literally named `origin/main` cannot
+  shadow the comparison. BigQuery's derived or caller-supplied `maximumBytesBilled` is clamped
+  to the int64 maximum (a 1e300 USD cap no longer raises `OverflowError`), `QueryJob.cancel()`
+  on the 120 s watchdog carries the same 30 s bound as every other API call, a provider
+  `bytesBilledLimitExceeded` with no cap attached by this server says so instead of claiming
+  "a limit of None bytes", `max_rows` (1 to the int64 maximum) and `max_bytes_billed` are
+  validated before any estimate, and refusal hints print tiny caps as `$1e-05`. The session
+  warehouse is pinned by its `CURRENT_WAREHOUSE()` name verbatim; a pinned warehouse whose
+  stored name this server cannot look up (a quoted identifier such as `big-wh`, or over 255
+  characters) now fails closed instead of pricing at the caller-asserted size.
+  `SNOWFLAKE_ROLE` normalisation peels every layer of quotes and whitespace, so
+  `" 'ACCOUNTADMIN' "` is refused too. `COST_GUARD_MAX_IN_FLIGHT_QUERIES` must be at most
+  1000. Text with no SQL statement (empty, whitespace or comments only) is refused by the
+  single-statement gate. Snowflake and Databricks `check_credentials` details and estimate
+  caveats run `redact_secrets` before presentation, as BigQuery's already did. Snowflake
+  estimates with no rate carry no pricing or runtime caveats, BigQuery presents the
+  service-returned accuracy text, and Databricks estimates always carry the
+  unobserved-warehouse diagnostic when the lookup failed.
 - **Log records and `SanitizedEngineError` text can no longer be forged by control characters.**
   `sanitize_exceptions` now `repr()`-quotes the (already secret-redacted) exception text
   before logging it or raising it, so a newline, carriage return, ESC or NUL in a
@@ -177,9 +197,10 @@ and the README. Design rationale: `DECISIONS.md` #10-#12 and #14-#19.
   caller supplied, defaulting to the cheapest tier, so an omitted size admitted a query costing
   up to 512x (Snowflake) / 174x (Databricks) the approved cap and labelled it `UPPER_BOUND`.
   Snowflake now reads the pinned warehouse's `SHOW WAREHOUSES` row directly (size/type/
-  generation/state via `fetchall()`, no `RESULT_SCAN`; exact case-insensitive name match so
-  LIKE's `_` wildcard cannot bind a sibling; `CURRENT_WAREHOUSE()` resolved when no `warehouse`
-  is given) and Databricks looks the `DATABRICKS_HTTP_PATH` warehouse up through the Warehouses
+  generation/state via `fetchall()`, no `RESULT_SCAN`; matched by its exact identifier - the
+  upper-cased unquoted argument, or `CURRENT_WAREHOUSE()` verbatim when no `warehouse` is
+  given - so neither LIKE's `_` wildcard nor a differently-cased sibling can bind, and a
+  result without exactly one such row fails closed) and Databricks looks the `DATABRICKS_HTTP_PATH` warehouse up through the Warehouses
   API (`auth_type` pinned, 60 s bounds); `warehouse_size`/`edition` can only raise the estimate.
   **Breaking:** Snowpark-optimized/non-STANDARD Snowflake warehouses, unrecognised sizes and
   Databricks Classic/Pro warehouses no longer get a dollar figure, so a `max_estimated_cost_usd`
