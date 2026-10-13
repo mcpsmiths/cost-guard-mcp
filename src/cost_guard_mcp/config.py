@@ -57,8 +57,9 @@ def load_bigquery_config() -> BigQueryConfig:
 # README and server.json have always promised "never ACCOUNTADMIN"; this makes the promise a
 # load-time check instead of prose. SECURITYADMIN and ORGADMIN carry the same class of
 # account-wide authority (grant management / organization administration) and are rejected
-# for the same reason. Compared after .strip().strip('"').upper() so a quoted or lower-case
-# env value cannot slip past (security audit, plan-review amendment A17).
+# for the same reason. Compared after stripping whitespace and both quote styles (see
+# _normalize_snowflake_role_name) so a quoted or lower-case env value cannot slip past
+# (security audit, plan-review amendment A17).
 _REJECTED_SNOWFLAKE_ADMIN_ROLES = frozenset({"ACCOUNTADMIN", "SECURITYADMIN", "ORGADMIN"})
 
 # The only values Snowflake's login-time SECONDARY_ROLES accepts. "NONE" is the secure default:
@@ -69,7 +70,12 @@ _ALLOWED_SNOWFLAKE_SECONDARY_ROLES = frozenset({"NONE", "ALL"})
 
 
 def _normalize_snowflake_role_name(role: str) -> str:
-    return role.strip().strip('"').upper()
+    """The comparison form of SNOWFLAKE_ROLE for the admin-role check: outer whitespace, then
+    either quoting style a shell or secret store can leave around the value (double OR single
+    quotes - PR #86 runtime verification T5 found "'ACCOUNTADMIN'" passing a normaliser that
+    stripped only double quotes and reaching connect(role=...)), then whitespace the quotes
+    may have enclosed, upper-cased. The value handed to the connector is the raw env string."""
+    return role.strip().strip("\"'").strip().upper()
 
 
 def _load_snowflake_secondary_roles() -> str:

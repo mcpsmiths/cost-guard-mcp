@@ -162,6 +162,12 @@ def test_load_snowflake_config_rejects_unknown_secondary_roles_value(monkeypatch
         "securityadmin",
         "ORGADMIN",
         '"orgadmin"',
+        # PR #86 runtime verification (T5): SNOWFLAKE_ROLE="'ACCOUNTADMIN'" - single quotes, the
+        # other quoting style a shell or secret store can leave in an env value - passed the
+        # normaliser (which stripped only double quotes) and reached connect(role=...).
+        "'ACCOUNTADMIN'",
+        " 'orgadmin' ",
+        "'\"SECURITYADMIN\"'",
     ],
 )
 def test_load_snowflake_config_rejects_account_wide_admin_roles(monkeypatch, role):
@@ -177,7 +183,7 @@ def test_load_snowflake_config_admin_role_error_text_is_static(monkeypatch):
     # The rejection message must not echo the env value back (it is operator config, but the
     # text reaches the MCP client via ToolError) - every rejected role gets identical text.
     messages = set()
-    for role in ("ACCOUNTADMIN", '"orgadmin"', " SecurityAdmin "):
+    for role in ("ACCOUNTADMIN", '"orgadmin"', " SecurityAdmin ", "'accountadmin'"):
         _set_minimal_snowflake_env(monkeypatch, role=role)
         with pytest.raises(ConfigError) as excinfo:
             load_snowflake_config()
