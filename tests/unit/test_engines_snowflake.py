@@ -951,6 +951,46 @@ def test_lookup_warehouse_facts_presents_unresolved_candidate_names_quoted_and_b
     assert all("\n" not in candidate for candidate in facts.candidates_presented)
 
 
+def test_lookup_warehouse_facts_fails_closed_on_rows_whose_name_is_null(snowflake_fakes):
+    # PR #86 round-2 review of 885c055: a SHOW result that parses but whose rows carry no
+    # usable name is not "malformed" in the fail-open sense (that word is for shapes the parse
+    # rejects, see the docstring) - these are rows that are not the pinned warehouse, so the
+    # outcome is the same _UnresolvedWarehouse as for any other non-matching row. The caveat
+    # presents such a row as the bare word None, never as a warehouse called 'None'.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[(None, "STARTED", "STANDARD", "X-Small", "true", "2")]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts == _UnresolvedWarehouse(
+        pinned_name="COMPUTE_WH", candidates_presented=("None",), candidate_count=1
+    )
+    _, _, caveats = _rate_for(facts, "XSMALL")
+    assert "(None)" in caveats[0] and "'None'" not in caveats[0]
+
+
+def test_lookup_warehouse_facts_fails_closed_when_the_result_has_no_name_column(
+    snowflake_fakes,
+):
+    class _NoNameColumnCursor(snowflake_fakes.cursor):
+        @property
+        def description(self):
+            if self._last.startswith("SHOW WAREHOUSES"):
+                return [
+                    (column, None, None, None, None, None, None)
+                    for column in ("state", "type", "size", "auto_resume", "generation")
+                ]
+            return None
+
+    cursor = _NoNameColumnCursor(show_rows=[("STARTED", "STANDARD", "6X-Large", "true", "2")])
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert isinstance(facts, _UnresolvedWarehouse)
+    assert facts.candidates_presented == ("None",)
+
+
 def test_rate_for_fails_closed_on_an_unresolved_warehouse():
     unresolved = _UnresolvedWarehouse(
         pinned_name="W_H", candidates_presented=("'WAH'", "'WBH'"), candidate_count=7

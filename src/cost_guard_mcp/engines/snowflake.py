@@ -315,8 +315,10 @@ class _UnresolvedWarehouse:
     rows, return None, and price a 6X-Large query at the caller-asserted X-Small rate.
 
     `candidates_presented` holds the first _MAX_UNRESOLVED_CANDIDATES_PRESENTED row names,
-    each already passed through present_remote_text (they are warehouse-returned text);
-    `candidate_count` is how many rows there were in total.
+    each already passed through _present_observed (they are warehouse-returned text; a row
+    with no usable name - column missing, NULL or non-text - is the bare word None, so it
+    never reads as a warehouse called 'None'); `candidate_count` is how many rows there were
+    in total.
     """
 
     pinned_name: str
@@ -425,6 +427,11 @@ def _lookup_warehouse_facts(
     that fails - permission, network, malformed response shape, timeout - or that finds no
     warehouse at all (an empty SHOW result, no CURRENT_WAREHOUSE()) returns None, never raises;
     explain_estimate() then degrades to the caller-asserted/Gen1 rate plus an explicit caveat.
+    "Malformed" means a shape the parse rejects (a row whose width differs from
+    cursor.description, a non-sequence row). Rows that parse but carry no usable name - the
+    column missing, NULL or non-text - are rows that are not the pinned warehouse, so they
+    fail CLOSED as an _UnresolvedWarehouse exactly like any other non-matching row: the
+    fail-open None is never chosen on the strength of what the rows contain.
 
     When `warehouse` is None the session's active warehouse is resolved with SELECT
     CURRENT_WAREHOUSE() first - it is what EXPLAIN just ran against and what execute_bounded
@@ -492,7 +499,7 @@ def _lookup_warehouse_facts(
         return _UnresolvedWarehouse(
             pinned_name=pinned_name,
             candidates_presented=tuple(
-                present_remote_text(str(row.get("name")))
+                _present_observed(row.get("name"))
                 for row in rows[:_MAX_UNRESOLVED_CANDIDATES_PRESENTED]
             ),
             candidate_count=len(rows),
