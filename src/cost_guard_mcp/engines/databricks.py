@@ -144,8 +144,15 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
             except Exception:  # noqa: BLE001, S110
                 pass
 
+    # current_user() is warehouse-returned text and this detail reaches the model as
+    # structuredContent, so it is presented (bounded, repr-quoted, one line) rather than
+    # interpolated raw inside literal quotes - PR #86 verification (probe-4 p5c) delivered a
+    # detail carrying U+000A, ESC, CR, U+0085 and U+2028 through the old f-string. The
+    # success path stays log-free.
     return CredentialCheckResult(
-        engine="databricks", ok=True, detail=f"Authenticated as '{current_user}'."
+        engine="databricks",
+        ok=True,
+        detail=f"Authenticated as {present_remote_text(str(current_user))}.",
     )
 
 

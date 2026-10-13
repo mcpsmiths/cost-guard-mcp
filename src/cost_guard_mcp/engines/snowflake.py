@@ -370,13 +370,14 @@ def _text_or_none(value: object, *, upper: bool = False) -> str | None:
     return text.upper() if upper else text
 
 
-def _present_observed(value: str | None) -> str:
-    """A warehouse-returned column value on its way into a caveat: present_remote_text for
-    text (bounded, repr-quoted, one line - DECISIONS.md #18), the bare word None for a NULL
-    column so it does not read as the text 'None'. Never repr(...)[:N]: slicing after repr()
-    drops the closing quote on long values and with it the visible boundary between what the
-    warehouse said and what this server says (PR #86 verification, probe-4 p5d/p5e)."""
-    return "None" if value is None else present_remote_text(value)
+def _present_observed(value: object) -> str:
+    """A warehouse-returned value on its way into a caveat or a check_credentials detail:
+    present_remote_text over its text (bounded, repr-quoted, one line - DECISIONS.md #18), the
+    bare word None for a NULL column so it does not read as the text 'None'. Never
+    repr(...)[:N]: slicing after repr() drops the closing quote on long values and with it the
+    visible boundary between what the warehouse said and what this server says (PR #86
+    verification, probe-4 p5a/p5d/p5e)."""
+    return "None" if value is None else present_remote_text(str(value))
 
 
 def _cloud_provider_from_region(region_row: object) -> str | None:
@@ -625,9 +626,9 @@ def _runtime_for(
         return scale_runtime_hours(bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS), [caveat]
     # The plan is warehouse-returned JSON, so the unusable value is presented like any other
     # remote text rather than sliced after repr().
-    shown = _present_observed(None if bytes_assigned is None else str(bytes_assigned))
     caveat = (
-        f"EXPLAIN returned no usable bytesAssigned figure ({shown}) — the byte estimate is "
+        f"EXPLAIN returned no usable bytesAssigned figure ({_present_observed(bytes_assigned)}) "
+        "— the byte estimate is "
         "unavailable, not zero, and without a historical runtime signal no dollar estimate is "
         "produced; run_query_bounded refuses a byte or dollar cap for this query."
     )
@@ -841,11 +842,17 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
             except Exception:  # noqa: BLE001, S110
                 pass
 
+    # The four identity values are warehouse-returned text (CURRENT_ROLE() etc. echo whatever
+    # the account holds) and this detail reaches the model as structuredContent, so each is
+    # presented - bounded, repr-quoted, one line - instead of interpolated raw inside literal
+    # quotes. PR #86 verification (probe-4 p5a) delivered a detail carrying U+000A, ESC, CR,
+    # U+0085 and U+2028 through this f-string. The success path stays log-free.
     return CredentialCheckResult(
         engine="snowflake",
         ok=True,
         detail=(
-            f"Authenticated as role '{role}' (secondary roles: {secondary_roles}) on "
-            f"account '{account}', warehouse '{current_warehouse}'."
+            f"Authenticated as role {_present_observed(role)} (secondary roles: "
+            f"{_present_observed(secondary_roles)}) on account {_present_observed(account)}, "
+            f"warehouse {_present_observed(current_warehouse)}."
         ),
     )
