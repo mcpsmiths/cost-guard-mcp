@@ -284,6 +284,20 @@ def test_check_credentials_presents_current_user_on_one_line(mock_connect, caplo
     assert not [record for record in caplog.records if record.name.startswith("cost_guard_mcp")]
 
 
+def test_rate_caveat_redacts_secrets_in_an_unmodelled_cluster_size():
+    # Round-3 verification: the cluster_size caveat was presented but not redacted, so a
+    # 'Gigantic password=hunter2' label reached the model verbatim while the CHANGELOG said
+    # Databricks caveats run redact_secrets first.
+    facts = _WarehouseFacts(
+        state="RUNNING", cluster_size="Gigantic password=hunter2", is_serverless=True
+    )
+    rate, _size, caveats = _rate_for(facts, "X-Small")
+
+    assert rate is None
+    assert any("REDACTED" in c for c in caveats)
+    assert not any("hunter2" in c for c in caveats)
+
+
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_check_credentials_redacts_secrets_in_current_user_before_presenting(mock_connect):
     # PR #86 delta verification (be81124 vs 8a16733 drift): same redact -> present chain as

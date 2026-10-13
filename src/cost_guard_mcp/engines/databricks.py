@@ -352,7 +352,11 @@ def _rate_for(
     # server's own words. The size LABEL handed back for the runtime caveat is the one value
     # that may stay raw: it is only ever a cluster_size dbus_per_hour accepted, i.e. a rate-
     # table key modulo case.
-    presented_cluster_size = present_remote_text(facts.cluster_size)
+    # redact -> present, the same chain as every other warehouse-returned text (round-3
+    # verification found this one caveat skipping the redaction step).
+    presented_cluster_size = present_remote_text(
+        redact_secrets(facts.cluster_size), total_chars=len(facts.cluster_size)
+    )
     try:
         observed_rate = dbus_per_hour(facts.cluster_size)
     except ValueError:

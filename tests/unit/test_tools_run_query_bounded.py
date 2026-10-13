@@ -731,11 +731,23 @@ def test_byte_cap_int64_maximum_is_accepted_and_one_above_is_refused(mock_estima
     mock_estimate.assert_not_called()
 
 
-@pytest.mark.parametrize("max_rows", [2**63, 2**64, 10**30])
+@pytest.mark.parametrize("max_rows", [2**63 - 1, 2**63, 2**64, 10**30])
 @patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
 def test_rejects_max_rows_above_int64_before_estimating(mock_estimate, max_rows):
+    # The wrapper dispatches LIMIT max_rows + 1, so the largest admissible value is 2**63 - 2
+    # (round-3 verification: 2**63 - 1 still produced LIMIT 9223372036854775808).
     # PR #86 delta verification: max_rows had no upper bound while max_bytes_billed was
     # bounded to int64, so 'LIMIT 9223372036854775808' was dispatched after the estimate ran.
     with pytest.raises(UserVisibleError, match="max_rows"):
         run_query_bounded("bigquery", "SELECT 1", max_rows=max_rows)
     mock_estimate.assert_not_called()
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_accepts_the_largest_max_rows_whose_limit_literal_fits_int64(mock_estimate):
+    mock_estimate.return_value = _estimate(cost=0.0001)
+    with patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded") as execute:
+        execute.return_value = ([{"a": 1}], 1, False)
+        result = run_query_bounded("bigquery", "SELECT 1", max_rows=2**63 - 2)
+    assert result.status == "ok"
+    assert execute.call_args.kwargs["max_rows"] == 2**63 - 2
