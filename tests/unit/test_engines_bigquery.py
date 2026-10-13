@@ -363,6 +363,34 @@ def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_bq_modul
     assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM t -- c",
+        "SELECT * FROM t; -- c\n",
+        "SELECT * FROM t /* c */;",
+        "SELECT * FROM t # c",
+    ],
+)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_strips_trailing_comments_before_wrapping(mock_bq_module, sql):
+    # Before: `SELECT * FROM (SELECT * FROM t -- c) AS cost_guard_row_cap LIMIT 6` - the
+    # comment ate the closing parenthesis and the provider rejected the wrapped text.
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter([{"a": 1}])
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    execute_bounded(sql, max_bytes_billed=None, max_rows=5)
+
+    called_sql = mock_client.query.call_args[0][0]
+    assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
+
+
 @patch("cost_guard_mcp.engines.bigquery.bigquery")
 def test_check_credentials_ok_when_service_account_email_succeeds(mock_bq_module):
     mock_client = MagicMock()

@@ -533,6 +533,20 @@ def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect)
     assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
 
 
+@pytest.mark.parametrize("sql", ["SELECT * FROM t -- c", "SELECT * FROM t; /* c */\n"])
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_strips_trailing_comments_before_wrapping(mock_connect, sql):
+    mock_cursor = _make_mock_cursor([(1,)])
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    execute_bounded(sql, warehouse=None, max_rows=5)
+
+    called_sql = mock_cursor.execute.call_args[0][0]
+    assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
+
+
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_execute_bounded_reraises_real_query_error_not_a_timeout(mock_connect):
     # Regression test: the background-thread query-FAILURE path (as opposed to a timeout)

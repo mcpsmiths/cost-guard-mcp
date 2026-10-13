@@ -1,7 +1,11 @@
 import pytest
 
 from cost_guard_mcp.errors import UserVisibleError
-from cost_guard_mcp.sql_scope import ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, assert_single_statement
+from cost_guard_mcp.sql_scope import (
+    ALLOW_MULTI_STATEMENT_SQL_ENV_VAR,
+    assert_single_statement,
+    single_statement_body,
+)
 
 ENGINES = ["bigquery", "snowflake", "databricks"]
 
@@ -283,3 +287,51 @@ def test_opt_out_is_read_at_call_time_not_import_time(monkeypatch):
     _refuses("SELECT 1; DELETE FROM t", "bigquery")
     monkeypatch.setenv(ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, "1")
     _accepts("SELECT 1; DELETE FROM t", "bigquery")
+
+
+# --- single_statement_body: what the engines wrap in the LIMIT subquery -------------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize(
+    ("sql", "body"),
+    [
+        ("SELECT 1", "SELECT 1"),
+        ("SELECT 1;", "SELECT 1"),
+        ("  \n SELECT 1 ;\n  ", "SELECT 1"),
+        # A trailing line comment used to survive `rstrip(";")` and swallow the wrapper's
+        # closing parenthesis: `SELECT * FROM (SELECT 1 -- c) AS cost_guard_row_cap LIMIT 6`.
+        ("SELECT 1 -- c", "SELECT 1"),
+        ("SELECT 1; -- c", "SELECT 1"),
+        ("SELECT 1;\n  /* c; */ \n", "SELECT 1"),
+        ("SELECT 1 /* c */ ;", "SELECT 1"),
+        ("SELECT 1 -- c\n;", "SELECT 1"),
+        ("SELECT ';' AS s;", "SELECT ';' AS s"),
+        ("SELECT '--x' AS s -- c", "SELECT '--x' AS s"),
+        ("SELECT 1 /* a */ + /* b */ 2", "SELECT 1 /* a */ + /* b */ 2"),
+    ],
+)
+def test_single_statement_body_drops_the_trailing_terminator_whitespace_and_comments(
+    sql, body, engine
+):
+    assert single_statement_body(sql, engine) == body  # type: ignore[arg-type]
+
+
+def test_single_statement_body_honours_each_dialects_line_comment_forms():
+    assert single_statement_body("SELECT 1 # c", "bigquery") == "SELECT 1"
+    assert single_statement_body("SELECT 1 // c", "snowflake") == "SELECT 1"
+    # Neither is a comment in Spark SQL: the text stays for the provider to judge.
+    assert single_statement_body("SELECT 1 # c", "databricks") == "SELECT 1 # c"
+    assert single_statement_body("SELECT 1 // c", "databricks") == "SELECT 1 // c"
+    assert single_statement_body("SELECT `a#b` FROM t -- c", "databricks") == "SELECT `a#b` FROM t"
+
+
+def test_single_statement_body_keeps_the_old_semicolon_strip_when_the_text_is_unscannable(
+    monkeypatch,
+):
+    # The gate (assert_single_statement) is a separate, earlier call; this helper never
+    # refuses. With the operator opt-out set, multi-statement or unscannable text reaches
+    # the engines and only the pre-existing best-effort strip applies.
+    monkeypatch.setenv(ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, "1")
+    assert single_statement_body("SELECT 'x;", "bigquery") == "SELECT 'x"
+    assert single_statement_body("SELECT 1; SELECT 2;", "bigquery") == "SELECT 1; SELECT 2"

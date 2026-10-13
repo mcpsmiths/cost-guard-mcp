@@ -13,6 +13,7 @@ from cost_guard_mcp.errors import (
     sanitize_exceptions,
 )
 from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
+from cost_guard_mcp.sql_scope import single_statement_body
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
 logger = logging.getLogger(__name__)
@@ -288,10 +289,13 @@ def execute_bounded(
 
     wrapped_sql = sql
     if max_rows is not None:
-        inner_sql = sql.strip().rstrip(";").strip()
         # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
         # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
-        # untrusted input reaching a query built from a different source.
+        # untrusted input reaching a query built from a different source. The trailing `;`
+        # and any trailing comments go first (sql_scope.single_statement_body, shared with
+        # the other engines): either makes `(...) AS x LIMIT n` a syntax error - a line
+        # comment swallows the closing parenthesis.
+        inner_sql = single_statement_body(sql, "bigquery")
         wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
 
     job_config = (

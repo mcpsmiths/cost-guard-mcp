@@ -1806,6 +1806,24 @@ def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect,
     assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
 
 
+@pytest.mark.parametrize("sql", ["SELECT * FROM t -- c", "SELECT * FROM t; // c\n"])
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_strips_trailing_comments_before_wrapping(mock_connect, _mock_sleep, sql):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchall.return_value = []
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = False
+    mock_connect.return_value = mock_conn
+
+    execute_bounded(sql, warehouse=None, max_rows=5)
+
+    called_sql = mock_cursor.execute_async.call_args[0][0]
+    assert called_sql == "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
+
+
 @patch("cost_guard_mcp.engines.snowflake.time.sleep")
 @patch("cost_guard_mcp.engines.snowflake._connect")
 def test_execute_bounded_closes_connection_on_success(mock_connect, _mock_sleep):

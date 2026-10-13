@@ -221,9 +221,13 @@ def _quoted_end(sql: str, index: int, dialect: _Dialect) -> int:
     )
 
 
-def _scan(sql: str, dialect: _Dialect) -> None:
+def _scan(sql: str, dialect: _Dialect) -> int:
+    """Refuse anything but one statement; return the end (exclusive) of that statement's
+    last significant character - whitespace, comments and the optional trailing ``;`` do
+    not count, so ``sql[:end]`` is exactly what a LIMIT wrapper may enclose."""
     index = 0
     terminator_seen = False
+    statement_end = 0
     while index < len(sql):
         ch = sql[index]
         if (
@@ -252,10 +256,10 @@ def _scan(sql: str, dialect: _Dialect) -> None:
             index += 1
             continue
         if ch in "'\"":
-            index = _quoted_end(sql, index, dialect)
+            index = statement_end = _quoted_end(sql, index, dialect)
             continue
         if ch == "`" and dialect.backtick_identifiers:
-            index = _unescaped_literal_end(sql, index + 1, "`", "quoted identifier")
+            index = statement_end = _unescaped_literal_end(sql, index + 1, "`", "quoted identifier")
             continue
         if dialect.dollar_strings and sql.startswith("$$", index):
             if _prefix_before(sql, index):
@@ -264,16 +268,41 @@ def _scan(sql: str, dialect: _Dialect) -> None:
                     "character) - put whitespace before it",
                     index,
                 )
-            index = _unescaped_literal_end(sql, index + 2, "$$", "dollar-quoted string")
+            index = statement_end = _unescaped_literal_end(
+                sql, index + 2, "$$", "dollar-quoted string"
+            )
             continue
         index += 1
+        statement_end = index
+    return statement_end
+
+
+def single_statement_body(sql: str, engine: Engine) -> str:
+    """The statement in ``sql`` without its trailing ``;``, whitespace and comments - the
+    text an engine may enclose in ``SELECT * FROM (...) AS cost_guard_row_cap LIMIT n``.
+
+    ``rstrip(";")`` alone left a trailing line comment in place, and the comment then ate
+    the wrapper's closing parenthesis (``(SELECT 1 -- c) AS ...``), so an admitted query
+    ending in a comment failed at the provider with a syntax error. Comment forms are
+    dialect-aware through the same scanner as the gate (a ``#`` is a comment on BigQuery
+    and plain text on Databricks). This helper never refuses: the gate is the separate,
+    earlier ``assert_single_statement`` call; text the scanner cannot resolve (possible
+    only when the operator opt-out let it through) keeps the pre-existing best-effort
+    semicolon strip.
+    """
+    try:
+        end = _scan(sql, _DIALECTS.get(engine, _FALLBACK))
+    except UserVisibleError:
+        return sql.strip().rstrip(";").strip()
+    return sql[:end].strip()
 
 
 def assert_single_statement(sql: str, engine: Engine) -> None:
     """Raise UserVisibleError unless ``sql`` is exactly one statement for ``engine``.
 
     A single trailing ``;`` (followed only by whitespace and comments) is allowed - the
-    engines' LIMIT wrappers already strip it. Everything the scanner cannot resolve with
+    engines' LIMIT wrappers strip it, and the trailing comments, via
+    ``single_statement_body``. Everything the scanner cannot resolve with
     certainty is refused; see the module docstring for the rule.
     """
     if os.environ.get(ALLOW_MULTI_STATEMENT_SQL_ENV_VAR) == "1":
