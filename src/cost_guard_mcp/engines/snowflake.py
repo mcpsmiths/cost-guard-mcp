@@ -766,15 +766,21 @@ def execute_bounded(
             while conn.is_still_running(status):
                 if elapsed_seconds >= _MAX_EXECUTION_WAIT_SECONDS:
                     _cancel_query(conn, query_id)
+                    # The id is connector-returned text, not this process's own: it goes into
+                    # the log record and the error presented (repr-quoted, bounded, one line),
+                    # never raw - the SDK's stderr handler is a bare '%(message)s', so a raw
+                    # '\n' in it started a second, prefix-free record that read exactly like
+                    # a genuine 'tool=... outcome=...' line (PR #86 verification, probe-4 p28).
+                    presented_query_id = present_remote_text(str(query_id))
                     logger.warning(
                         "engine=snowflake execute_bounded timed out after %ss, "
                         "cancelled query_id=%s",
                         _MAX_EXECUTION_WAIT_SECONDS,
-                        query_id,
+                        presented_query_id,
                     )
                     raise TimeoutError(
                         f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
-                        f"(query_id={query_id})."
+                        f"(query_id={presented_query_id})."
                     )
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 elapsed_seconds += _POLL_INTERVAL_SECONDS

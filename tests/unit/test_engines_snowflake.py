@@ -2051,6 +2051,49 @@ def test_execute_bounded_raise_survives_a_failed_cancel_attempt(mock_connect, _m
         execute_bounded("SELECT * FROM huge_table", warehouse=None, max_rows=None)
 
 
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_timeout_presents_the_query_id_in_the_log_and_the_error(
+    mock_connect, _mock_sleep, caplog
+):
+    # PR #86 runtime verification, probe-4 p28 (evidence/probe-4/p28-bq-timeout-jobid.stderr.log
+    # for the BigQuery leg; this 'cancelled query_id=%s' record had the same shape): a
+    # connector-returned id carrying '\n' went into the WARNING raw, and because the SDK's
+    # stderr handler is a bare '%(message)s' the tail became a second, prefix-free record
+    # 'FORGED tool=run_query_bounded outcome=success' indistinguishable from a genuine one.
+    caplog.set_level(logging.WARNING, logger="cost_guard_mcp")
+    forged_id = "q\nFORGED tool=run_query_bounded outcome=success"
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = forged_id
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = True  # never finishes
+    mock_connect.return_value = mock_conn
+
+    with pytest.raises(SanitizedEngineError, match="was cancelled") as exc_info:
+        execute_bounded("SELECT * FROM huge_table", warehouse=None, max_rows=None)
+
+    engine_warnings = [
+        record
+        for record in caplog.records
+        if record.name == "cost_guard_mcp.engines.snowflake" and record.levelno == logging.WARNING
+    ]
+    assert len(engine_warnings) == 1
+    message = engine_warnings[0].getMessage()
+    assert len(message.splitlines()) == 1
+    assert f"cancelled query_id={present_remote_text(forged_id)}" in message
+    # Every record this project emitted on the way out is one line - the sanitize_exceptions
+    # WARNING included - and the error text carries the escaped id, never a raw line break.
+    assert all(
+        len(record.getMessage().splitlines()) == 1
+        for record in caplog.records
+        if record.name.startswith("cost_guard_mcp")
+    )
+    assert "\n" not in str(exc_info.value)
+    assert "FORGED" in str(exc_info.value)
+    assert exc_info.value.__cause__ is None  # raised `from None`: the raw text stays server-side
+
+
 @patch("cost_guard_mcp.engines.snowflake._connect")
 def test_execute_bounded_raises_when_execute_async_returns_no_query_id(mock_connect):
     mock_cursor = MagicMock()
