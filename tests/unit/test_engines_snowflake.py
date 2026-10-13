@@ -17,6 +17,7 @@ from cost_guard_mcp.engines.snowflake import (
     _SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS,
     _SINGLE_STATEMENT_COUNT,
     _apply_statement_timeout,
+    _asserted_size_key,
     _connect,
     _lookup_historical_runtime,
     _lookup_warehouse_facts,
@@ -1538,6 +1539,58 @@ def test_explain_estimate_validates_asserted_rate_inputs_before_connecting(
     # warehouse lookup, so its (bounded) message is what the caller sees.
     with pytest.raises(SanitizedEngineError, match=message):
         explain_estimate("SELECT 1", warehouse="WH", **kwargs)
+
+    mock_connect.assert_not_called()
+
+
+# --- explain_estimate: warehouse_size spellings (PR #86 verification, docker-cli finding) ---
+
+
+@pytest.mark.parametrize(
+    ("warehouse_size", "expected_key"),
+    [
+        ("X-Large", "XLARGE"),
+        ("x-large", "XLARGE"),
+        ("XLARGE", "XLARGE"),
+        ("2X-Large", "X2LARGE"),
+        ("X2LARGE", "X2LARGE"),
+        ("4X-Large", "X4LARGE"),
+        ("X Large", "XLARGE"),
+        (" x-small ", "XSMALL"),
+    ],
+)
+def test_explain_estimate_accepts_the_size_spellings_the_tool_description_uses(
+    snowflake_fakes, warehouse_size, expected_key
+):
+    # The run_query_bounded/estimate_query_cost description offers "X-Large" as a
+    # warehouse_size example, yet warehouse_size.upper() handed 'X-LARGE' straight to
+    # credits_per_hour, which rejected it. The caller's string is normalised with the same
+    # mapping SHOW WAREHOUSES text uses, so the display spellings, the table's own keys and a
+    # space for the hyphen all resolve to one pricing key.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", generation="1")],
+        warehouse_size=warehouse_size,
+    )
+
+    expected = round(
+        credits_per_hour(expected_key) * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
+    )
+    assert estimate.estimated_cost_usd == expected
+    assert any(f"on a {expected_key} warehouse" in c for c in estimate.caveats)
+
+
+@pytest.mark.parametrize("warehouse_size", ["gigantic", "GIGANTIC", "giga ntic"])
+def test_asserted_size_key_falls_back_to_the_upper_cased_raw_text(warehouse_size):
+    # An unknown spelling is handed on as its upper-cased raw form, so credits_per_hour's
+    # existing ValueError fires with exactly the (bounded, repr-quoted) echo it has today.
+    assert _asserted_size_key(warehouse_size) == warehouse_size.upper()
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_explain_estimate_still_rejects_an_unknown_size_spelling_before_connecting(mock_connect):
+    with pytest.raises(SanitizedEngineError, match="unknown Snowflake warehouse size 'GIGANTIC'"):
+        explain_estimate("SELECT 1", warehouse="WH", warehouse_size="gigantic")
 
     mock_connect.assert_not_called()
 

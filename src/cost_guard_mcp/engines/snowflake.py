@@ -363,6 +363,24 @@ def _size_to_pricing_key(size_text: object) -> str | None:
     return _SHOW_SIZE_TO_PRICING_KEY.get(size_text.strip().upper())
 
 
+def _asserted_size_key(warehouse_size: str) -> str:
+    """The pricing-table key for the caller's `warehouse_size` argument.
+
+    The tool description offers "X-Large" as an example, but credits_per_hour knows only the
+    CREATE WAREHOUSE spellings ('XLARGE', 'X2LARGE'), so warehouse_size.upper() handed it
+    'X-LARGE' and the call was refused (PR #86 runtime verification, docker-cli finding). The
+    caller's string is therefore normalised with the same allowlist SHOW WAREHOUSES text uses
+    (_SHOW_SIZE_TO_PRICING_KEY), also accepting a space for the hyphen ('X Large', '2X Large').
+    Anything the allowlist does not know is handed on as the upper-cased raw text, so
+    credits_per_hour raises its existing unknown-size ValueError with exactly the bounded,
+    repr-quoted echo it has today - this widens what is accepted, never what is echoed.
+    """
+    key = _size_to_pricing_key(warehouse_size) or _size_to_pricing_key(
+        "-".join(warehouse_size.split())
+    )
+    return key if key is not None else warehouse_size.upper()
+
+
 def _text_or_none(value: object, *, upper: bool = False) -> str | None:
     if not isinstance(value, str):
         return None
@@ -656,7 +674,7 @@ def explain_estimate(
     # Validate every caller-asserted input before connecting: an unknown warehouse name, size
     # or edition is a clear (sanitized) ValueError that never costs a connection or a lookup.
     validated_warehouse = _validate_warehouse(warehouse) if warehouse is not None else None
-    asserted_size_key = warehouse_size.upper()
+    asserted_size_key = _asserted_size_key(warehouse_size)
     credits_per_hour(asserted_size_key)
     usd_per_credit(edition)
     config = load_snowflake_config()
