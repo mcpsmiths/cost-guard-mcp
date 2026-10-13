@@ -340,14 +340,18 @@ def execute_bounded(
         except Exception:  # noqa: BLE001, S110 - best-effort cancel; the TimeoutError below is
             # the message that matters to the caller, a failed cancel must not mask it
             pass
+        # The job id came back from the service, so it is remote text like any error
+        # message: present it (one line, control characters escaped) before it reaches the
+        # log or the exception, or a newline in it starts a prefix-free stderr record.
+        presented_job_id = present_remote_text(str(query_job.job_id))
         logger.warning(
             "engine=bigquery execute_bounded timed out after %ss, cancelled job_id=%s",
             _MAX_EXECUTION_WAIT_SECONDS,
-            query_job.job_id,
+            presented_job_id,
         )
         raise TimeoutError(
             f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
-            f"(job_id={query_job.job_id})."
+            f"(job_id={presented_job_id})."
         ) from None
 
     row_cap_hit = max_rows is not None and len(rows) > max_rows
