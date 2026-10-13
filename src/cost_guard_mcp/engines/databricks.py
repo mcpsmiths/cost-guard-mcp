@@ -398,8 +398,7 @@ def explain_estimate(
             (
                 "Databricks has no BigQuery-style dry-run; this estimate is HEURISTIC, the "
                 "least precise of this project's three accuracy tiers."
-            ),
-            *rate_caveats,
+            )
         ]
         # A dollar figure derived from no plan statistics would depend only on the
         # warehouse rate, not on the query (0.035 USD for every X-Small query) - a cap
@@ -408,9 +407,17 @@ def explain_estimate(
         # max_estimated_cost_usd, exactly as it already does for the byte cap when
         # estimated_bytes is None (DECISIONS.md #5). The same None results when the observed
         # warehouse has no modelled rate (rate is None, see _rate_for).
-        estimated_cost_usd: float | None
+        #
+        # The caveat list describes the outcome actually returned (PR #86 verification, T4):
+        # _rate_for's caveats say how the rate was chosen ("priced at the observed size",
+        # "Priced at the caller-asserted ... size") when rate is not None, or why there is
+        # none when it is. They are kept with a figure, or when they ARE the refusal; a
+        # no-statistics estimate carries no pricing sentence, and a rate-None estimate no
+        # runtime-baseline sentence, because neither describes anything that happened.
+        estimated_cost_usd: float | None = None
+        if rate is None:
+            caveats.extend(rate_caveats)
         if max_size_in_bytes is None:
-            estimated_cost_usd = None
             caveats.append(
                 "EXPLAIN COST returned no size statistics for this query (common without "
                 "ANALYZE TABLE having been run, for streaming sources, or for non-Delta "
@@ -418,13 +425,12 @@ def explain_estimate(
                 "run_query_bounded will refuse any max_bytes_billed or max_estimated_cost_usd "
                 "cap for this query."
             )
-        else:
+        elif rate is not None:
             runtime_hours = scale_runtime_hours(
                 max_size_in_bytes, baseline_hours=_ASSUMED_RUNTIME_HOURS
             )
-            estimated_cost_usd = (
-                None if rate is None else round(rate * SERVERLESS_USD_PER_DBU * runtime_hours, 6)
-            )
+            estimated_cost_usd = round(rate * SERVERLESS_USD_PER_DBU * runtime_hours, 6)
+            caveats.extend(rate_caveats)
             caveats.append(
                 f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime on "
                 f"a {size_label} Serverless SQL warehouse, scaled up by a coarse size tier "

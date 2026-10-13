@@ -884,6 +884,99 @@ def test_explain_estimate_returns_no_dollar_figure_when_a_serverless_warehouse_r
     assert any("no cluster size" in c and "run_query_bounded" in c for c in estimate.caveats)
 
 
+# --- explain_estimate: the caveat list describes the outcome actually returned ---------------
+
+_NO_STATISTICS_PLAN = "== Optimized Logical Plan ==\nRelation[a,b] csv\n"
+_TIER_PREFIX = "Databricks has no BigQuery-style dry-run"
+_NO_STATISTICS_PREFIX = "EXPLAIN COST returned no size statistics"
+_RUNTIME_BASELINE_PREFIX = "Cost assumes a baseline"
+
+
+def _assert_no_pricing_language(caveats):
+    # PR #86 runtime verification (T4): with estimated_cost_usd None the list must not say a
+    # price was produced - neither "Priced at the caller-asserted ..." / "priced at the
+    # observed size" nor the runtime-baseline sentence that describes how a figure was built.
+    assert not any("riced at" in c for c in caveats)
+    assert not any(c.startswith(_RUNTIME_BASELINE_PREFIX) for c in caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_without_statistics_omits_the_pricing_caveats(mock_connect):
+    # Lookup failed -> an asserted rate exists, but no statistics -> no dollar figure. The
+    # live output paired "Priced at the caller-asserted X-Small size ..." with
+    # estimated_cost_usd null.
+    estimate = _explain_with(mock_connect, explain_output=_NO_STATISTICS_PLAN)
+
+    assert estimate.estimated_cost_usd is None
+    assert [c[:40] for c in estimate.caveats] == [_TIER_PREFIX, _NO_STATISTICS_PREFIX]
+    _assert_no_pricing_language(estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_without_statistics_on_an_understated_warehouse_omits_priced_at(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size="5X-Large"))
+
+    estimate = _explain_with(mock_connect, explain_output=_NO_STATISTICS_PLAN)
+
+    assert estimate.estimated_cost_usd is None
+    assert len(estimate.caveats) == 2
+    assert estimate.caveats[1].startswith(_NO_STATISTICS_PREFIX)
+    _assert_no_pricing_language(estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_for_a_non_serverless_warehouse_omits_the_runtime_baseline(
+    mock_connect, databricks_env
+):
+    # Statistics present, rate None: the live output carried both "no dollar estimate is
+    # produced" and "Cost assumes a baseline 30-second runtime ..." for the same estimate.
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size="Small", serverless=False))
+
+    estimate = _explain_with(mock_connect)
+
+    assert estimate.estimated_cost_usd is None
+    assert estimate.estimated_bytes == 1
+    assert len(estimate.caveats) == 2
+    assert estimate.caveats[0].startswith(_TIER_PREFIX)
+    assert "Classic/Pro" in estimate.caveats[1]
+    assert estimate.caveats[1].endswith(_FAIL_CLOSED_HINT)
+    _assert_no_pricing_language(estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_with_an_unrecognised_size_and_no_statistics_lists_both_refusals(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size="7X-Large"))
+
+    estimate = _explain_with(mock_connect, explain_output=_NO_STATISTICS_PLAN)
+
+    assert estimate.estimated_cost_usd is None
+    assert estimate.estimated_bytes is None
+    assert len(estimate.caveats) == 3
+    assert "'7X-Large'" in estimate.caveats[1] and estimate.caveats[1].endswith(_FAIL_CLOSED_HINT)
+    assert estimate.caveats[2].startswith(_NO_STATISTICS_PREFIX)
+    _assert_no_pricing_language(estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_with_a_dollar_figure_keeps_the_pricing_and_runtime_caveats(
+    mock_connect, databricks_env
+):
+    # Positive control: when a figure IS produced the list still explains how.
+    _stub_warehouse(databricks_env, _warehouse_response(cluster_size="5X-Large"))
+
+    estimate = _explain_with(mock_connect)
+
+    assert estimate.estimated_cost_usd is not None
+    assert len(estimate.caveats) == 3
+    assert "understated" in estimate.caveats[1]
+    assert estimate.caveats[2].startswith(_RUNTIME_BASELINE_PREFIX)
+    assert "5X-Large Serverless SQL warehouse" in estimate.caveats[2]
+
+
 # --- caveats present warehouse-returned text bounded, quoted and on one line ----------------
 
 
