@@ -2,18 +2,21 @@ import asyncio
 import base64
 import datetime
 import decimal
+import json
 import logging
 import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
+from pydantic_core import PydanticSerializationError
 
 from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
-from cost_guard_mcp.errors import UserVisibleError
+from cost_guard_mcp.errors import UserVisibleError, as_tool_error
 from cost_guard_mcp.tools.run_query_bounded import _json_safe_rows, run_query_bounded
-from cost_guard_mcp.types import AccuracyTier, CostEstimate, RefusalReason
+from cost_guard_mcp.types import AccuracyTier, BoundedQueryResult, CostEstimate, RefusalReason
 
 _RUN_QUERY_BOUNDED_LOGGER_NAME = "cost_guard_mcp.tools.run_query_bounded"
+_ERRORS_LOGGER_NAME = "cost_guard_mcp.errors"
 
 
 def _estimate(cost=None, bytes_=None):
@@ -617,3 +620,70 @@ def test_cost_cap_refusal_hint_shows_a_tiny_cap_exactly(mock_estimate):
     assert result.status == "refused"
     assert "1e-05" in result.hint
     assert "$0.0000" not in result.hint
+
+
+# --- runtime-verification follow-up (PR #86 adversarial probe-4 p11): lone surrogates -------
+# A str cell is not automatically UTF-8: Python's surrogateescape decoding (and BigQuery text
+# built from non-UTF-8 source bytes) yields lone surrogates such as \udcff, and pydantic_core
+# serialises str through a strict UTF-8 encoder. The normaliser must turn such text into its
+# visible escape instead of letting the SDK raise after the billed execution.
+
+_LONE_SURROGATE_TEXT = "ok\udcffend"
+
+
+def test_lone_surrogate_text_is_not_utf8_encodable():
+    # Control for the tests below: the fake BigQuery backend handed back exactly this cell,
+    # and the SDK's result serialiser refused it after 'tool=run_query_bounded
+    # outcome=success' had already been logged (evidence/probe-4/p11-rows-surrogate.*).
+    with pytest.raises(UnicodeEncodeError):
+        _LONE_SURROGATE_TEXT.encode("utf-8")
+
+
+def test_json_safe_rows_escapes_lone_surrogates_in_str_cells_and_column_names():
+    rows = _json_safe_rows([{"a\udc80": _LONE_SURROGATE_TEXT, "m": {"k\udc81": "v\udc82"}}])
+    assert rows == [{"a\\udc80": "ok\\udcffend", "m": {"k\\udc81": "v\\udc82"}}]
+
+
+def test_json_safe_rows_leaves_ordinary_text_untouched():
+    rows = _json_safe_rows([{"s": "héllo ✓", "e": ""}])
+    assert rows == [{"s": "héllo ✓", "e": ""}]
+
+
+def test_bounded_query_result_with_normalised_surrogate_rows_serialises_through_pydantic():
+    raw_rows = [{"a\udc80": _LONE_SURROGATE_TEXT}]
+    # Negative control: the un-normalised row still trips the real pydantic path, so the
+    # assertion below exercises the normaliser and not a serialiser that turned lenient.
+    with pytest.raises(PydanticSerializationError, match="utf-8"):
+        BoundedQueryResult(status="ok", rows=raw_rows, row_count=1).model_dump_json()
+
+    dumped = BoundedQueryResult(
+        status="ok", rows=_json_safe_rows(raw_rows), row_count=1
+    ).model_dump_json()
+
+    assert json.loads(dumped)["rows"] == [{"a\\udc80": "ok\\udcffend"}]
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_surrogate_row_text_reaches_the_caller_escaped_with_a_success_outcome(
+    mock_estimate, mock_execute, caplog
+):
+    # probe-4 p11: stderr said outcome=success and the model then got a bare 'Error
+    # executing tool run_query_bounded' because the SDK could not encode the rows. The
+    # tool keeps its promise of never raising after the billed query: the rows come back
+    # with the surrogate as six visible characters and the outcome record still reads
+    # success - the same path, not a refusal or an error in its place.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([{"s": _LONE_SURROGATE_TEXT, "n": 1}], 1, False)
+    tool = as_tool_error(run_query_bounded)
+
+    with caplog.at_level(logging.INFO, logger=_ERRORS_LOGGER_NAME):
+        result = tool("bigquery", "SELECT 1", max_rows=5)
+
+    assert result.status == "ok"
+    assert result.rows == [{"s": "ok\\udcffend", "n": 1}]
+    result.model_dump_json()  # the SDK's serialisation step, which used to raise here
+    records = [r for r in caplog.records if r.name == _ERRORS_LOGGER_NAME]
+    assert [r.message.split(" elapsed_ms=")[0] for r in records] == [
+        "tool=run_query_bounded outcome=success"
+    ]

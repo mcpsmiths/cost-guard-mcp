@@ -52,35 +52,64 @@ _PYDANTIC_NATIVE_CELL_TYPES = (
 )
 
 
+def _json_safe_text(text: str) -> str:
+    """Return `text` as UTF-8-encodable text, never raising.
+
+    A Python str is not automatically UTF-8: surrogateescape decoding of non-UTF-8 source
+    bytes (which BigQuery can hand back in a STRING cell) leaves lone surrogates such as
+    \\udcff in it, and pydantic_core serialises str through a strict UTF-8 encoder, so one
+    such cell raised PydanticSerializationError inside the SDK's result conversion - after
+    the billed execution and after the success record. backslashreplace turns the surrogate
+    into its six visible characters (\\udcff): honest about what came back, lossless for
+    forensics, and never raising. The fast path is one encode of the all-valid common case.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+    return text
+
+
 def _json_safe_value(value: object) -> object:
     """Normalise one connector-native cell so the mcp SDK can always serialise it.
 
     Runs AFTER the billed query has executed, so it must never raise and must cover every
     engine's native row values: bytes-like cells (BigQuery BYTES, Snowflake/Databricks
     BINARY) become base64 text instead of tripping pydantic's default utf8 bytes mode;
-    NaN/Inf become explicit strings instead of JSON null; driver-specific types pydantic
-    does not know (BigQuery INTERVAL -> dateutil relativedelta) are stringified instead of
-    raising "Unable to serialize unknown type". Returns new objects, never mutates.
+    NaN/Inf become explicit strings instead of JSON null; str cells (and every text this
+    function produces from a non-str value) pass through _json_safe_text so a lone surrogate
+    cannot trip pydantic's strict UTF-8 str encoder; driver-specific types pydantic does not
+    know (BigQuery INTERVAL -> dateutil relativedelta) are stringified instead of raising
+    "Unable to serialize unknown type". Returns new objects, never mutates.
     """
-    if value is None or isinstance(value, bool | int | str):
+    if value is None or isinstance(value, bool | int):
         return value
+    if isinstance(value, str):
+        return _json_safe_text(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else str(value)
     if isinstance(value, bytes | bytearray | memoryview):
         return base64.b64encode(bytes(value)).decode("ascii")
     if isinstance(value, dict):
-        return {str(_json_safe_value(key)): _json_safe_value(item) for key, item in value.items()}
+        return {
+            _json_safe_text(str(_json_safe_value(key))): _json_safe_value(item)
+            for key, item in value.items()
+        }
     if isinstance(value, list | tuple | set | frozenset):
         return [_json_safe_value(item) for item in value]
     if isinstance(value, _PYDANTIC_NATIVE_CELL_TYPES):
         return value
-    return str(value)
+    return _json_safe_text(str(value))
 
 
 def _json_safe_rows(rows: list[dict]) -> list[dict]:
     """The one choke point for all three engines and both return paths (ok and
-    row_cap_exceeded): every value placed in BoundedQueryResult.rows is JSON-serialisable."""
-    return [{str(key): _json_safe_value(item) for key, item in row.items()} for row in rows]
+    row_cap_exceeded): every value placed in BoundedQueryResult.rows - column names
+    included - is JSON-serialisable and UTF-8-encodable."""
+    return [
+        {_json_safe_text(str(key)): _json_safe_value(item) for key, item in row.items()}
+        for row in rows
+    ]
 
 
 def run_query_bounded(
