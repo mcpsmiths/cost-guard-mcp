@@ -324,24 +324,32 @@ def _rate_for(
             f"can price — {_FAIL_CLOSED_HINT}"
         )
         return None, warehouse_size, [caveat]
+    # cluster_size is API-returned text: it reaches a caveat only through present_remote_text
+    # (bounded, repr-quoted, one line - DECISIONS.md #18), never as repr(...)[:N]. PR #86
+    # verification (probe-4 p5e) showed the slice-after-repr form dropping the closing quote
+    # on a long value, which erased the visible boundary between the warehouse's text and this
+    # server's own words. The size LABEL handed back for the runtime caveat is the one value
+    # that may stay raw: it is only ever a cluster_size dbus_per_hour accepted, i.e. a rate-
+    # table key modulo case.
+    presented_cluster_size = present_remote_text(facts.cluster_size)
     try:
         observed_rate = dbus_per_hour(facts.cluster_size)
     except ValueError:
         caveat = (
-            f"The configured SQL warehouse reports cluster size {repr(facts.cluster_size)[:32]}, "
+            f"The configured SQL warehouse reports cluster size {presented_cluster_size}, "
             f"which this project's DBU rate table does not model — {_FAIL_CLOSED_HINT}"
         )
         return None, warehouse_size, [caveat]
     if observed_rate > asserted_rate:
         caveat = (
             f"warehouse_size {warehouse_size!r} understated the configured Serverless SQL "
-            f"warehouse ({facts.cluster_size}) — priced at the observed size; the warehouse_size "
-            "argument can only raise the estimate, never lower it."
+            f"warehouse ({presented_cluster_size}) — priced at the observed size; the "
+            "warehouse_size argument can only raise the estimate, never lower it."
         )
         return observed_rate, facts.cluster_size, [caveat]
     caveat = (
         f"Priced at the caller-asserted {warehouse_size} size, which is at least the observed "
-        f"Serverless SQL warehouse size ({facts.cluster_size})."
+        f"Serverless SQL warehouse size ({presented_cluster_size})."
     )
     return asserted_rate, warehouse_size, [caveat]
 

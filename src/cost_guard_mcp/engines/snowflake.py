@@ -370,6 +370,15 @@ def _text_or_none(value: object, *, upper: bool = False) -> str | None:
     return text.upper() if upper else text
 
 
+def _present_observed(value: str | None) -> str:
+    """A warehouse-returned column value on its way into a caveat: present_remote_text for
+    text (bounded, repr-quoted, one line - DECISIONS.md #18), the bare word None for a NULL
+    column so it does not read as the text 'None'. Never repr(...)[:N]: slicing after repr()
+    drops the closing quote on long values and with it the visible boundary between what the
+    warehouse said and what this server says (PR #86 verification, probe-4 p5d/p5e)."""
+    return "None" if value is None else present_remote_text(value)
+
+
 def _cloud_provider_from_region(region_row: object) -> str | None:
     """CURRENT_REGION() returns "<CLOUD>_<REGION>" (e.g. "AWS_US_WEST_2") for most accounts, or
     "<region-group>.<CLOUD>_<REGION>" (e.g. "PUBLIC.AWS_US_WEST_2") for accounts whose
@@ -523,16 +532,19 @@ def _rate_for(
             f"warehouse's size and type were not observed — {_FAIL_CLOSED_HINT}"
         )
         return None, asserted_size_key, [caveat]
+    # facts.name is the pinned name - it passed _WAREHOUSE_NAME_RE and the exact-match rule in
+    # _lookup_warehouse_facts - so it is safe raw; type/size are SHOW text and are presented.
     if facts.warehouse_type != _STANDARD_WAREHOUSE_TYPE:
         caveat = (
-            f"Warehouse {facts.name} is of type {facts.warehouse_type!r}, which this project's "
-            f"rate table does not model (only STANDARD warehouses are priced) — {_FAIL_CLOSED_HINT}"
+            f"Warehouse {facts.name} is of type {_present_observed(facts.warehouse_type)}, which "
+            "this project's rate table does not model (only STANDARD warehouses are priced) — "
+            f"{_FAIL_CLOSED_HINT}"
         )
         return None, asserted_size_key, [caveat]
     if facts.size_key is None:
         caveat = (
-            f"Warehouse {facts.name} reports size {repr(facts.size_text)[:32]}, which this "
-            f"project's rate table does not recognise — {_FAIL_CLOSED_HINT}"
+            f"Warehouse {facts.name} reports size {_present_observed(facts.size_text)}, which "
+            f"this project's rate table does not recognise — {_FAIL_CLOSED_HINT}"
         )
         return None, asserted_size_key, [caveat]
 
@@ -541,8 +553,8 @@ def _rate_for(
     if size_key != asserted_size_key:
         caveats.append(
             f"warehouse_size {asserted_size_key!r} understated the pinned warehouse {facts.name} "
-            f"({facts.size_text}, {size_key}) — priced at the observed size; the warehouse_size "
-            "argument can only raise the estimate, never lower it."
+            f"({_present_observed(facts.size_text)}, {size_key}) — priced at the observed size; "
+            "the warehouse_size argument can only raise the estimate, never lower it."
         )
     if facts.generation is not None and facts.cloud_provider is not None:
         rate = credits_per_hour(
@@ -611,11 +623,13 @@ def _runtime_for(
             "query's actual expected runtime."
         )
         return scale_runtime_hours(bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS), [caveat]
+    # The plan is warehouse-returned JSON, so the unusable value is presented like any other
+    # remote text rather than sliced after repr().
+    shown = _present_observed(None if bytes_assigned is None else str(bytes_assigned))
     caveat = (
-        f"EXPLAIN returned no usable bytesAssigned figure ({repr(bytes_assigned)[:32]}) — the "
-        "byte estimate is unavailable, not zero, and without a historical runtime signal no "
-        "dollar estimate is produced; run_query_bounded refuses a byte or dollar cap for this "
-        "query."
+        f"EXPLAIN returned no usable bytesAssigned figure ({shown}) — the byte estimate is "
+        "unavailable, not zero, and without a historical runtime signal no dollar estimate is "
+        "produced; run_query_bounded refuses a byte or dollar cap for this query."
     )
     return None, [caveat]
 
