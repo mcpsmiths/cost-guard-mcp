@@ -6,10 +6,12 @@ import pytest
 
 from cost_guard_mcp.engines.snowflake import (
     _ASSUMED_RUNTIME_HOURS,
+    _FAIL_CLOSED_HINT,
     _GENERATION_LOOKUP_TIMEOUT_SECONDS,
     _HISTORY_LOOKUP_TIMEOUT_SECONDS,
     _LOGIN_TIMEOUT_SECONDS,
     _MAX_EXECUTION_WAIT_SECONDS,
+    _MAX_UNRESOLVED_CANDIDATES_PRESENTED,
     _NETWORK_TIMEOUT_SECONDS,
     _SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS,
     _SINGLE_STATEMENT_COUNT,
@@ -18,7 +20,9 @@ from cost_guard_mcp.engines.snowflake import (
     _lookup_historical_runtime,
     _lookup_warehouse_facts,
     _normalize_sql_for_matching,
+    _rate_for,
     _size_to_pricing_key,
+    _UnresolvedWarehouse,
     _WarehouseFacts,
     check_credentials,
     execute_bounded,
@@ -796,28 +800,123 @@ def test_lookup_warehouse_facts_returns_none_when_current_warehouse_fails_the_al
     assert not any(stmt.startswith("SHOW WAREHOUSES") for stmt in cursor.executed)
 
 
-def test_lookup_warehouse_facts_matches_the_row_name_case_insensitively(snowflake_fakes):
-    # Amendment A3: unquoted Snowflake identifiers are stored upper-cased and the allowlist
-    # forbids quoted names, so a caller passing 'compute_wh' must still bind to the
-    # 'COMPUTE_WH' row - otherwise the model controls whether the observed size applies.
+def test_lookup_warehouse_facts_upper_cases_the_caller_argument_to_the_stored_name(
+    snowflake_fakes,
+):
+    # Was "matches the row name case-insensitively" (amendment A3). PR #86 runtime verification
+    # (probe-3 p45) showed that case-insensitive matching let a quoted lower-case sibling make
+    # the lookup ambiguous and fall OPEN to the caller-asserted rate, so the match is now exact
+    # against the upper-cased caller argument. The property this test guards still holds: a
+    # caller passing 'compute_wh' (unquoted, so USE WAREHOUSE resolves it to COMPUTE_WH) must
+    # bind to the 'COMPUTE_WH' row - otherwise the model controls whether the observed size
+    # applies.
     cursor = snowflake_fakes.cursor(
         show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large")],
     )
 
     facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "compute_wh")
 
-    assert facts is not None
+    assert isinstance(facts, _WarehouseFacts)
     assert facts.name == "COMPUTE_WH"
     assert facts.size_key == "X4LARGE"
     assert cursor.executed[0] == "SHOW WAREHOUSES LIKE 'compute_wh'"
 
 
-def test_lookup_warehouse_facts_returns_none_when_names_genuinely_differ(snowflake_fakes):
-    # Negative control for the case-insensitive match: LIKE's '_' wildcard makes Snowflake
-    # return MYAWH for the pattern MY_WH; it is a different warehouse and must not bind.
+def test_lookup_warehouse_facts_uses_the_exact_row_when_a_quoted_lower_case_sibling_exists(
+    snowflake_fakes,
+):
+    # PR #86 runtime verification, probe-3 p45 (evidence/probe-3/p45-sf-duplicate-case-names):
+    # SHOW WAREHOUSES LIKE 'COMPUTE_WH' returned the 6X-Large COMPUTE_WH and a quoted,
+    # lower-case "compute_wh" (X-Small). Case-insensitive matching saw two rows, gave up
+    # (None) and the estimate fell open to the caller-asserted XSMALL rate while the query ran
+    # on the 6X-Large under a 0.05 USD cap. The pinned warehouse is the upper-cased one (USE
+    # WAREHOUSE on an unquoted identifier resolves there), so that row - and only that row -
+    # is the observation; the lower-case sibling is a different warehouse.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[
+            snowflake_fakes.show_row("COMPUTE_WH", "6X-Large"),
+            snowflake_fakes.show_row("compute_wh", "X-Small"),
+        ]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert isinstance(facts, _WarehouseFacts)
+    assert facts.name == "COMPUTE_WH"
+    assert facts.size_key == "X6LARGE"
+
+
+def test_lookup_warehouse_facts_fails_closed_when_only_a_differently_cased_row_matches(
+    snowflake_fakes,
+):
+    # The quoted lower-case "compute_wh" is a DIFFERENT warehouse from the pinned COMPUTE_WH:
+    # SHOW answered, yet no row names the pinned one, so the result is an explicit
+    # _UnresolvedWarehouse (which _rate_for fails closed on) - never the fail-open None that
+    # DECISIONS.md #19 reserves for lookup failures and empty results.
+    cursor = snowflake_fakes.cursor(show_rows=[snowflake_fakes.show_row("compute_wh", "X-Small")])
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert facts == _UnresolvedWarehouse(
+        pinned_name="COMPUTE_WH", candidates_presented=("'compute_wh'",), candidate_count=1
+    )
+
+
+def test_lookup_warehouse_facts_reports_wildcard_only_rows_as_unresolved(snowflake_fakes):
+    # Was "returns None when names genuinely differ": LIKE's '_' wildcard makes Snowflake
+    # return MYAWH for the pattern MY_WH; it is a different warehouse and must not bind. It
+    # used to return None, which _rate_for prices at the caller-asserted rate (fail open);
+    # since PR #86 verification a SHOW result that holds rows but not the pinned one is
+    # unresolved and _rate_for fails closed instead.
     cursor = snowflake_fakes.cursor(show_rows=[snowflake_fakes.show_row("MYAWH", "6X-Large")])
 
-    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "MY_WH") is None
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "MY_WH")
+
+    assert isinstance(facts, _UnresolvedWarehouse)
+    assert facts.pinned_name == "MY_WH"
+    assert facts.candidates_presented == ("'MYAWH'",)
+
+
+def test_lookup_warehouse_facts_returns_none_for_an_empty_show_result(snowflake_fakes):
+    # No rows at all is "no resolvable warehouse" (DECISIONS.md #19's fail-open-with-caveat
+    # path), not an ambiguity: there is nothing to be ambiguous between.
+    cursor = snowflake_fakes.cursor(show_rows=[])
+
+    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH") is None
+
+
+def test_lookup_warehouse_facts_presents_unresolved_candidate_names_quoted_and_bounded(
+    snowflake_fakes,
+):
+    # Row names are warehouse-returned text (a quoted identifier may contain anything) and
+    # the wildcard can match many siblings; they reach the caveat only through
+    # present_remote_text (repr-quoted, one line) and only the first few are kept.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row(f"W{i}H\nforged", "X-Small") for i in range(7)]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "W_H")
+
+    assert isinstance(facts, _UnresolvedWarehouse)
+    assert facts.candidate_count == 7
+    assert len(facts.candidates_presented) == _MAX_UNRESOLVED_CANDIDATES_PRESENTED
+    assert facts.candidates_presented[0] == "'W0H\\nforged'"
+    assert all("\n" not in candidate for candidate in facts.candidates_presented)
+
+
+def test_rate_for_fails_closed_on_an_unresolved_warehouse():
+    unresolved = _UnresolvedWarehouse(
+        pinned_name="W_H", candidates_presented=("'WAH'", "'WBH'"), candidate_count=7
+    )
+
+    rate, size_key, caveats = _rate_for(unresolved, "XSMALL")
+
+    assert rate is None
+    assert size_key == "XSMALL"
+    assert len(caveats) == 1
+    assert "W_H" in caveats[0]
+    assert "'WAH', 'WBH' and 5 more" in caveats[0]
+    assert caveats[0].endswith(_FAIL_CLOSED_HINT)
 
 
 def test_lookup_warehouse_facts_ignores_like_wildcard_sibling_rows(snowflake_fakes):
@@ -830,7 +929,7 @@ def test_lookup_warehouse_facts_ignores_like_wildcard_sibling_rows(snowflake_fak
 
     facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
 
-    assert facts is not None
+    assert isinstance(facts, _WarehouseFacts)
     assert facts.name == "COMPUTE_WH"
     assert facts.size_key == "SMALL"
 
@@ -1087,6 +1186,45 @@ def test_explain_estimate_applies_the_observed_size_for_a_lowercase_warehouse_ar
         172.8 * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6
     )
     assert estimate.estimated_cost_usd > 0.10
+
+
+def test_explain_estimate_prices_the_exact_row_when_a_quoted_lower_case_sibling_exists(
+    snowflake_fakes,
+):
+    # probe-3 p45 end to end: both rows come back for LIKE 'COMPUTE_WH'; the estimate is
+    # priced at the 6X-Large COMPUTE_WH the query runs on (512 credits/h), not left at the
+    # caller-asserted XSMALL rate that let a 0.05 USD cap report status ok.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[
+            snowflake_fakes.show_row("COMPUTE_WH", "6X-Large", generation="1"),
+            snowflake_fakes.show_row("compute_wh", "X-Small", generation="1"),
+        ],
+    )
+
+    expected = round(512.0 * usd_per_credit("standard") * _ASSUMED_RUNTIME_HOURS, 6)
+    assert estimate.estimated_cost_usd == expected
+    assert any("understated" in c and "6X-Large" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_fails_closed_when_no_row_names_the_pinned_warehouse(snowflake_fakes):
+    # Only the quoted lower-case sibling comes back: SHOW answered, the pinned COMPUTE_WH is
+    # not among the rows, so there is no observation to price at and the dollar cap must
+    # refuse exactly as it does for an unmodelled warehouse type (DECISIONS.md #5) - not fall
+    # open to the caller-asserted rate as a failed lookup does.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("compute_wh", "X-Small")],
+    )
+
+    assert estimate.estimated_cost_usd is None
+    assert estimate.estimated_bytes == 1000
+    ambiguity = [c for c in estimate.caveats if "could not be resolved" in c]
+    assert len(ambiguity) == 1
+    assert "COMPUTE_WH" in ambiguity[0]
+    assert "'compute_wh'" in ambiguity[0]
+    assert ambiguity[0].endswith(_FAIL_CLOSED_HINT)
+    assert not any("could not be determined" in c for c in estimate.caveats)
 
 
 def test_explain_estimate_returns_no_dollar_figure_for_a_non_standard_warehouse_type(

@@ -299,6 +299,35 @@ class _WarehouseFacts:
     auto_resume: str | None
 
 
+@dataclass(frozen=True)
+class _UnresolvedWarehouse:
+    """SHOW WAREHOUSES answered, but its rows did not contain exactly one named `pinned_name`
+    (the upper-cased, allowlisted name the query is pinned to) - so the warehouse the query
+    will run on was not observed, and nothing else in the result may stand in for it.
+
+    Distinct from the None a failed lookup returns on purpose: None takes DECISIONS.md #19's
+    fail-open-with-caveat path (roles that cannot run SHOW WAREHOUSES keep working at the
+    caller-asserted rate), whereas this makes _rate_for fail closed (DECISIONS.md #5). PR #86
+    runtime verification (probe-3 p45) showed why the two must not share a value: a quoted
+    lower-case "compute_wh" next to COMPUTE_WH made the old case-insensitive match see two
+    rows, return None, and price a 6X-Large query at the caller-asserted X-Small rate.
+
+    `candidates_presented` holds the first _MAX_UNRESOLVED_CANDIDATES_PRESENTED row names,
+    each already passed through present_remote_text (they are warehouse-returned text);
+    `candidate_count` is how many rows there were in total.
+    """
+
+    pinned_name: str
+    candidates_presented: tuple[str, ...]
+    candidate_count: int
+
+
+# How many of the SHOW WAREHOUSES row names an _UnresolvedWarehouse carries into its caveat.
+# LIKE's '_' wildcard can match many sibling warehouses and each presented name is itself
+# bounded only at present_remote_text's 1,000 characters, so the count is capped here too.
+_MAX_UNRESOLVED_CANDIDATES_PRESENTED = 5
+
+
 _STANDARD_WAREHOUSE_TYPE = "STANDARD"
 
 # SHOW WAREHOUSES reports `size` as display text ('X-Small', '4X-Large'); the pricing table is
@@ -357,15 +386,15 @@ def _cloud_provider_from_region(region_row: object) -> str | None:
 
 def _lookup_warehouse_facts(
     conn: "snowflake.connector.SnowflakeConnection", warehouse: str | None
-) -> _WarehouseFacts | None:
+) -> _WarehouseFacts | _UnresolvedWarehouse | None:
     """Best-effort, non-privileged observation of the warehouse the query is pinned to - its
     size, type, generation and state from its SHOW WAREHOUSES row, plus the account's cloud
     provider from CURRENT_REGION() - used by explain_estimate() to bind the cap-gate rate to
     the warehouse that will actually execute instead of to the caller's warehouse_size string
-    (DECISIONS.md #19). Mirrors _lookup_historical_runtime's contract exactly: any failure at
-    all - permission, network, malformed response shape, timeout, no resolvable warehouse -
-    returns None, never raises; explain_estimate() then degrades to the caller-asserted/Gen1
-    rate plus an explicit caveat.
+    (DECISIONS.md #19). Mirrors _lookup_historical_runtime's contract for failures: a lookup
+    that fails - permission, network, malformed response shape, timeout - or that finds no
+    warehouse at all (an empty SHOW result, no CURRENT_WAREHOUSE()) returns None, never raises;
+    explain_estimate() then degrades to the caller-asserted/Gen1 rate plus an explicit caveat.
 
     When `warehouse` is None the session's active warehouse is resolved with SELECT
     CURRENT_WAREHOUSE() first - it is what EXPLAIN just ran against and what execute_bounded
@@ -373,13 +402,20 @@ def _lookup_warehouse_facts(
     exactly like a caller-supplied one, so it passes the same allowlist (DECISIONS.md #6).
 
     The row is read straight from the SHOW result via fetchall()/cursor.description - no
-    RESULT_SCAN(LAST_QUERY_ID(-1)) SELECT (one statement fewer, same data). LIKE treats '_' as
-    a single-character wildcard, so the pattern can return sibling warehouses (MYAWH for
-    MY_WH); only the row whose name matches case-insensitively is used - unquoted Snowflake
-    identifiers are stored upper-cased and _WAREHOUSE_NAME_RE forbids quoted ones, so
-    'compute_wh' and 'COMPUTE_WH' are the same warehouse. `generation` is a real SHOW
-    WAREHOUSES column (behavior-change bundle 2025_07/bcr-2110, "currently either 1 or 2");
-    the `size`/`type` text shapes are pinned by tests/integration/test_snowflake_live.py.
+    RESULT_SCAN(LAST_QUERY_ID(-1)) SELECT (one statement fewer, same data). SHOW's LIKE is
+    case-insensitive and treats '_' as a single-character wildcard, so the result can hold
+    sibling warehouses: MYAWH for MY_WH, or a quoted lower-case "compute_wh" next to
+    COMPUTE_WH. Exactly one row may bind - the one whose name EQUALS the upper-cased pinned
+    name. USE WAREHOUSE on an unquoted identifier (the only kind _WAREHOUSE_NAME_RE admits)
+    resolves to the upper-cased stored name, so that row is the warehouse the query runs on,
+    and a differently-cased quoted sibling is a DIFFERENT warehouse, not another spelling of
+    the same one. When SHOW answered with rows but no single row carries that name the result
+    is an _UnresolvedWarehouse, never None, so _rate_for fails closed: PR #86 runtime
+    verification (probe-3 p45) drove the old case-insensitive match with COMPUTE_WH (6X-Large)
+    plus "compute_wh" (X-Small), got two matches -> None, and the 6X-Large query ran under a
+    cap priced at X-Small. `generation` is a real SHOW WAREHOUSES column (behavior-change
+    bundle 2025_07/bcr-2110, "currently either 1 or 2"); the `size`/`type` text shapes are
+    pinned by tests/integration/test_snowflake_live.py.
 
     SHOW WAREHOUSES, CURRENT_WAREHOUSE() and CURRENT_REGION() are all ordinary, non-privileged
     SQL - no ACCOUNTADMIN or elevated grant is required (AGENTS.md / DECISIONS.md #7).
@@ -408,13 +444,19 @@ def _lookup_warehouse_facts(
     except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
         return None
 
-    matching = [
-        row
-        for row in rows
-        if isinstance(row.get("name"), str) and row["name"].upper() == validated_warehouse.upper()
-    ]
-    if len(matching) != 1:
+    if not rows:
         return None
+    pinned_name = validated_warehouse.upper()
+    matching = [row for row in rows if row.get("name") == pinned_name]
+    if len(matching) != 1:
+        return _UnresolvedWarehouse(
+            pinned_name=pinned_name,
+            candidates_presented=tuple(
+                present_remote_text(str(row.get("name")))
+                for row in rows[:_MAX_UNRESOLVED_CANDIDATES_PRESENTED]
+            ),
+            candidate_count=len(rows),
+        )
     row = matching[0]
     generation = str(row.get("generation", "")).strip()
     return _WarehouseFacts(
@@ -444,13 +486,15 @@ def _is_valid_byte_count(value: object) -> TypeGuard[int]:
 
 
 def _rate_for(
-    facts: _WarehouseFacts | None, asserted_size_key: str
+    facts: _WarehouseFacts | _UnresolvedWarehouse | None, asserted_size_key: str
 ) -> tuple[float | None, str, list[str]]:
     """Pick the credit rate the cap gate prices at: (rate, effective size key, caveats).
 
     The rate is never below the observed warehouse - the caller's warehouse_size may raise the
     size, never lower it. `rate` is None when the observed warehouse is of a type or size the
-    rate table does not model; explain_estimate then returns estimated_cost_usd=None so
+    rate table does not model, and likewise when SHOW WAREHOUSES answered but no single row
+    was the pinned warehouse (_UnresolvedWarehouse) - there is nothing to price at, so the cap
+    gate must not be handed a figure; explain_estimate then returns estimated_cost_usd=None so
     run_query_bounded refuses a dollar cap (DECISIONS.md #5: an unenforceable cap must never
     look enforced). A failed lookup (facts is None) keeps the caller-asserted/default size at
     the Gen1 rate with an explicit caveat, so roles that cannot run SHOW WAREHOUSES keep
@@ -464,6 +508,21 @@ def _rate_for(
             "higher than this estimate if the warehouse is really Gen2 or larger."
         )
         return credits_per_hour(asserted_size_key), asserted_size_key, [caveat]
+    if isinstance(facts, _UnresolvedWarehouse):
+        # pinned_name passed _WAREHOUSE_NAME_RE and is upper-cased, so it is safe to echo raw;
+        # the candidate names are warehouse-returned text and arrive already presented.
+        shown = ", ".join(facts.candidates_presented)
+        hidden = facts.candidate_count - len(facts.candidates_presented)
+        if hidden > 0:
+            shown = f"{shown} and {hidden} more"
+        caveat = (
+            f"Warehouse {facts.pinned_name} could not be resolved to exactly one SHOW WAREHOUSES "
+            f"row: the {facts.candidate_count} row(s) returned ({shown}) do not contain exactly "
+            f"one named {facts.pinned_name} (unquoted identifiers are stored upper-cased, so a "
+            "differently-cased quoted warehouse is a different warehouse), and the pinned "
+            f"warehouse's size and type were not observed — {_FAIL_CLOSED_HINT}"
+        )
+        return None, asserted_size_key, [caveat]
     if facts.warehouse_type != _STANDARD_WAREHOUSE_TYPE:
         caveat = (
             f"Warehouse {facts.name} is of type {facts.warehouse_type!r}, which this project's "
