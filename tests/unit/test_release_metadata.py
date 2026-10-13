@@ -633,3 +633,18 @@ def test_multi_statement_opt_out_documents_its_snowflake_and_max_rows_limits():
     )
     assert "MULTI_STATEMENT_COUNT=1" in opt_out_entry
     assert "max_rows" in opt_out_entry
+
+
+def test_readme_observability_names_the_sdk_stderr_records_this_project_does_not_shape():
+    # Every stderr capture of a tool error in the PR #86 verification carries a second line
+    # this project never wrote: the mcp SDK's own `Tool 'estimate_query_cost' failed: '...'`
+    # (server.py: logger.info("Tool %r failed: %r", ...)), and a pydantic argument rejection
+    # logs `Tool 'run_query_bounded' rejected arguments: ['sql']` with no `tool=<name>
+    # outcome=` record at all because the tool body never ran. README listed only this
+    # project's records; an operator parsing stderr needs to know which lines to key on.
+    readme = README_PATH.read_text(encoding="utf-8")
+    observability = readme.split("## Observability", 1)[1].split("## Known limitations", 1)[0]
+    assert "Tool '<name>' failed:" in observability
+    assert "rejected arguments" in observability
+    assert "key on" in observability
+    assert "tool=<name> outcome=" in observability
