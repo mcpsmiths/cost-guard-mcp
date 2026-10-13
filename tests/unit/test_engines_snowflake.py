@@ -1376,6 +1376,28 @@ def test_explain_estimate_prices_the_exact_row_when_a_quoted_lower_case_sibling_
     assert any("understated" in c and "6X-Large" in c for c in estimate.caveats)
 
 
+def test_explain_estimate_drops_pricing_and_runtime_caveats_when_no_rate_is_produced(
+    snowflake_fakes,
+):
+    # probe p5d: a Snowpark-optimized warehouse yields estimated_cost_usd None (fail-closed),
+    # yet the caveats still said 'Cost assumes a baseline 30-second runtime on a XSMALL
+    # warehouse' - describing a priced outcome that was not returned (the Snowflake twin of
+    # the Databricks caveat fix). Only the Cortex note and the fail-closed type caveat remain.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[
+            snowflake_fakes.show_row(
+                "COMPUTE_WH", "6X-Large", generation="1", warehouse_type="SNOWPARK-OPTIMIZED"
+            )
+        ],
+    )
+
+    assert estimate.estimated_cost_usd is None
+    assert len(estimate.caveats) == 2
+    assert estimate.caveats[1].endswith(_FAIL_CLOSED_HINT)
+    assert not any("runtime" in c.lower() or "historical" in c.lower() for c in estimate.caveats)
+
+
 def test_explain_estimate_prices_the_session_warehouse_row_not_its_upper_cased_sibling(
     snowflake_fakes,
 ):

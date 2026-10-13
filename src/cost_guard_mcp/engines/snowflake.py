@@ -733,7 +733,15 @@ def explain_estimate(
             accuracy_tier=AccuracyTier.UPPER_BOUND,
             estimated_bytes=bytes_assigned if _is_valid_byte_count(bytes_assigned) else None,
             estimated_cost_usd=estimated_cost_usd,
-            caveats=[_CORTEX_CAVEAT, *rate_caveats, *price_caveats, *runtime_caveats],
+            caveats=[
+                _CORTEX_CAVEAT,
+                *rate_caveats,
+                # No rate means no dollar figure (fail-closed, DECISIONS.md #5): pricing and
+                # runtime caveats would describe an outcome that is not returned ('Cost
+                # assumes a baseline 30-second runtime ...' next to estimated_cost_usd null -
+                # PR #86 runtime verification, probe p5d).
+                *([] if rate is None else [*price_caveats, *runtime_caveats]),
+            ],
         )
     finally:
         # Best-effort close, mirroring the cancel-is-best-effort discipline in execute_bounded

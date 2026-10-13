@@ -96,6 +96,28 @@ def test_dry_run_on_demand_precise(
 
 @patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
 @patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_presents_a_service_returned_accuracy_string_bounded_and_quoted(
+    mock_bq_module, _mock_capacity
+):
+    # totalBytesProcessedAccuracy is service-returned text; a control character in it used to
+    # reach the model raw inside the caveat (PR #86 round-2 review of group B).
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(
+        total_bytes_processed=1024, accuracy="LOWER\n\x1b[31mBOUND"
+    )
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT * FROM t")
+
+    [caveat] = [c for c in estimate.caveats if "own accuracy" in c]
+    assert "\n" not in caveat and "\x1b" not in caveat
+    assert "'LOWER\\n\\x1b[31mBOUND'" in caveat
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
 def test_dry_run_downgrades_accuracy_when_bigquery_reports_non_precise(
     mock_bq_module, _mock_capacity
 ):

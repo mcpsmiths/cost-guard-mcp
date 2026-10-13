@@ -118,7 +118,10 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
     caveats: list[str] = []
     if tier != AccuracyTier.PRECISE:
         caveats.append(
-            f"BigQuery reported this estimate's own accuracy as '{raw_accuracy}', not "
+            # Service-returned text: bounded and repr-quoted like every other remote string
+            # that reaches the model (PR #86 verification, group-B review).
+            f"BigQuery reported this estimate's own accuracy as "
+            f"{present_remote_text(str(raw_accuracy))}, not "
             "PRECISE — treating it conservatively as UPPER_BOUND."
         )
 
@@ -389,7 +392,10 @@ def check_credentials(project: str | None = None) -> CredentialCheckResult:
         engine="bigquery",
         ok=True,
         detail=(
-            f"Authenticated to project {present_remote_text(str(client.project))} "
-            f"(BigQuery service account: {present_remote_text(str(service_account_email))})."
+            # Same redact -> present chain as the failure path two lines above, so the two
+            # branches cannot drift apart.
+            f"Authenticated to project {present_remote_text(redact_secrets(str(client.project)))} "
+            "(BigQuery service account: "
+            f"{present_remote_text(redact_secrets(str(service_account_email)))})."
         ),
     )
