@@ -25,6 +25,8 @@ from cost_guard_mcp.engines.snowflake import (
     _rate_for,
     _size_to_pricing_key,
     _UnresolvedWarehouse,
+    _UnsafeWarehouseName,
+    _validate_warehouse,
     _WarehouseFacts,
     check_credentials,
     execute_bounded,
@@ -791,14 +793,19 @@ def test_lookup_warehouse_facts_returns_none_when_session_has_no_current_warehou
     assert not any(stmt.startswith("SHOW WAREHOUSES") for stmt in cursor.executed)
 
 
-def test_lookup_warehouse_facts_returns_none_when_current_warehouse_fails_the_allowlist(
+def test_lookup_warehouse_facts_fails_closed_when_current_warehouse_fails_the_allowlist(
     snowflake_fakes,
 ):
     # The resolved name is interpolated into SHOW WAREHOUSES LIKE '<name>' exactly like a
     # caller-supplied one, so it gets the same DECISIONS.md #6 validation first.
     cursor = snowflake_fakes.cursor(show_rows=[], current_warehouse="WH'; DROP WAREHOUSE X")
 
-    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), None) is None
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), None)
+
+    # Fail CLOSED (PR #86 delta verification, probe a03): a stored name outside the allowlist
+    # is not a failed lookup, so it must not take DECISIONS.md #19's caller-asserted fallback.
+    assert isinstance(facts, _UnsafeWarehouseName)
+    assert "DROP WAREHOUSE" in facts.name_presented
     assert not any(stmt.startswith("SHOW WAREHOUSES") for stmt in cursor.executed)
 
 
@@ -1218,10 +1225,13 @@ def test_lookup_warehouse_facts_treats_non_string_columns_as_unknown(snowflake_f
     assert facts.cloud_provider is None
 
 
-def test_lookup_warehouse_facts_returns_none_for_invalid_warehouse_name():
+def test_lookup_warehouse_facts_fails_closed_for_an_invalid_warehouse_name():
     mock_conn = MagicMock()
 
-    assert _lookup_warehouse_facts(mock_conn, "WH1; malicious") is None
+    facts = _lookup_warehouse_facts(mock_conn, "WH1; malicious")
+
+    assert isinstance(facts, _UnsafeWarehouseName)
+    assert "malicious" in facts.name_presented
     mock_conn.cursor.assert_not_called()
 
 
@@ -1396,6 +1406,45 @@ def test_explain_estimate_drops_pricing_and_runtime_caveats_when_no_rate_is_prod
     assert len(estimate.caveats) == 2
     assert estimate.caveats[1].endswith(_FAIL_CLOSED_HINT)
     assert not any("runtime" in c.lower() or "historical" in c.lower() for c in estimate.caveats)
+
+
+def test_explain_estimate_fails_closed_when_the_session_warehouse_name_is_outside_the_allowlist(
+    snowflake_fakes,
+):
+    # PR #86 delta verification, probe a03: CURRENT_WAREHOUSE() returned the legal quoted
+    # identifier "big-wh"; _validate_warehouse raised inside the lookup's try, the lookup fell
+    # to the fail-open None and a 6X-Large ran under a $0.05 cap priced as X-Small.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        warehouse=None,
+        current_warehouse="big-wh",
+        show_rows=[snowflake_fakes.show_row("big-wh", "6X-Large", generation="1")],
+    )
+
+    assert estimate.estimated_cost_usd is None
+    assert any("'big-wh'" in c and c.endswith(_FAIL_CLOSED_HINT) for c in estimate.caveats)
+    assert not any("could not be determined" in c for c in estimate.caveats)
+
+
+def test_rate_for_fails_closed_on_an_unsafe_warehouse_name():
+    rate, size_key, caveats = _rate_for(
+        _UnsafeWarehouseName(name_presented=present_remote_text("big-wh")), "XSMALL"
+    )
+
+    assert rate is None
+    assert size_key == "XSMALL"
+    assert len(caveats) == 1 and "'big-wh'" in caveats[0]
+    assert caveats[0].endswith(_FAIL_CLOSED_HINT)
+
+
+def test_validate_warehouse_bounds_the_name_length_and_the_echo():
+    # Snowflake identifiers are at most 255 characters; a 3,000-char "valid" name produced a
+    # 6,490-char caveat (PR #86 delta verification, probe a25).
+    name = "W" * 300
+    with pytest.raises(ValueError, match="Invalid warehouse name") as excinfo:
+        _validate_warehouse(name)
+    assert "255" in str(excinfo.value)
+    assert _validate_warehouse("W" * 255) == "W" * 255
 
 
 def test_explain_estimate_prices_the_session_warehouse_row_not_its_upper_cased_sibling(
@@ -1945,6 +1994,20 @@ def test_check_credentials_presents_session_identity_values_on_one_line(mock_con
     assert "\\n" in result.detail and "\\x1b" in result.detail and "\\u2028" in result.detail
     # The success path stays log-free: nothing for a forged record to land in.
     assert not [record for record in caplog.records if record.name.startswith("cost_guard_mcp")]
+
+
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_check_credentials_redacts_secrets_in_identity_values_before_presenting(mock_connect):
+    # PR #86 delta verification (be81124 vs 8a16733 drift): BigQuery ran redact_secrets on its
+    # success detail, Snowflake and Databricks only presented - the same chain applies to all.
+    role = "COST_GUARD_READER password=hunter2"
+    result = _check_credentials_with_context_row(
+        mock_connect, (role, '{"roles":"","value":""}', "COMPUTE_WH", "ABC12345")
+    )
+
+    assert result.ok is True
+    assert "hunter2" not in result.detail
+    assert "REDACTED" in result.detail
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")

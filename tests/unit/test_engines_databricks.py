@@ -285,6 +285,17 @@ def test_check_credentials_presents_current_user_on_one_line(mock_connect, caplo
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_redacts_secrets_in_current_user_before_presenting(mock_connect):
+    # PR #86 delta verification (be81124 vs 8a16733 drift): same redact -> present chain as
+    # BigQuery and the failure path.
+    result = _check_credentials_with_current_user(mock_connect, "alice password=hunter2")
+
+    assert result.ok is True
+    assert "hunter2" not in result.detail
+    assert "REDACTED" in result.detail
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
 def test_check_credentials_ok_detail_reads_naturally_for_an_ordinary_user(mock_connect):
     result = _check_credentials_with_current_user(mock_connect, "alice@example.com")
 

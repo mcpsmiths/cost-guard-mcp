@@ -152,7 +152,11 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     return CredentialCheckResult(
         engine="databricks",
         ok=True,
-        detail=f"Authenticated as {present_remote_text(str(current_user))}.",
+        # redact -> present, the same chain as the failure path and the other engines.
+        detail=(
+            "Authenticated as "
+            f"{present_remote_text(redact_secrets(str(current_user)), total_chars=len(str(current_user)))}."
+        ),
     )
 
 

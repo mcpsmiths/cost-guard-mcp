@@ -169,13 +169,16 @@ def _connect(
     return conn
 
 
-_WAREHOUSE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+# Unquoted Snowflake identifier characters, and Snowflake's 255-character identifier limit:
+# a longer "valid" name is not a warehouse and only inflates every text that echoes it.
+_WAREHOUSE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$")
 
 
 def _validate_warehouse(warehouse: str) -> str:
     if not _WAREHOUSE_NAME_RE.fullmatch(warehouse):
         raise ValueError(
-            f"Invalid warehouse name {warehouse!r}: must match [A-Za-z_][A-Za-z0-9_$]*"
+            f"Invalid warehouse name {present_remote_text(warehouse)}: must match "
+            "[A-Za-z_][A-Za-z0-9_$]* and be at most 255 characters"
         )
     return warehouse
 
@@ -326,6 +329,23 @@ class _UnresolvedWarehouse:
     candidate_count: int
 
 
+@dataclass(frozen=True)
+class _UnsafeWarehouseName:
+    """The warehouse the query is pinned to has a stored name this server cannot look up: the
+    CURRENT_WAREHOUSE() result (or the caller argument) is outside _WAREHOUSE_NAME_RE - a legal
+    quoted identifier such as ``big-wh`` or ``MY%WH``, or a name over 255 characters - so no
+    SHOW WAREHOUSES LIKE '...' was issued and the warehouse was not observed.
+
+    Fails closed in _rate_for like _UnresolvedWarehouse. It is NOT the fail-open None of a
+    FAILED lookup (DECISIONS.md #19 - permission, network, timeout): nothing failed, this
+    server's own allowlist refused the name. PR #86 delta verification (probe a03) showed why
+    the old None here mattered: a session default warehouse named big-wh made the lookup
+    return None, the estimate priced a 6X-Large at the caller-asserted X-Small rate, and the
+    query ran under a $0.05 cap. `name_presented` is the name through present_remote_text."""
+
+    name_presented: str
+
+
 # How many of the SHOW WAREHOUSES row names an _UnresolvedWarehouse carries into its caveat.
 # LIKE's '_' wildcard can match many sibling warehouses and each presented name is itself
 # bounded only at present_remote_text's 1,000 characters, so the count is capped here too.
@@ -399,7 +419,12 @@ def _present_observed(value: object) -> str:
     repr(...)[:N]: slicing after repr() drops the closing quote on long values and with it the
     visible boundary between what the warehouse said and what this server says (PR #86
     verification, probe-4 p5a/p5d/p5e)."""
-    return "None" if value is None else present_remote_text(str(value))
+    if value is None:
+        return "None"
+    text = str(value)
+    # redact -> present, the same chain as every failure text and BigQuery's success detail
+    # (PR #86 delta verification found the three engines applying two policies).
+    return present_remote_text(redact_secrets(text), total_chars=len(text))
 
 
 def _cloud_provider_from_region(region_row: object) -> str | None:
@@ -418,7 +443,7 @@ def _cloud_provider_from_region(region_row: object) -> str | None:
 
 def _lookup_warehouse_facts(
     conn: "snowflake.connector.SnowflakeConnection", warehouse: str | None
-) -> _WarehouseFacts | _UnresolvedWarehouse | None:
+) -> _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None:
     """Best-effort, non-privileged observation of the warehouse the query is pinned to - its
     size, type, generation and state from its SHOW WAREHOUSES row, plus the account's cloud
     provider from CURRENT_REGION() - used by explain_estimate() to bind the cap-gate rate to
@@ -463,22 +488,32 @@ def _lookup_warehouse_facts(
     SHOW WAREHOUSES, CURRENT_WAREHOUSE() and CURRENT_REGION() are all ordinary, non-privileged
     SQL - no ACCOUNTADMIN or elevated grant is required (AGENTS.md / DECISIONS.md #7).
     """
-    try:
-        if warehouse is None:
+    if warehouse is None:
+        try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT CURRENT_WAREHOUSE()", timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS
                 )
                 current = cur.fetchone()
-            if current is None or not isinstance(current[0], str):
-                return None
-            # The stored name as Snowflake holds it (see the docstring): pin it verbatim.
-            validated_warehouse = _validate_warehouse(current[0])
-            pinned_name = validated_warehouse
-        else:
-            # An unquoted caller argument resolves to its upper-cased stored name.
-            validated_warehouse = _validate_warehouse(warehouse)
-            pinned_name = validated_warehouse.upper()
+        except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
+            return None
+        if current is None or not isinstance(current[0], str):
+            return None
+        # The stored name as Snowflake holds it (see the docstring): pin it verbatim. A name
+        # outside the allowlist cannot go into SHOW WAREHOUSES LIKE '...' and is refused HERE,
+        # fail closed - not caught by the lookup's except as a "failed lookup" and priced at
+        # the caller-asserted size (PR #86 delta verification, probe a03).
+        if not _WAREHOUSE_NAME_RE.fullmatch(current[0]):
+            return _UnsafeWarehouseName(name_presented=present_remote_text(current[0]))
+        validated_warehouse = pinned_name = current[0]
+    else:
+        # An unquoted caller argument resolves to its upper-cased stored name; a name the
+        # allowlist refuses fails closed the same way instead of pricing at the asserted size.
+        if not _WAREHOUSE_NAME_RE.fullmatch(warehouse):
+            return _UnsafeWarehouseName(name_presented=present_remote_text(warehouse))
+        validated_warehouse = warehouse
+        pinned_name = warehouse.upper()
+    try:
         with conn.cursor() as cur:
             cur.execute(
                 f"SHOW WAREHOUSES LIKE '{validated_warehouse}'",
@@ -533,7 +568,8 @@ def _is_valid_byte_count(value: object) -> TypeGuard[int]:
 
 
 def _rate_for(
-    facts: _WarehouseFacts | _UnresolvedWarehouse | None, asserted_size_key: str
+    facts: _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None,
+    asserted_size_key: str,
 ) -> tuple[float | None, str, list[str]]:
     """Pick the credit rate the cap gate prices at: (rate, effective size key, caveats).
 
@@ -555,6 +591,14 @@ def _rate_for(
             "higher than this estimate if the warehouse is really Gen2 or larger."
         )
         return credits_per_hour(asserted_size_key), asserted_size_key, [caveat]
+    if isinstance(facts, _UnsafeWarehouseName):
+        caveat = (
+            f"The warehouse the query is pinned to, {facts.name_presented}, has a stored name this "
+            "server cannot look up (unquoted identifier characters only, at most 255), so its size "
+            "and type were not observed and no other warehouse may stand in for it — "
+            f"{_FAIL_CLOSED_HINT}"
+        )
+        return None, asserted_size_key, [caveat]
     if isinstance(facts, _UnresolvedWarehouse):
         # pinned_name passed _WAREHOUSE_NAME_RE (it is the upper-cased caller argument, or
         # CURRENT_WAREHOUSE() verbatim), so it is safe to echo raw; the candidate names are
