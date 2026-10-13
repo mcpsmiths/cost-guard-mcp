@@ -381,11 +381,15 @@ def check_credentials(project: str | None = None) -> CredentialCheckResult:
         logger.warning("engine=bigquery check_credentials_failed detail=%s", safe_detail)
         return CredentialCheckResult(engine="bigquery", ok=False, detail=safe_detail)
 
+    # Both identifiers came back from the service: present them like the failure path
+    # presents its error text (bounded, repr-quoted, control characters escaped) instead of
+    # interpolating them raw, so a line boundary or terminal sequence in either cannot reach
+    # the model's structuredContent as-is. The repr supplies the quotes.
     return CredentialCheckResult(
         engine="bigquery",
         ok=True,
         detail=(
-            f"Authenticated to project '{client.project}' "
-            f"(BigQuery service account: {service_account_email})."
+            f"Authenticated to project {present_remote_text(str(client.project))} "
+            f"(BigQuery service account: {present_remote_text(str(service_account_email))})."
         ),
     )
