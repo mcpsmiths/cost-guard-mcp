@@ -24,3 +24,5 @@ credentials*.json
 *service-account*.json
 # .env is ignored above; its per-environment variants must be too.
 .env.*
+# ...except a committed example (placeholder values only), which .env.* would silently hide.
+!.env.example

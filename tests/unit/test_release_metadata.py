@@ -588,7 +588,7 @@ def test_gitignore_covers_the_host_layouts_and_key_names_the_readme_documents(tm
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("secret\n", encoding="utf-8")
         assert _is_ignored(rel, cwd=repo, env=env), f"{rel} is committable (not ignored)"
-    for rel in (".mcp.json.example", "server.json", "src/x.py"):
+    for rel in (".mcp.json.example", ".env.example", "server.json", "src/x.py"):
         path = repo / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("tracked\n", encoding="utf-8")
