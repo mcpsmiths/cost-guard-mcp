@@ -47,3 +47,23 @@ def test_serverless_rate_matches_confirmed_pricing_page():
     # Serverless — Classic $0.22/DBU and Pro $0.55/DBU both need a SEPARATE, unconfirmed
     # cloud-VM cost stream on top, which is why this project scopes to Serverless only).
     assert SERVERLESS_USD_PER_DBU == 0.70
+
+
+def test_dbus_per_hour_error_message_escapes_control_characters_in_size():
+    # The model-supplied warehouse_size is echoed into the ValueError that
+    # sanitize_exceptions logs; it must be repr-quoted so a newline in the argument cannot
+    # forge a second log record (audit: log-record-forgery-control-chars).
+    with pytest.raises(ValueError, match=r"'Small\\nforged line'") as exc_info:
+        dbus_per_hour("Small\nforged line")
+
+    assert "\n" not in str(exc_info.value)
+
+
+def test_dbus_per_hour_error_message_bounds_the_echoed_size():
+    # Cap the echoed model-supplied argument so an oversized value cannot inflate the
+    # exception text that sanitize_exceptions redacts and logs.
+    with pytest.raises(ValueError) as exc_info:
+        dbus_per_hour("Z" * 500)
+
+    assert "Z" * 64 in str(exc_info.value)
+    assert "Z" * 65 not in str(exc_info.value)

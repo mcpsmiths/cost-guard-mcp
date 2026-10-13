@@ -3,13 +3,21 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
+from typing import TypeGuard
 
 import snowflake.connector
 
 from cost_guard_mcp.config import load_snowflake_config
-from cost_guard_mcp.errors import SanitizedEngineError, redact_secrets, sanitize_exceptions
+from cost_guard_mcp.errors import (
+    SanitizedEngineError,
+    present_remote_text,
+    redact_secrets,
+    sanitize_exceptions,
+)
 from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
+from cost_guard_mcp.sql_scope import single_statement_body
 from cost_guard_mcp.types import (
     AccuracyTier,
     CostEstimate,
@@ -27,13 +35,113 @@ logger = logging.getLogger(__name__)
 _LOGIN_TIMEOUT_SECONDS = 30
 _NETWORK_TIMEOUT_SECONDS = 60
 
+# Security audit record snowflake-execute-unpinned-multi-statement-count: EXPLAIN USING JSON
+# and execute_async both carry model-supplied text. Without num_statements the connector sends
+# no MULTI_STATEMENT_COUNT, so whether a ';'-separated trailing statement executed - inside a
+# tool advertised read_only_hint=True, and ahead of run_query_bounded's cap gate - depended on
+# the operator's account/user MULTI_STATEMENT_COUNT parameter. Passing num_statements=1 makes
+# Snowflake itself reject any text that is not exactly one statement ("Actual statement count
+# N did not match the desired statement count 1"), regardless of that parameter; the same
+# value also goes in the login-time session_parameters as belt and braces for any future
+# execute added without the kwarg. tests/unit/test_snowflake_dependency_contract.py pins the
+# connector API this relies on.
+_SINGLE_STATEMENT_COUNT = 1
+
+# Provider-side statement deadline (security audit record client-side-only-query-deadline-
+# orphaned-on-process-exit, Snowflake leg; plan-review amendment A8). execute_bounded's
+# poll/cancel watchdog and the connector's network_timeout are both client-side: if this
+# process dies mid-call (host closes stdin, SIGTERM, OOM) the warehouse keeps running - and
+# billing - the query until Snowflake's own STATEMENT_TIMEOUT_IN_SECONDS fires, whose shipped
+# default is 172800 s (two days). A session-level value is therefore set so the deadline
+# survives this process. It is applied read-then-only-lower, NOT as a blind login-time
+# session parameter: a SESSION-level value OVERRIDES the account- and user-level values (only
+# the warehouse level combines lowest-wins), so blindly setting 120 would RAISE an operator's
+# stricter 30 s user policy. SHOW PARAMETERS ... IN SESSION is metadata-only (no warehouse)
+# and bounded by the same short client-side timeout the other metadata probes use.
+_SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS = 5
+_STATEMENT_TIMEOUT_PARAMETER = "STATEMENT_TIMEOUT_IN_SECONDS"
+
+
+def _parse_effective_statement_timeout(row: tuple | None) -> int | None:
+    """The `value` column of a SHOW PARAMETERS row as a positive int, else None.
+
+    SHOW PARAMETERS rows are (key, value, default, level, description, type). 0 means "no
+    timeout" in Snowflake - the LEAST bounded value, so it is reported as None (needs
+    lowering), exactly like an unparseable or missing value.
+    """
+    if row is None or len(row) < 2:
+        return None
+    try:
+        effective = int(str(row[1]).strip())
+    except (TypeError, ValueError):
+        return None
+    return effective if effective > 0 else None
+
+
+def _apply_statement_timeout(
+    conn: "snowflake.connector.SnowflakeConnection", target_seconds: int
+) -> None:
+    """Lower the session's STATEMENT_TIMEOUT_IN_SECONDS to `target_seconds` unless an operator
+    policy is already at or below it; never raise an existing stricter value.
+
+    Fails closed: an effective value of 0 (unbounded), a missing row or an unparseable value
+    all result in ALTER SESSION to the target. Any exception closes the connection before
+    re-raising so a half-configured session is never handed back; the @sanitize_exceptions
+    decorator on _connect() turns it into a SanitizedEngineError. `target_seconds` is always
+    one of this module's own int constants, never caller input.
+    """
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SHOW PARAMETERS LIKE '{_STATEMENT_TIMEOUT_PARAMETER}' IN SESSION",
+                timeout=_SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS,
+            )
+            effective = _parse_effective_statement_timeout(cur.fetchone())
+            if effective is not None and effective <= target_seconds:
+                return
+            cur.execute(
+                f"ALTER SESSION SET {_STATEMENT_TIMEOUT_PARAMETER} = {int(target_seconds)}",
+                timeout=_SESSION_PARAMETER_PROBE_TIMEOUT_SECONDS,
+            )
+    except Exception:
+        # Best-effort close, mirroring explain_estimate/execute_bounded's own discipline - a
+        # failed close must never mask the real failure being re-raised.
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
+        raise
+
 
 @sanitize_exceptions("snowflake")
-def _connect() -> "snowflake.connector.SnowflakeConnection":
+def _connect(
+    statement_timeout_seconds: int = _NETWORK_TIMEOUT_SECONDS,
+) -> "snowflake.connector.SnowflakeConnection":
+    """Open a per-call connection whose session authority is exactly SNOWFLAKE_ROLE and whose
+    statements carry a provider-side deadline of at most `statement_timeout_seconds`.
+
+    `role=` only sets the session's PRIMARY role; Snowflake authorizes each statement against
+    the primary role plus every ACTIVE secondary role, and the active set at login defaults to
+    the user's DEFAULT_SECONDARY_ROLES (('ALL') for users created after behavior-change
+    bundle 2024_07). `secondary_roles=` travels in the login request itself
+    (SECONDARY_ROLES=NONE unless the operator opted into ALL), so the pin is in force before
+    USE WAREHOUSE or any model-supplied text, with no extra round trip and no pre-pin
+    window. tests/unit/test_snowflake_dependency_contract.py guards the kwarg's existence
+    because the connector only WARNS on an unknown connect() kwarg (fail-open).
+
+    `statement_timeout_seconds` defaults to the read-only paths' network timeout (60 s);
+    execute_bounded passes its own 120 s watchdog bound. See _apply_statement_timeout for why
+    it is applied read-then-lower rather than as a login-time session parameter.
+    """
     config = load_snowflake_config()
+    # Login-time session parameters (sent in the login request body, so in force before any
+    # statement). MULTI_STATEMENT_COUNT=1 is the session-level half of the single-statement
+    # pin described at _SINGLE_STATEMENT_COUNT; the per-call num_statements kwarg on the two
+    # statements that carry model text is the other half.
+    session_parameters = {"MULTI_STATEMENT_COUNT": _SINGLE_STATEMENT_COUNT}
 
     if config.private_key_path:
-        return snowflake.connector.connect(
+        conn = snowflake.connector.connect(
             account=config.account,
             user=config.user,
             role=config.role,
@@ -42,25 +150,35 @@ def _connect() -> "snowflake.connector.SnowflakeConnection":
             private_key_file_pwd=config.private_key_passphrase,
             login_timeout=_LOGIN_TIMEOUT_SECONDS,
             network_timeout=_NETWORK_TIMEOUT_SECONDS,
+            secondary_roles=config.secondary_roles,
+            session_parameters=session_parameters,
+        )
+    else:
+        conn = snowflake.connector.connect(
+            account=config.account,
+            user=config.user,
+            role=config.role,
+            password=config.password,
+            login_timeout=_LOGIN_TIMEOUT_SECONDS,
+            network_timeout=_NETWORK_TIMEOUT_SECONDS,
+            secondary_roles=config.secondary_roles,
+            session_parameters=session_parameters,
         )
 
-    return snowflake.connector.connect(
-        account=config.account,
-        user=config.user,
-        role=config.role,
-        password=config.password,
-        login_timeout=_LOGIN_TIMEOUT_SECONDS,
-        network_timeout=_NETWORK_TIMEOUT_SECONDS,
-    )
+    _apply_statement_timeout(conn, statement_timeout_seconds)
+    return conn
 
 
-_WAREHOUSE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+# Unquoted Snowflake identifier characters, and Snowflake's 255-character identifier limit:
+# a longer "valid" name is not a warehouse and only inflates every text that echoes it.
+_WAREHOUSE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]{0,254}$")
 
 
 def _validate_warehouse(warehouse: str) -> str:
     if not _WAREHOUSE_NAME_RE.fullmatch(warehouse):
         raise ValueError(
-            f"Invalid warehouse name {warehouse!r}: must match [A-Za-z_][A-Za-z0-9_$]*"
+            f"Invalid warehouse name {present_remote_text(warehouse)}: must match "
+            "[A-Za-z_][A-Za-z0-9_$]* and be at most 255 characters"
         )
     return warehouse
 
@@ -163,69 +281,441 @@ def _lookup_historical_runtime(
         return None
 
 
-def _lookup_warehouse_generation(
+@dataclass(frozen=True)
+class _WarehouseFacts:
+    """What SHOW WAREHOUSES and CURRENT_REGION() say about the warehouse a query is pinned to.
+
+    `size_key` is the pricing-table key for the row's `size` text (`size_text`), or None when
+    the text is not a size this project prices; `generation`/`cloud_provider` are None when
+    their value is not one of the recognised ones. `state`/`auto_resume` are carried for the
+    pending read-only warehouse-state guard (audit record read-only-tools-resume-suspended-
+    warehouse) so it can reuse this single lookup instead of issuing another one.
+    """
+
+    name: str
+    generation: str | None
+    cloud_provider: str | None
+    size_key: str | None
+    size_text: str | None
+    warehouse_type: str | None
+    state: str | None
+    auto_resume: str | None
+
+
+@dataclass(frozen=True)
+class _UnresolvedWarehouse:
+    """SHOW WAREHOUSES answered, but its rows did not contain exactly one named `pinned_name`
+    - the allowlisted STORED name of the warehouse the query is pinned to: the upper-cased
+    caller argument, or CURRENT_WAREHOUSE() verbatim when the caller gave none - so the
+    warehouse the query will run on was not observed, and nothing else in the result may
+    stand in for it.
+
+    Distinct from the None a failed lookup returns on purpose: None takes DECISIONS.md #19's
+    fail-open-with-caveat path (roles that cannot run SHOW WAREHOUSES keep working at the
+    caller-asserted rate), whereas this makes _rate_for fail closed (DECISIONS.md #5). PR #86
+    runtime verification (probe-3 p45) showed why the two must not share a value: a quoted
+    lower-case "compute_wh" next to COMPUTE_WH made the old case-insensitive match see two
+    rows, return None, and price a 6X-Large query at the caller-asserted X-Small rate.
+
+    `candidates_presented` holds the first _MAX_UNRESOLVED_CANDIDATES_PRESENTED row names,
+    each already passed through _present_observed (they are warehouse-returned text; a row
+    with no usable name - column missing, NULL or non-text - is the bare word None, so it
+    never reads as a warehouse called 'None'); `candidate_count` is how many rows there were
+    in total.
+    """
+
+    pinned_name: str
+    candidates_presented: tuple[str, ...]
+    candidate_count: int
+
+
+@dataclass(frozen=True)
+class _UnsafeWarehouseName:
+    """The warehouse the query is pinned to has a stored name this server cannot look up: the
+    CURRENT_WAREHOUSE() result (or the caller argument) is outside _WAREHOUSE_NAME_RE - a legal
+    quoted identifier such as ``big-wh`` or ``MY%WH``, or a name over 255 characters - so no
+    SHOW WAREHOUSES LIKE '...' was issued and the warehouse was not observed.
+
+    Fails closed in _rate_for like _UnresolvedWarehouse. It is NOT the fail-open None of a
+    FAILED lookup (DECISIONS.md #19 - permission, network, timeout): nothing failed, this
+    server's own allowlist refused the name. PR #86 delta verification (probe a03) showed why
+    the old None here mattered: a session default warehouse named big-wh made the lookup
+    return None, the estimate priced a 6X-Large at the caller-asserted X-Small rate, and the
+    query ran under a $0.05 cap. `name_presented` is the name through present_remote_text."""
+
+    name_presented: str
+
+
+# How many of the SHOW WAREHOUSES row names an _UnresolvedWarehouse carries into its caveat.
+# LIKE's '_' wildcard can match many sibling warehouses and each presented name is itself
+# bounded only at present_remote_text's 1,000 characters, so the count is capped here too.
+_MAX_UNRESOLVED_CANDIDATES_PRESENTED = 5
+
+
+_STANDARD_WAREHOUSE_TYPE = "STANDARD"
+
+# SHOW WAREHOUSES reports `size` as display text ('X-Small', '4X-Large'); the pricing table is
+# keyed the way Snowflake's own CREATE WAREHOUSE syntax spells sizes ('XSMALL', 'X4LARGE'). An
+# explicit allowlist, not a regex: anything else (a new size, an Interactive/Snowpark tier
+# label, garbage) is "not priced" and makes explain_estimate fail closed on a dollar cap.
+_SHOW_SIZE_TO_PRICING_KEY: dict[str, str] = {
+    "X-SMALL": "XSMALL",
+    "XSMALL": "XSMALL",
+    "SMALL": "SMALL",
+    "MEDIUM": "MEDIUM",
+    "LARGE": "LARGE",
+    "X-LARGE": "XLARGE",
+    "XLARGE": "XLARGE",
+    "2X-LARGE": "X2LARGE",
+    "XXLARGE": "X2LARGE",
+    "X2LARGE": "X2LARGE",
+    "3X-LARGE": "X3LARGE",
+    "XXXLARGE": "X3LARGE",
+    "X3LARGE": "X3LARGE",
+    "4X-LARGE": "X4LARGE",
+    "X4LARGE": "X4LARGE",
+    "5X-LARGE": "X5LARGE",
+    "X5LARGE": "X5LARGE",
+    "6X-LARGE": "X6LARGE",
+    "X6LARGE": "X6LARGE",
+}
+
+
+def _size_to_pricing_key(size_text: object) -> str | None:
+    if not isinstance(size_text, str):
+        return None
+    return _SHOW_SIZE_TO_PRICING_KEY.get(size_text.strip().upper())
+
+
+def _asserted_size_key(warehouse_size: str) -> str:
+    """The pricing-table key for the caller's `warehouse_size` argument.
+
+    The tool description offers "X-Large" as an example, but credits_per_hour knows only the
+    CREATE WAREHOUSE spellings ('XLARGE', 'X2LARGE'), so warehouse_size.upper() handed it
+    'X-LARGE' and the call was refused (PR #86 runtime verification, docker-cli finding). The
+    caller's string is therefore normalised with the same allowlist SHOW WAREHOUSES text uses
+    (_SHOW_SIZE_TO_PRICING_KEY), also accepting a space for the hyphen ('X Large', '2X Large').
+    Anything the allowlist does not know is handed on as the upper-cased raw text, so
+    credits_per_hour raises its existing unknown-size ValueError with exactly the bounded,
+    repr-quoted echo it has today - this widens what is accepted, never what is echoed.
+    """
+    key = _size_to_pricing_key(warehouse_size) or _size_to_pricing_key(
+        "-".join(warehouse_size.split())
+    )
+    return key if key is not None else warehouse_size.upper()
+
+
+def _text_or_none(value: object, *, upper: bool = False) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    return text.upper() if upper else text
+
+
+def _present_observed(value: object) -> str:
+    """A warehouse-returned value on its way into a caveat or a check_credentials detail:
+    present_remote_text over its text (bounded, repr-quoted, one line - DECISIONS.md #18), the
+    bare word None for a NULL column so it does not read as the text 'None'. Never
+    repr(...)[:N]: slicing after repr() drops the closing quote on long values and with it the
+    visible boundary between what the warehouse said and what this server says (PR #86
+    verification, probe-4 p5a/p5d/p5e)."""
+    if value is None:
+        return "None"
+    text = str(value)
+    # redact -> present, the same chain as every failure text and BigQuery's success detail
+    # (PR #86 delta verification found the three engines applying two policies).
+    return present_remote_text(redact_secrets(text), total_chars=len(text))
+
+
+def _cloud_provider_from_region(region_row: object) -> str | None:
+    """CURRENT_REGION() returns "<CLOUD>_<REGION>" (e.g. "AWS_US_WEST_2") for most accounts, or
+    "<region-group>.<CLOUD>_<REGION>" (e.g. "PUBLIC.AWS_US_WEST_2") for accounts whose
+    organization spans multiple region groups - both shapes are documented examples in
+    Snowflake's own CURRENT_REGION() reference."""
+    if not isinstance(region_row, (tuple, list)) or not region_row:
+        return None
+    if not isinstance(region_row[0], str):
+        return None
+    region = region_row[0].rsplit(".", 1)[-1]
+    cloud_provider = region.split("_", 1)[0].upper()
+    return cloud_provider if cloud_provider in _CLOUD_PROVIDERS else None
+
+
+def _lookup_warehouse_facts(
     conn: "snowflake.connector.SnowflakeConnection", warehouse: str | None
-) -> tuple[str, str] | None:
-    """Best-effort, non-privileged lookup of a warehouse's generation ("1" or "2") and the
-    account's cloud provider ("AWS"/"AZURE"/"GCP"), used by explain_estimate() to pick the
-    correct Gen1/Gen2 credit rate instead of always assuming Gen1. Mirrors
-    _lookup_historical_runtime's contract exactly: any failure at all — no warehouse given,
-    permission, network, malformed/unrecognized response shape, timeout — returns None, never
-    raises. explain_estimate() degrades to the pre-existing Gen1-assumed rate plus an explicit
-    caveat whenever this returns None; no exception from this function ever propagates out of
-    explain_estimate.
+) -> _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None:
+    """Best-effort, non-privileged observation of the warehouse the query is pinned to - its
+    size, type, generation and state from its SHOW WAREHOUSES row, plus the account's cloud
+    provider from CURRENT_REGION() - used by explain_estimate() to bind the cap-gate rate to
+    the warehouse that will actually execute instead of to the caller's warehouse_size string
+    (DECISIONS.md #19). Mirrors _lookup_historical_runtime's contract for failures: a lookup
+    that fails - permission, network, malformed response shape, timeout - or that finds no
+    warehouse at all (an empty SHOW result, no CURRENT_WAREHOUSE()) returns None, never raises;
+    explain_estimate() then degrades to the caller-asserted/Gen1 rate plus an explicit caveat.
+    "Malformed" means a shape the parse rejects (a row whose width differs from
+    cursor.description, a non-sequence row). Rows that parse but carry no usable name - the
+    column missing, NULL or non-text - are rows that are not the pinned warehouse, so they
+    fail CLOSED as an _UnresolvedWarehouse exactly like any other non-matching row: the
+    fail-open None is never chosen on the strength of what the rows contain.
 
-    Both `SHOW WAREHOUSES` and `CURRENT_REGION()` are ordinary, non-privileged SQL — no
-    ACCOUNTADMIN or elevated grant is required (unlike ACCOUNT_USAGE views), consistent with
-    this project's least-privilege stance (AGENTS.md / DECISIONS.md #7). `generation` is a
-    real `SHOW WAREHOUSES` output column added by Snowflake behavior-change bundle
-    2025_07/bcr-2110 ("A positive integer, currently either `1` or `2`"); it's read back via
-    the documented `RESULT_SCAN(LAST_QUERY_ID(-1))` pattern since a `SHOW` command's own
-    output can't be wrapped directly in a `SELECT`.
+    When `warehouse` is None the session's active warehouse is resolved with SELECT
+    CURRENT_WAREHOUSE() first - it is what EXPLAIN just ran against and what execute_bounded
+    will run against. The resolved name is interpolated into SHOW WAREHOUSES LIKE '<name>'
+    exactly like a caller-supplied one, so it passes the same allowlist (DECISIONS.md #6).
+    It is NOT upper-cased: _connect() passes no warehouse=, so the session warehouse is the
+    user's DEFAULT_WAREHOUSE as stored, and CURRENT_WAREHOUSE() returns that stored name
+    verbatim - a quoted lower- or mixed-case identifier included.
 
-    No live Snowflake account was available to verify this against a real Gen2 warehouse
-    while implementing this (see this repo's isolated-worktree constraints) — treat the exact
-    SQL shape here as a documented-but-not-live-verified best effort; a real Gen2 warehouse
-    live-verification pass is an explicit follow-up for whoever has credentials.
+    The row is read straight from the SHOW result via fetchall()/cursor.description - no
+    RESULT_SCAN(LAST_QUERY_ID(-1)) SELECT (one statement fewer, same data). SHOW's LIKE is
+    case-insensitive and treats '_' as a single-character wildcard, so the result can hold
+    sibling warehouses: MYAWH for MY_WH, or a quoted lower-case "compute_wh" next to
+    COMPUTE_WH. Exactly one row may bind - the one whose name EQUALS the pinned warehouse's
+    STORED name. For a caller-supplied argument that is the upper-cased argument: USE
+    WAREHOUSE on an unquoted identifier (the only kind _WAREHOUSE_NAME_RE admits) resolves to
+    the upper-cased stored name. For an omitted argument it is CURRENT_WAREHOUSE() verbatim,
+    which already IS the stored name - upper-casing it would bind a session on a quoted
+    "compute_wh" to a COMPUTE_WH sibling (the same mispricing in the other direction) or to
+    nothing. Either way a differently-cased sibling is a DIFFERENT warehouse, not another
+    spelling of the same one. When SHOW answered with rows but no single row carries that
+    name the result is an _UnresolvedWarehouse, never None, so _rate_for fails closed: PR #86
+    runtime verification (probe-3 p45) drove the old case-insensitive match with COMPUTE_WH
+    (6X-Large) plus "compute_wh" (X-Small), got two matches -> None, and the 6X-Large query
+    ran under a cap priced at X-Small. `generation` is a real SHOW WAREHOUSES column
+    (behavior-change bundle 2025_07/bcr-2110, "currently either 1 or 2"); the `size`/`type`
+    text shapes are pinned by tests/integration/test_snowflake_live.py.
+
+    SHOW WAREHOUSES, CURRENT_WAREHOUSE() and CURRENT_REGION() are all ordinary, non-privileged
+    SQL - no ACCOUNTADMIN or elevated grant is required (AGENTS.md / DECISIONS.md #7).
     """
     if warehouse is None:
-        return None
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT CURRENT_WAREHOUSE()", timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS
+                )
+                current = cur.fetchone()
+        except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
+            return None
+        if current is None or not isinstance(current[0], str):
+            return None
+        # The stored name as Snowflake holds it (see the docstring): pin it verbatim. A name
+        # outside the allowlist cannot go into SHOW WAREHOUSES LIKE '...' and is refused HERE,
+        # fail closed - not caught by the lookup's except as a "failed lookup" and priced at
+        # the caller-asserted size (PR #86 delta verification, probe a03).
+        if not _WAREHOUSE_NAME_RE.fullmatch(current[0]):
+            return _UnsafeWarehouseName(name_presented=present_remote_text(current[0]))
+        validated_warehouse = pinned_name = current[0]
+    else:
+        # An unquoted caller argument resolves to its upper-cased stored name; a name the
+        # allowlist refuses fails closed the same way instead of pricing at the asserted size.
+        if not _WAREHOUSE_NAME_RE.fullmatch(warehouse):
+            return _UnsafeWarehouseName(name_presented=present_remote_text(warehouse))
+        validated_warehouse = warehouse
+        pinned_name = warehouse.upper()
     try:
-        validated_warehouse = _validate_warehouse(warehouse)
         with conn.cursor() as cur:
             cur.execute(
                 f"SHOW WAREHOUSES LIKE '{validated_warehouse}'",
                 timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS,
             )
-            cur.execute(
-                'SELECT "generation" FROM TABLE(RESULT_SCAN(LAST_QUERY_ID(-1)))',
-                timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS,
-            )
-            generation_row = cur.fetchone()
+            columns = [str(column[0]).lower() for column in (cur.description or ())]
+            rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
 
             cur.execute("SELECT CURRENT_REGION()", timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS)
             region_row = cur.fetchone()
     except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
         return None
 
-    if generation_row is None or not isinstance(generation_row[0], str):
+    if not rows:
         return None
-    generation = generation_row[0].strip()
-    if generation not in ("1", "2"):
-        return None
+    matching = [row for row in rows if row.get("name") == pinned_name]
+    if len(matching) != 1:
+        return _UnresolvedWarehouse(
+            pinned_name=pinned_name,
+            candidates_presented=tuple(
+                _present_observed(row.get("name"))
+                for row in rows[:_MAX_UNRESOLVED_CANDIDATES_PRESENTED]
+            ),
+            candidate_count=len(rows),
+        )
+    row = matching[0]
+    generation = str(row.get("generation", "")).strip()
+    return _WarehouseFacts(
+        name=row["name"],
+        generation=generation if generation in ("1", "2") else None,
+        cloud_provider=_cloud_provider_from_region(region_row),
+        size_key=_size_to_pricing_key(row.get("size")),
+        size_text=_text_or_none(row.get("size")),
+        warehouse_type=_text_or_none(row.get("type"), upper=True),
+        state=_text_or_none(row.get("state"), upper=True),
+        auto_resume=_text_or_none(row.get("auto_resume")),
+    )
 
-    if region_row is None or not isinstance(region_row[0], str):
-        return None
-    # CURRENT_REGION() returns "<CLOUD>_<REGION>" (e.g. "AWS_US_WEST_2") for most accounts, or
-    # "<region-group>.<CLOUD>_<REGION>" (e.g. "PUBLIC.AWS_US_WEST_2") for accounts whose
-    # organization spans multiple region groups - both shapes are documented examples in
-    # Snowflake's own CURRENT_REGION() reference.
-    region = region_row[0].rsplit(".", 1)[-1]
-    cloud_provider = region.split("_", 1)[0].upper()
-    if cloud_provider not in _CLOUD_PROVIDERS:
-        return None
 
-    return generation, cloud_provider
+_CORTEX_CAVEAT = (
+    "This estimate excludes Cortex AI Function ('AI Credits') cost — EXPLAIN's bytesAssigned "
+    "only reflects warehouse compute/scan, not AI-inference calls inside the SQL."
+)
+_FAIL_CLOSED_HINT = (
+    "no dollar estimate is produced, so run_query_bounded refuses a max_estimated_cost_usd cap "
+    "for it; omit the dollar cap to run on this warehouse."
+)
+
+
+def _is_valid_byte_count(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _rate_for(
+    facts: _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None,
+    asserted_size_key: str,
+) -> tuple[float | None, str, list[str]]:
+    """Pick the credit rate the cap gate prices at: (rate, effective size key, caveats).
+
+    The rate is never below the observed warehouse - the caller's warehouse_size may raise the
+    size, never lower it. `rate` is None when the observed warehouse is of a type or size the
+    rate table does not model, and likewise when SHOW WAREHOUSES answered but no single row
+    was the pinned warehouse (_UnresolvedWarehouse) - there is nothing to price at, so the cap
+    gate must not be handed a figure; explain_estimate then returns estimated_cost_usd=None so
+    run_query_bounded refuses a dollar cap (DECISIONS.md #5: an unenforceable cap must never
+    look enforced). A failed lookup (facts is None) keeps the caller-asserted/default size at
+    the Gen1 rate with an explicit caveat, so roles that cannot run SHOW WAREHOUSES keep
+    working (DECISIONS.md #19).
+    """
+    if facts is None:
+        caveat = (
+            "Warehouse generation and size could not be determined (no warehouse specified or "
+            "resolvable, or the SHOW WAREHOUSES/cloud-provider lookup failed) — assuming Gen1 "
+            f"credit rates at the caller-asserted {asserted_size_key} size; actual cost will be "
+            "higher than this estimate if the warehouse is really Gen2 or larger."
+        )
+        return credits_per_hour(asserted_size_key), asserted_size_key, [caveat]
+    if isinstance(facts, _UnsafeWarehouseName):
+        caveat = (
+            f"The warehouse the query is pinned to, {facts.name_presented}, has a stored name this "
+            "server cannot look up (unquoted identifier characters only, at most 255), so its size "
+            "and type were not observed and no other warehouse may stand in for it — "
+            f"{_FAIL_CLOSED_HINT}"
+        )
+        return None, asserted_size_key, [caveat]
+    if isinstance(facts, _UnresolvedWarehouse):
+        # pinned_name passed _WAREHOUSE_NAME_RE (it is the upper-cased caller argument, or
+        # CURRENT_WAREHOUSE() verbatim), so it is safe to echo raw; the candidate names are
+        # warehouse-returned text and arrive already presented.
+        shown = ", ".join(facts.candidates_presented)
+        hidden = facts.candidate_count - len(facts.candidates_presented)
+        if hidden > 0:
+            shown = f"{shown} and {hidden} more"
+        caveat = (
+            f"Warehouse {facts.pinned_name} could not be resolved to exactly one SHOW WAREHOUSES "
+            f"row: the {facts.candidate_count} row(s) returned ({shown}) do not contain exactly "
+            f"one named {facts.pinned_name} (the stored name - the upper-cased unquoted "
+            "argument, or CURRENT_WAREHOUSE() as returned - so a differently-cased warehouse "
+            f"is a different warehouse), and the pinned warehouse's size and type were not "
+            f"observed — {_FAIL_CLOSED_HINT}"
+        )
+        return None, asserted_size_key, [caveat]
+    # facts.name is the pinned name - it passed _WAREHOUSE_NAME_RE and the exact-match rule in
+    # _lookup_warehouse_facts - so it is safe raw; type/size are SHOW text and are presented.
+    if facts.warehouse_type != _STANDARD_WAREHOUSE_TYPE:
+        caveat = (
+            f"Warehouse {facts.name} is of type {_present_observed(facts.warehouse_type)}, which "
+            "this project's rate table does not model (only STANDARD warehouses are priced) — "
+            f"{_FAIL_CLOSED_HINT}"
+        )
+        return None, asserted_size_key, [caveat]
+    if facts.size_key is None:
+        caveat = (
+            f"Warehouse {facts.name} reports size {_present_observed(facts.size_text)}, which "
+            f"this project's rate table does not recognise — {_FAIL_CLOSED_HINT}"
+        )
+        return None, asserted_size_key, [caveat]
+
+    caveats: list[str] = []
+    size_key = max(asserted_size_key, facts.size_key, key=credits_per_hour)
+    if size_key != asserted_size_key:
+        caveats.append(
+            f"warehouse_size {asserted_size_key!r} understated the pinned warehouse {facts.name} "
+            f"({_present_observed(facts.size_text)}, {size_key}) — priced at the observed size; "
+            "the warehouse_size argument can only raise the estimate, never lower it."
+        )
+    if facts.generation is not None and facts.cloud_provider is not None:
+        rate = credits_per_hour(
+            size_key, generation=facts.generation, cloud_provider=facts.cloud_provider
+        )
+        if facts.generation == "2":
+            caveats.append(
+                f"Warehouse generation detected as Gen2 on {facts.cloud_provider} — billed at "
+                "Gen2's higher per-hour credit rate (per Snowflake's Service Consumption "
+                "Table), not Gen1's."
+            )
+        else:
+            caveats.append(
+                f"Warehouse generation detected as Gen1 on {facts.cloud_provider} — billed at "
+                "Gen1's per-hour credit rate."
+            )
+        return rate, size_key, caveats
+    caveats.append(
+        f"Warehouse generation could not be determined for {facts.name} (SHOW WAREHOUSES "
+        "reported an unrecognised generation, or CURRENT_REGION() an unrecognised cloud "
+        "provider) — assuming Gen1 credit rates; actual cost will be higher than this estimate "
+        "if the warehouse is really Gen2."
+    )
+    return credits_per_hour(size_key), size_key, caveats
+
+
+def _price_for(configured_edition: str, asserted_edition: str) -> tuple[float, list[str]]:
+    """USD/credit at the higher of the operator-configured edition (SNOWFLAKE_EDITION) and the
+    caller-asserted one: the tool argument may only raise the price, never lower it. Edition
+    is an account property the server cannot observe without ORGADMIN, hence configuration."""
+    effective = max(configured_edition.lower(), asserted_edition.lower(), key=usd_per_credit)
+    caveats: list[str] = []
+    if effective != asserted_edition.lower():
+        caveats.append(
+            f"edition {asserted_edition!r} is below the operator-configured "
+            f"SNOWFLAKE_EDITION={configured_edition!r} — priced at the configured edition; the "
+            "edition argument can only raise the estimate, never lower it."
+        )
+    return usd_per_credit(effective), caveats
+
+
+def _runtime_for(
+    conn: "snowflake.connector.SnowflakeConnection",
+    sql: str,
+    bytes_assigned: object,
+    size_key: str,
+) -> tuple[float | None, list[str]]:
+    """Runtime hours for the dollar figure: a historical run of this exact SQL when there is
+    one, else the byte-tier heuristic - but only from a real, non-negative integer bytesAssigned.
+    A null/non-integer value used to flow into scale_runtime_hours as None and yield the
+    information-free baseline figure DECISIONS.md #5 forbids; it now yields None (no dollar
+    estimate) unless the query-dependent historical signal exists."""
+    historical = _lookup_historical_runtime(conn, sql)
+    if historical is not None:
+        caveat = (
+            f"Cost is informed by {historical.sample_count} historical run(s) of this "
+            f"exact query, averaging {historical.avg_runtime_hours * 3600:.1f}s — more "
+            "reliable than the coarse size-tier heuristic below."
+        )
+        return historical.avg_runtime_hours, [caveat]
+    if _is_valid_byte_count(bytes_assigned):
+        caveat = (
+            f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
+            f"on a {size_key} warehouse, scaled up by a coarse size tier based on "
+            f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
+            "query's actual expected runtime."
+        )
+        return scale_runtime_hours(bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS), [caveat]
+    # The plan is warehouse-returned JSON, so the unusable value is presented like any other
+    # remote text rather than sliced after repr().
+    caveat = (
+        f"EXPLAIN returned no usable bytesAssigned figure ({_present_observed(bytes_assigned)}) "
+        "— the byte estimate is "
+        "unavailable, not zero, and without a historical runtime signal no dollar estimate is "
+        "produced; run_query_bounded refuses a byte or dollar cap for this query."
+    )
+    return None, [caveat]
 
 
 @sanitize_exceptions("snowflake")
@@ -238,82 +728,63 @@ def explain_estimate(
     """Estimate Snowflake query cost via EXPLAIN. Always UPPER_BOUND — never PRECISE — since
     Snowflake bills by warehouse-time, not bytes, and EXPLAIN's byte/partition figures are
     themselves documented upper bounds ("runtime optimizations... can reduce the number of
-    partitions and bytes scanned")."""
+    partitions and bytes scanned").
+
+    The dollar figure is priced at the warehouse the query is pinned to as observed through
+    SHOW WAREHOUSES (size/type/generation) - never below it: `warehouse_size` and `edition`
+    can only raise the estimate. Warehouse types the rate table does not model, and a plan
+    without a usable bytesAssigned, yield estimated_cost_usd=None so run_query_bounded fails
+    closed on a dollar cap (DECISIONS.md #5, #19).
+    """
+    # Validate every caller-asserted input before connecting: an unknown warehouse name, size
+    # or edition is a clear (sanitized) ValueError that never costs a connection or a lookup.
+    validated_warehouse = _validate_warehouse(warehouse) if warehouse is not None else None
+    asserted_size_key = _asserted_size_key(warehouse_size)
+    credits_per_hour(asserted_size_key)
+    usd_per_credit(edition)
+    config = load_snowflake_config()
+
     conn = _connect()
     try:
         with conn.cursor() as cur:
-            if warehouse is not None:
-                cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-            cur.execute(f"EXPLAIN USING JSON {sql}")
+            if validated_warehouse is not None:
+                cur.execute(f"USE WAREHOUSE {validated_warehouse}")
+            # num_statements=1: Snowflake rejects the whole text if it is not exactly one
+            # statement, so a ';'-separated trailing statement can neither execute inside this
+            # read-only-advertised estimate nor be silently discarded (see
+            # _SINGLE_STATEMENT_COUNT).
+            cur.execute(f"EXPLAIN USING JSON {sql}", num_statements=_SINGLE_STATEMENT_COUNT)
             row = cur.fetchone()
 
         if row is None:
             raise ValueError("EXPLAIN USING JSON returned no rows")
 
         plan = json.loads(row[0])
-        global_stats = plan["GlobalStats"]
-        bytes_assigned = global_stats["bytesAssigned"]
+        bytes_assigned = plan["GlobalStats"]["bytesAssigned"]
 
-        generation_info = _lookup_warehouse_generation(conn, warehouse)
-        if generation_info is not None:
-            generation, cloud_provider = generation_info
-            rate = credits_per_hour(
-                warehouse_size, generation=generation, cloud_provider=cloud_provider
-            )
-            if generation == "2":
-                generation_caveat = (
-                    f"Warehouse generation detected as Gen2 on {cloud_provider} — billed at "
-                    "Gen2's higher per-hour credit rate (per Snowflake's Service Consumption "
-                    "Table), not Gen1's."
-                )
-            else:
-                generation_caveat = (
-                    f"Warehouse generation detected as Gen1 on {cloud_provider} — billed at "
-                    "Gen1's per-hour credit rate."
-                )
-        else:
-            rate = credits_per_hour(warehouse_size)
-            generation_caveat = (
-                "Warehouse generation could not be determined (no warehouse specified, or "
-                "the generation/cloud-provider lookup failed) — assuming Gen1 credit rates; "
-                "actual cost will be higher than this estimate if the warehouse is really "
-                "Gen2."
-            )
-        price = usd_per_credit(edition)
+        facts = _lookup_warehouse_facts(conn, warehouse)
+        rate, size_key, rate_caveats = _rate_for(facts, asserted_size_key)
+        price, price_caveats = _price_for(config.edition, edition)
+        runtime_hours, runtime_caveats = _runtime_for(conn, sql, bytes_assigned, size_key)
 
-        historical = _lookup_historical_runtime(conn, sql)
-        if historical is not None:
-            runtime_hours = historical.avg_runtime_hours
-            runtime_caveat = (
-                f"Cost is informed by {historical.sample_count} historical run(s) of this "
-                f"exact query, averaging {historical.avg_runtime_hours * 3600:.1f}s — more "
-                "reliable than the coarse size-tier heuristic below."
-            )
-        else:
-            runtime_hours = scale_runtime_hours(
-                bytes_assigned, baseline_hours=_ASSUMED_RUNTIME_HOURS
-            )
-            runtime_caveat = (
-                f"Cost assumes a baseline {int(_ASSUMED_RUNTIME_HOURS * 3600)}-second runtime "
-                f"on a {warehouse_size} warehouse, scaled up by a coarse size tier based on "
-                f"{bytes_assigned} bytes scanned — still a heuristic, not derived from this "
-                "query's actual expected runtime."
-            )
-        estimated_cost_usd = rate * price * runtime_hours
-
+        estimated_cost_usd = (
+            None
+            if rate is None or runtime_hours is None
+            else round(rate * price * runtime_hours, 6)
+        )
         return CostEstimate(
             engine="snowflake",
             accuracy_tier=AccuracyTier.UPPER_BOUND,
-            estimated_bytes=bytes_assigned,
-            estimated_cost_usd=round(estimated_cost_usd, 6),
+            estimated_bytes=bytes_assigned if _is_valid_byte_count(bytes_assigned) else None,
+            estimated_cost_usd=estimated_cost_usd,
             caveats=[
-                (
-                    "This estimate excludes Cortex AI Function ('AI Credits') cost — EXPLAIN's "
-                    "bytesAssigned only reflects warehouse compute/scan, not AI-inference calls "
-                    "inside the SQL."
-                ),
-                generation_caveat,
-                runtime_caveat,
+                _CORTEX_CAVEAT,
+                *rate_caveats,
+                # No rate means no dollar figure (fail-closed, DECISIONS.md #5): pricing and
+                # runtime caveats would describe an outcome that is not returned ('Cost
+                # assumes a baseline 30-second runtime ...' next to estimated_cost_usd null -
+                # PR #86 runtime verification, probe p5d).
+                *([] if rate is None else [*price_caveats, *runtime_caveats]),
             ],
         )
     finally:
@@ -340,11 +811,14 @@ def _cancel_query(conn: "snowflake.connector.SnowflakeConnection", query_id: str
     `query_id` is connector-generated (cur.sfqid), not caller input — but it still gets
     validated as a UUID before reaching raw SQL text, same defense-in-depth discipline as
     _validate_warehouse and _validate_project_id use for genuinely caller-supplied values.
+    The CANONICAL text (str(uuid.UUID(...))) is what gets interpolated, never the raw string:
+    uuid.UUID() also accepts braces, urn: prefixes and upper-case hex, so validating and then
+    interpolating the original would still let non-canonical text into the SQL literal.
     """
     try:
-        uuid.UUID(query_id)
+        canonical_query_id = str(uuid.UUID(query_id))
         with conn.cursor() as cur:
-            cur.execute(f"SELECT SYSTEM$CANCEL_QUERY('{query_id}')")
+            cur.execute(f"SELECT SYSTEM$CANCEL_QUERY('{canonical_query_id}')")
     except Exception:  # noqa: BLE001, S110
         pass
 
@@ -353,22 +827,27 @@ def _cancel_query(conn: "snowflake.connector.SnowflakeConnection", query_id: str
 def execute_bounded(
     sql: str, warehouse: str | None, max_rows: int | None
 ) -> tuple[list[dict], int, bool]:
-    conn = _connect()
+    # The session deadline matches this function's own watchdog bound, so the warehouse-side
+    # query dies on its own even if this process is gone before _cancel_query can run.
+    conn = _connect(statement_timeout_seconds=_MAX_EXECUTION_WAIT_SECONDS)
     try:
         wrapped_sql = sql
         if max_rows is not None:
             # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
             # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
-            # untrusted input reaching a query built from a different source. Strip a trailing
-            # semicolon first (matching bigquery.py's own execute_bounded) - LLM-generated SQL
-            # commonly ends in one, and `SELECT * FROM (...;) AS x LIMIT n` is a syntax error.
-            inner_sql = sql.strip().rstrip(";").strip()
+            # untrusted input reaching a query built from a different source. The trailing
+            # `;` and any trailing comments go first (sql_scope.single_statement_body, shared
+            # with the other engines): either makes `(...) AS x LIMIT n` a syntax error.
+            inner_sql = single_statement_body(sql, "snowflake")
             wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
 
         with conn.cursor(snowflake.connector.DictCursor) as cur:
             if warehouse is not None:
                 cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-            cur.execute_async(wrapped_sql)
+            # execute_async forwards **kwargs to execute, so num_statements=1 reaches the
+            # request as statement_params {'MULTI_STATEMENT_COUNT': 1} - the billable path
+            # gets the same server-side single-statement pin as EXPLAIN above.
+            cur.execute_async(wrapped_sql, num_statements=_SINGLE_STATEMENT_COUNT)
             query_id = cur.sfqid
             if query_id is None:
                 raise SanitizedEngineError("execute_async did not return a query id")
@@ -378,15 +857,21 @@ def execute_bounded(
             while conn.is_still_running(status):
                 if elapsed_seconds >= _MAX_EXECUTION_WAIT_SECONDS:
                     _cancel_query(conn, query_id)
+                    # The id is connector-returned text, not this process's own: it goes into
+                    # the log record and the error presented (repr-quoted, bounded, one line),
+                    # never raw - the SDK's stderr handler is a bare '%(message)s', so a raw
+                    # '\n' in it started a second, prefix-free record that read exactly like
+                    # a genuine 'tool=... outcome=...' line (PR #86 verification, probe-4 p28).
+                    presented_query_id = present_remote_text(str(query_id))
                     logger.warning(
                         "engine=snowflake execute_bounded timed out after %ss, "
                         "cancelled query_id=%s",
                         _MAX_EXECUTION_WAIT_SECONDS,
-                        query_id,
+                        presented_query_id,
                     )
                     raise TimeoutError(
                         f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
-                        f"(query_id={query_id})."
+                        f"(query_id={presented_query_id})."
                     )
                 time.sleep(_POLL_INTERVAL_SECONDS)
                 elapsed_seconds += _POLL_INTERVAL_SECONDS
@@ -418,8 +903,10 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     result here, not an error condition — this function always returns a
     CredentialCheckResult (never raises for a credential/connectivity failure) so a caller
     can distinguish "not configured yet" from "actually broken" before attempting a real
-    estimate_query_cost/run_query_bounded call. redact_secrets is applied defensively even
-    though _connect() already redacts its own failures — it is a no-op on already-safe text.
+    estimate_query_cost/run_query_bounded call. The failure detail goes through the same
+    redact_secrets -> present_remote_text chain as every other outbound error text (bounded,
+    repr()-quoted) and is recorded as one WARNING - also when _connect() already sanitized
+    its own failure, where re-presenting the already-safe text just adds a layer of quotes.
     """
     conn: snowflake.connector.SnowflakeConnection | None = None
     try:
@@ -427,13 +914,22 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
         with conn.cursor() as cur:
             if warehouse is not None:
                 cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-            cur.execute("SELECT CURRENT_ROLE(), CURRENT_WAREHOUSE(), CURRENT_ACCOUNT()")
+            # CURRENT_SECONDARY_ROLES() is reported so the operator can SEE the effective
+            # authority of this session (primary role plus active secondary roles), not just
+            # the primary role the config asked for - see _connect().
+            cur.execute(
+                "SELECT CURRENT_ROLE(), CURRENT_SECONDARY_ROLES(), CURRENT_WAREHOUSE(), "
+                "CURRENT_ACCOUNT()"
+            )
             row = cur.fetchone()
             if row is None:
                 raise SanitizedEngineError("session context query returned no rows")
-            role, current_warehouse, account = row
+            role, secondary_roles, current_warehouse, account = row
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
-        return CredentialCheckResult(engine="snowflake", ok=False, detail=redact_secrets(str(exc)))
+        raw_detail = str(exc)
+        safe_detail = present_remote_text(redact_secrets(raw_detail), total_chars=len(raw_detail))
+        logger.warning("engine=snowflake check_credentials_failed detail=%s", safe_detail)
+        return CredentialCheckResult(engine="snowflake", ok=False, detail=safe_detail)
     finally:
         # conn is None if _connect() itself raised — nothing to close in that case. A failed
         # close() is best-effort and must never mask the success return below.
@@ -443,11 +939,17 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
             except Exception:  # noqa: BLE001, S110
                 pass
 
+    # The four identity values are warehouse-returned text (CURRENT_ROLE() etc. echo whatever
+    # the account holds) and this detail reaches the model as structuredContent, so each is
+    # presented - bounded, repr-quoted, one line - instead of interpolated raw inside literal
+    # quotes. PR #86 verification (probe-4 p5a) delivered a detail carrying U+000A, ESC, CR,
+    # U+0085 and U+2028 through this f-string. The success path stays log-free.
     return CredentialCheckResult(
         engine="snowflake",
         ok=True,
         detail=(
-            f"Authenticated as role '{role}' on account '{account}', "
-            f"warehouse '{current_warehouse}'."
+            f"Authenticated as role {_present_observed(role)} (secondary roles: "
+            f"{_present_observed(secondary_roles)}) on account {_present_observed(account)}, "
+            f"warehouse {_present_observed(current_warehouse)}."
         ),
     )

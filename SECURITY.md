@@ -27,8 +27,9 @@ Please include:
 
 ## Scope
 
-This project talks to two cloud warehouse APIs (BigQuery, Snowflake) and handles
-credentials for both (service-account keys, RSA private keys). In scope:
+This project talks to three cloud warehouse APIs (BigQuery, Snowflake, Databricks) and
+handles credentials for all three (service-account keys, RSA private keys, personal access
+tokens / OAuth client secrets). In scope:
 
 - Credential handling — anything that could cause a credential to leak into a log, an
   exception message, or a tool response
@@ -36,9 +37,12 @@ credentials for both (service-account keys, RSA private keys). In scope:
   project ID) escape its intended context
 - Cap-enforcement bypass — anything that lets `run_query_bounded`'s
   `max_bytes_billed`/`max_rows`/`max_estimated_cost_usd` be silently ignored
+- Untrusted warehouse content — content returned by the warehouse (rows, error text) is
+  untrusted data, not an instruction: anything that lets it reach the model or the
+  operator's log unlabelled, unbounded, or able to forge a log-record boundary
 
-Out of scope: vulnerabilities in BigQuery, Snowflake, or the official `mcp` SDK
-themselves — report those to Google, Snowflake, or
+Out of scope: vulnerabilities in BigQuery, Snowflake, Databricks, or the official `mcp`
+SDK themselves — report those to Google, Snowflake, Databricks, or
 [modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk)
 respectively.
 

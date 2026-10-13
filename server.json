@@ -37,7 +37,13 @@
         },
         {
           "name": "SNOWFLAKE_ROLE",
-          "description": "Snowflake: role to assume. Required to use the snowflake engine; has no default and must never be ACCOUNTADMIN.",
+          "description": "Snowflake: role to assume. Required to use the snowflake engine; has no default and must never be ACCOUNTADMIN (ACCOUNTADMIN, SECURITYADMIN and ORGADMIN are rejected before any Snowflake connection is opened - the check runs when the Snowflake configuration is first loaded, on the first Snowflake tool call; the server process itself starts regardless, so a bad role surfaces as a failed check_credentials or a tool error, not as a startup exit).",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "SNOWFLAKE_SECONDARY_ROLES",
+          "description": "Snowflake: secondary roles activated at login. NONE (default) means only SNOWFLAKE_ROLE is active in the session; ALL is the explicit opt-out that activates every role granted to SNOWFLAKE_USER.",
           "isRequired": false,
           "isSecret": false
         },
@@ -58,6 +64,12 @@
           "description": "Snowflake: password (discouraged; prefer SNOWFLAKE_PRIVATE_KEY_PATH). Either this or SNOWFLAKE_PRIVATE_KEY_PATH is required to use the snowflake engine.",
           "isRequired": false,
           "isSecret": true
+        },
+        {
+          "name": "SNOWFLAKE_EDITION",
+          "description": "Snowflake: account edition that sets the USD/credit price of estimates - standard (default), enterprise, business_critical or vps. The per-call edition argument can only raise it.",
+          "isRequired": false,
+          "isSecret": false
         },
         {
           "name": "DATABRICKS_SERVER_HOSTNAME",
@@ -88,6 +100,18 @@
           "description": "Databricks: OAuth machine-to-machine service-principal client secret. Requires DATABRICKS_CLIENT_ID as well.",
           "isRequired": false,
           "isSecret": true
+        },
+        {
+          "name": "COST_GUARD_ALLOW_MULTI_STATEMENT_SQL",
+          "description": "Set to 1 to let estimate_query_cost/run_query_bounded accept text containing more than one SQL statement. Off by default: the cost cap is only known to cover the single statement the dry run/EXPLAIN priced. Skips only this server's scanner: Snowflake still rejects multi-statement text (sessions are pinned to MULTI_STATEMENT_COUNT=1), and max_rows wraps the whole text in one LIMIT subquery, so use the opt-out without max_rows.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "COST_GUARD_MAX_IN_FLIGHT_QUERIES",
+          "description": "Maximum number of run_query_bounded calls allowed in flight at once (positive integer, default 8). A cancelled call keeps its slot until its warehouse query completes or the 120 s watchdog fires; a call over the cap fails with a tool error naming this variable before any warehouse connection is opened.",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

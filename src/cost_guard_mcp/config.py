@@ -1,9 +1,14 @@
 import os
 from dataclasses import dataclass, field
 
+from cost_guard_mcp.pricing.snowflake_pricing import usd_per_credit
+
 
 class ConfigError(RuntimeError):
     """Raised when a required credential/config env var is missing or invalid."""
+
+
+_DEFAULT_SNOWFLAKE_EDITION = "standard"
 
 
 @dataclass(frozen=True)
@@ -19,6 +24,13 @@ class SnowflakeConfig:
     private_key_path: str | None
     private_key_passphrase: str | None = field(repr=False)
     password: str | None = field(repr=False)
+    # Login-time SECONDARY_ROLES pin: "NONE" (default) or "ALL" (explicit opt-out). See
+    # load_snowflake_config() and DECISIONS.md #7.
+    secondary_roles: str = "NONE"
+    # Account edition (SNOWFLAKE_EDITION) sets the USD/credit price of every estimate. It is
+    # operator configuration because the server cannot observe it without ORGADMIN; the
+    # per-call `edition` tool argument may only raise it (DECISIONS.md #19).
+    edition: str = _DEFAULT_SNOWFLAKE_EDITION
 
 
 @dataclass(frozen=True)
@@ -41,6 +53,65 @@ def load_bigquery_config() -> BigQueryConfig:
     return BigQueryConfig(google_application_credentials=creds)
 
 
+# Account-wide administrative roles that SNOWFLAKE_ROLE may never be set to. DECISIONS.md #7,
+# README and server.json have always promised "never ACCOUNTADMIN"; this makes the promise a
+# load-time check instead of prose. SECURITYADMIN and ORGADMIN carry the same class of
+# account-wide authority (grant management / organization administration) and are rejected
+# for the same reason. Compared after stripping whitespace and both quote styles (see
+# _normalize_snowflake_role_name) so a quoted or lower-case env value cannot slip past
+# (security audit, plan-review amendment A17).
+_REJECTED_SNOWFLAKE_ADMIN_ROLES = frozenset({"ACCOUNTADMIN", "SECURITYADMIN", "ORGADMIN"})
+
+# The only values Snowflake's login-time SECONDARY_ROLES accepts. "NONE" is the secure default:
+# without an explicit pin, Snowflake activates the user's DEFAULT_SECONDARY_ROLES - documented
+# as ('ALL') for users created after behavior-change bundle 2024_07 - so model-supplied SQL
+# would be authorized by EVERY role granted to SNOWFLAKE_USER, not by SNOWFLAKE_ROLE alone.
+_ALLOWED_SNOWFLAKE_SECONDARY_ROLES = frozenset({"NONE", "ALL"})
+
+
+def _normalize_snowflake_role_name(role: str) -> str:
+    """The comparison form of SNOWFLAKE_ROLE for the admin-role check: every layer of outer
+    whitespace and of either quoting style (double OR single quotes) a shell or secret store
+    can leave around the value is peeled until the text stops changing, then upper-cased. One
+    layer was not enough: PR #86 verification found "'ACCOUNTADMIN'" passing a double-quote-only
+    normaliser (T5) and the delta round found " 'ACCOUNTADMIN' " - whitespace between two
+    layers - passing the one-layer version (probe d04)."""
+    text = role
+    while True:
+        peeled = text.strip().strip("\"'")
+        if peeled == text:
+            return text.upper()
+        text = peeled
+
+
+def _load_snowflake_secondary_roles() -> str:
+    # An empty string (what CI / secret stores set for a missing value) is treated as unset,
+    # exactly like the empty-passphrase handling below - it falls to the secure default.
+    raw = os.environ.get("SNOWFLAKE_SECONDARY_ROLES", "").strip().upper()
+    if not raw:
+        return "NONE"
+    if raw not in _ALLOWED_SNOWFLAKE_SECONDARY_ROLES:
+        raise ConfigError(
+            "SNOWFLAKE_SECONDARY_ROLES must be either NONE (default: only SNOWFLAKE_ROLE is "
+            "active in the session) or ALL (opt-out: every role granted to SNOWFLAKE_USER is "
+            "active). Individual role names are not accepted here - grant the objects to "
+            "SNOWFLAKE_ROLE instead."
+        )
+    return raw
+
+
+def _parse_snowflake_edition(raw: str | None) -> str:
+    """Normalise SNOWFLAKE_EDITION (unset/empty -> 'standard', case-insensitive) and validate
+    it against the pricing table at load time, so a typo is a clear ConfigError on the first
+    tool call rather than a pricing ValueError inside an estimate."""
+    edition = (raw or "").strip().lower() or _DEFAULT_SNOWFLAKE_EDITION
+    try:
+        usd_per_credit(edition)
+    except ValueError as exc:
+        raise ConfigError(f"SNOWFLAKE_EDITION is invalid: {exc}") from exc
+    return edition
+
+
 def load_snowflake_config() -> SnowflakeConfig:
     account = os.environ.get("SNOWFLAKE_ACCOUNT")
     user = os.environ.get("SNOWFLAKE_USER")
@@ -56,6 +127,17 @@ def load_snowflake_config() -> SnowflakeConfig:
             "to any role (in particular, never ACCOUNTADMIN). Set it to a "
             "least-privilege role scoped to the objects you want cost-estimated."
         )
+    if _normalize_snowflake_role_name(role) in _REJECTED_SNOWFLAKE_ADMIN_ROLES:
+        # Static text on purpose: the value is operator config, but this message reaches
+        # the MCP client as a ToolError, so it never echoes the env value back.
+        raise ConfigError(
+            "SNOWFLAKE_ROLE must not be an account-wide administrative role (ACCOUNTADMIN, "
+            "SECURITYADMIN or ORGADMIN) - cost-guard-mcp runs model-supplied SQL under this "
+            "role. Set it to a least-privilege role scoped to the objects you want "
+            "cost-estimated."
+        )
+
+    secondary_roles = _load_snowflake_secondary_roles()
 
     private_key_path = os.environ.get("SNOWFLAKE_PRIVATE_KEY_PATH")
     password = os.environ.get("SNOWFLAKE_PASSWORD")
@@ -79,6 +161,8 @@ def load_snowflake_config() -> SnowflakeConfig:
         # meaningfully different from no passphrase.
         private_key_passphrase=os.environ.get("SNOWFLAKE_PRIVATE_KEY_PASSPHRASE") or None,
         password=password,
+        secondary_roles=secondary_roles,
+        edition=_parse_snowflake_edition(os.environ.get("SNOWFLAKE_EDITION")),
     )
 
 

@@ -40,6 +40,30 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "warehouse argument is supplied - omitting it uses whatever warehouse is "
                 "already active on the connection."
             ),
+            (
+                "The dollar figure is priced at the warehouse the query is pinned to as observed "
+                "through SHOW WAREHOUSES (size, type, Gen1/Gen2) - or the session's current "
+                "warehouse when no warehouse argument is given; warehouse_size and edition "
+                "(operator-configured via SNOWFLAKE_EDITION) can only raise the estimate, never "
+                "lower it. If that lookup fails (e.g. the role cannot run SHOW WAREHOUSES) the "
+                "estimate falls back to the caller-asserted size at Gen1 rates with a caveat; "
+                "if SHOW WAREHOUSES lists rows but none named exactly like the pinned "
+                "warehouse, no dollar figure is produced and a dollar cap refuses."
+            ),
+            (
+                "Only STANDARD warehouses are priced: a Snowpark-optimized (or any other "
+                "non-STANDARD type, or unrecognised-size) warehouse gets a byte estimate but no "
+                "dollar figure, so run_query_bounded refuses a max_estimated_cost_usd cap on it "
+                "- omit the dollar cap to run there."
+            ),
+            (
+                "check_credentials and estimate_query_cost are read-only with respect to data "
+                "but not free of compute: they run lightweight statements (USE WAREHOUSE, a "
+                "session-context SELECT, EXPLAIN, SHOW WAREHOUSES, CURRENT_REGION(), a "
+                "QUERY_HISTORY read) on the named or default warehouse session, which can "
+                "resume a suspended AUTO_RESUME warehouse and bill compute until it suspends "
+                "again."
+            ),
         ],
     ),
     "databricks": EngineCapabilities(
@@ -51,19 +75,36 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
             (
                 "Databricks has no BigQuery-style dry-run; EXPLAIN COST's plan-node "
                 "statistics are frequently absent (no ANALYZE TABLE run, streaming "
-                "sources, non-Delta external tables) - byte estimates may be unavailable."
+                "sources, non-Delta external tables) - without them both the byte and the "
+                "dollar estimate are unavailable (None), not zero, and run_query_bounded "
+                "refuses any max_bytes_billed or max_estimated_cost_usd cap for that query."
             ),
             (
                 "The dollar figure assumes a fixed placeholder runtime on a Serverless SQL "
                 "warehouse, not derived from this query's actual expected runtime."
             ),
             (
-                "Only Serverless SQL warehouse pricing is modeled - Classic/Pro warehouses "
-                "use different DBU rates plus a separate cloud VM cost not modeled here."
+                "The dollar figure is priced at the SQL warehouse DATABRICKS_HTTP_PATH binds "
+                "to, as observed through the Warehouses API (cluster size, Serverless or not); "
+                "warehouse_size can only raise the estimate, never lower it. If that lookup "
+                "fails (e.g. the principal lacks CAN_VIEW/CAN_USE on the warehouse) the "
+                "estimate falls back to the caller-asserted size with a caveat."
+            ),
+            (
+                "Only Serverless SQL warehouse pricing is modeled: a Classic/Pro warehouse "
+                "(different DBU rates plus a separate cloud VM cost) gets a byte estimate but "
+                "no dollar figure, so run_query_bounded refuses a max_estimated_cost_usd cap on "
+                "it - omit the dollar cap to run there."
             ),
             (
                 "There is no per-query USE WAREHOUSE equivalent - the SQL warehouse is "
                 "fixed by DATABRICKS_HTTP_PATH at connect time, not overridable per call."
+            ),
+            (
+                "check_credentials and estimate_query_cost are read-only with respect to data "
+                "but not free of compute: they open a session on the DATABRICKS_HTTP_PATH "
+                "warehouse and run SELECT current_user() / EXPLAIN COST, which can start a "
+                "STOPPED SQL warehouse and bill compute until it auto-stops again."
             ),
         ],
     ),

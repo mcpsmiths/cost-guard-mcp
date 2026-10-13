@@ -48,12 +48,17 @@ _DBUS_PER_HOUR: dict[str, float] = {
 # matching the same assumption already made for BigQuery and Snowflake pricing.
 SERVERLESS_USD_PER_DBU = 0.70
 
+# How much of an unrecognised, model-supplied argument the ValueError below echoes back. The
+# message is logged and returned by sanitize_exceptions, so the echo is bounded here rather
+# than letting an oversized argument inflate that record.
+_MAX_ECHO_CHARS = 64
+
 
 def dbus_per_hour(warehouse_size: str) -> float:
     size = warehouse_size.upper()
     if size not in _DBUS_PER_HOUR:
         raise ValueError(
-            f"unknown Databricks warehouse size '{warehouse_size}'. "
+            f"unknown Databricks warehouse size {warehouse_size[:_MAX_ECHO_CHARS]!r}. "
             f"Known sizes: {sorted(_DBUS_PER_HOUR)}."
         )
     return _DBUS_PER_HOUR[size]

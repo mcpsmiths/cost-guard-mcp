@@ -79,6 +79,11 @@ _USD_PER_CREDIT_BY_EDITION: dict[str, float] = {
     "vps": 6.00,
 }
 
+# How much of an unrecognised, model-supplied argument the ValueError below echoes back. The
+# message is logged and returned by sanitize_exceptions, so the echo is bounded here rather
+# than letting an oversized argument inflate that record.
+_MAX_ECHO_CHARS = 64
+
 
 def credits_per_hour(
     warehouse_size: str, generation: str = "1", cloud_provider: str = "AWS"
@@ -94,7 +99,7 @@ def credits_per_hour(
     size = warehouse_size.upper()
     if size not in _GEN1_CREDITS_PER_HOUR:
         raise ValueError(
-            f"unknown Snowflake warehouse size '{warehouse_size}'. "
+            f"unknown Snowflake warehouse size {warehouse_size[:_MAX_ECHO_CHARS]!r}. "
             f"Known sizes: {sorted(_GEN1_CREDITS_PER_HOUR)}."
         )
     if generation == "2":
@@ -108,6 +113,7 @@ def usd_per_credit(edition: str = "standard") -> float:
     key = edition.lower()
     if key not in _USD_PER_CREDIT_BY_EDITION:
         raise ValueError(
-            f"unknown Snowflake edition '{edition}'. Known editions: {sorted(_USD_PER_CREDIT_BY_EDITION)}."
+            f"unknown Snowflake edition {edition[:_MAX_ECHO_CHARS]!r}. "
+            f"Known editions: {sorted(_USD_PER_CREDIT_BY_EDITION)}."
         )
     return _USD_PER_CREDIT_BY_EDITION[key]

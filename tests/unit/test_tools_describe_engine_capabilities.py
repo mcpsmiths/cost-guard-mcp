@@ -34,3 +34,35 @@ def test_databricks_capabilities_are_heuristic_by_default():
     assert caps.supports_dollar_estimate is True
     assert caps.default_accuracy_tier == AccuracyTier.HEURISTIC
     assert any("EXPLAIN COST" in gap for gap in caps.known_gaps)
+
+
+def test_databricks_known_gaps_disclose_dollar_estimate_is_none_without_statistics():
+    # Audit: databricks-dollar-estimate-floor-when-size-statistics-absent - the gap text
+    # must tell the caller that BOTH the byte and the dollar estimate are unavailable
+    # without plan statistics and that run_query_bounded refuses caps in that state.
+    caps = describe_engine_capabilities("databricks")
+    assert any("dollar" in gap and "unavailable" in gap for gap in caps.known_gaps)
+    assert any("refuse" in gap.lower() for gap in caps.known_gaps)
+
+
+def test_snowflake_capabilities_disclose_observed_size_reconciliation_and_fail_closed_types():
+    caps = describe_engine_capabilities("snowflake")
+    assert any("SHOW WAREHOUSES" in gap and "only raise" in gap for gap in caps.known_gaps)
+    assert any(
+        "Snowpark-optimized" in gap and "no dollar" in gap.lower() for gap in caps.known_gaps
+    )
+
+
+def test_databricks_capabilities_disclose_observed_size_reconciliation_and_fail_closed_types():
+    caps = describe_engine_capabilities("databricks")
+    assert any("only raise" in gap for gap in caps.known_gaps)
+    assert any("Classic/Pro" in gap and "no dollar" in gap.lower() for gap in caps.known_gaps)
+
+
+@pytest.mark.parametrize("engine", ["snowflake", "databricks"])
+def test_warehouse_engines_disclose_that_read_only_tools_can_start_or_resume_a_warehouse(engine):
+    caps = describe_engine_capabilities(engine)
+    assert any(
+        "check_credentials" in gap and "estimate_query_cost" in gap and "compute" in gap
+        for gap in caps.known_gaps
+    )

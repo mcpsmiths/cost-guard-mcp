@@ -50,3 +50,35 @@ def test_run_query_bounded_refuses_on_impossible_byte_cap():
     )
 
     assert result.status == "refused"
+
+
+def test_lookup_warehouse_facts_reads_the_live_show_warehouses_row_shape():
+    # Release gate for observed-warehouse pricing (DECISIONS.md #19): the SHOW WAREHOUSES
+    # `size`/`type`/`generation` text must map onto the pricing table on a real account, and
+    # CURRENT_WAREHOUSE() must resolve the session's warehouse when no argument is given.
+    from cost_guard_mcp.engines.snowflake import _connect, _lookup_warehouse_facts
+    from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour
+
+    _require_env("SNOWFLAKE_ACCOUNT")
+    _require_env("SNOWFLAKE_USER")
+    _require_env("SNOWFLAKE_ROLE")
+
+    conn = _connect()
+    try:
+        facts = _lookup_warehouse_facts(conn, "COMPUTE_WH")
+        with conn.cursor() as cur:
+            cur.execute("USE WAREHOUSE COMPUTE_WH")
+        resolved = _lookup_warehouse_facts(conn, None)
+    finally:
+        conn.close()
+
+    assert facts is not None
+    assert facts.name == "COMPUTE_WH"
+    assert facts.warehouse_type == "STANDARD"
+    assert facts.size_key is not None, facts.size_text
+    assert credits_per_hour(facts.size_key) > 0
+    assert facts.generation in ("1", "2")
+    assert facts.cloud_provider in ("AWS", "AZURE", "GCP")
+    assert facts.state is not None
+    assert resolved is not None
+    assert resolved.name == "COMPUTE_WH"

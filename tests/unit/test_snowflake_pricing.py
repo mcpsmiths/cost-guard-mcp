@@ -98,3 +98,39 @@ def test_credits_per_hour_unknown_generation_string_falls_back_to_gen1():
     # Only the literal "2" opts into the Gen2 table — any other/unexpected generation string
     # (e.g. a future "3", or a malformed lookup result) must degrade safely to Gen1, not raise.
     assert credits_per_hour("MEDIUM", generation="unknown") == 4.0
+
+
+def test_credits_per_hour_error_message_escapes_control_characters_in_size():
+    # The model-supplied warehouse_size is echoed into the ValueError that
+    # sanitize_exceptions logs; it must be repr-quoted so a newline in the argument cannot
+    # forge a second log record (audit: log-record-forgery-control-chars).
+    with pytest.raises(ValueError, match=r"'XSMALL\\nforged line'") as exc_info:
+        credits_per_hour("XSMALL\nforged line")
+
+    assert "\n" not in str(exc_info.value)
+
+
+def test_usd_per_credit_error_message_escapes_control_characters_in_edition():
+    with pytest.raises(ValueError, match=r"'standard\\nforged line'") as exc_info:
+        usd_per_credit("standard\nforged line")
+
+    assert "\n" not in str(exc_info.value)
+
+
+def test_credits_per_hour_error_message_bounds_the_echoed_size():
+    # The echo is the one place a model-supplied argument re-enters the exception text that
+    # sanitize_exceptions redacts and logs; cap it so an oversized argument cannot inflate
+    # the record (audit: redact-secrets-quadratic-regex-on-unbounded-text).
+    with pytest.raises(ValueError) as exc_info:
+        credits_per_hour("Z" * 500)
+
+    assert "Z" * 64 in str(exc_info.value)
+    assert "Z" * 65 not in str(exc_info.value)
+
+
+def test_usd_per_credit_error_message_bounds_the_echoed_edition():
+    with pytest.raises(ValueError) as exc_info:
+        usd_per_credit("z" * 500)
+
+    assert "z" * 64 in str(exc_info.value)
+    assert "z" * 65 not in str(exc_info.value)

@@ -5,13 +5,19 @@ channel for stdio mode. All diagnostic output must go to stderr (the default
 for Python's `logging` module when no handler is configured, and for `print(..., file=sys.stderr)`).
 """
 
+import functools
 import os
+import re
+import threading
+from collections.abc import Callable
 
+import anyio.from_thread
 import anyio.to_thread
 from mcp.server import MCPServer
 from mcp_types import ToolAnnotations
 
-from cost_guard_mcp.errors import as_tool_error
+from cost_guard_mcp.config import ConfigError
+from cost_guard_mcp.errors import UserVisibleError, as_tool_error
 from cost_guard_mcp.tools.check_credentials import check_credentials as _check_credentials
 from cost_guard_mcp.tools.describe_engine_capabilities import (
     describe_engine_capabilities as _describe_engine_capabilities,
@@ -54,6 +60,86 @@ _check_credentials_safe = as_tool_error(_check_credentials)
 _describe_engine_capabilities_safe = as_tool_error(_describe_engine_capabilities)
 _estimate_query_cost_safe = as_tool_error(_estimate_query_cost)
 
+# Explicit in-flight cap for the one tool with a monetary side effect. The MCP-level detach
+# below (abandon_on_cancel=True) returns anyio's thread-limiter token the moment the host
+# cancels, while the worker thread, its per-call warehouse connection and the running query
+# stay pinned for up to the 120 s watchdog - so without this cap a host that cancels and
+# re-issues could pin an unbounded number of live warehouse queries, and the process would
+# have stopped counting them. The slot is held for the thread's whole lifetime, cancelled
+# or not. Positive integer, default 8; a bad value fails at startup naming the variable.
+_MAX_IN_FLIGHT_QUERIES_ENV_VAR = "COST_GUARD_MAX_IN_FLIGHT_QUERIES"
+_DEFAULT_MAX_IN_FLIGHT_QUERIES = 8
+# A plain positive decimal integer, nothing else: int() would also accept a sign, a leading
+# zero, "_" separators and non-ASCII digits, so the value an operator meant and the value
+# the process ran with could differ (PR #86 runtime verification, container/CLI matrix).
+_POSITIVE_DECIMAL_INTEGER_RE = re.compile(r"[1-9][0-9]*", re.ASCII)
+# Above this the cap is no cap: a 20-digit value started the server and ran every parallel
+# call (delta verification), which is never what an operator meant.
+_MAX_IN_FLIGHT_QUERIES_UPPER_BOUND = 1000
+
+
+def _load_max_in_flight_queries() -> int:
+    raw = os.environ.get(_MAX_IN_FLIGHT_QUERIES_ENV_VAR)
+    # Unset or blank (what GitHub Actions passes for an unset secret) -> default.
+    text = "" if raw is None else raw.strip()
+    if not text:
+        return _DEFAULT_MAX_IN_FLIGHT_QUERIES
+    value = int(text) if _POSITIVE_DECIMAL_INTEGER_RE.fullmatch(text) else 0
+    if not 1 <= value <= _MAX_IN_FLIGHT_QUERIES_UPPER_BOUND:
+        # Names only the variable - never echoes the rejected text into the error.
+        raise ConfigError(
+            f"{_MAX_IN_FLIGHT_QUERIES_ENV_VAR} must be a positive integer no larger than "
+            f"{_MAX_IN_FLIGHT_QUERIES_UPPER_BOUND}: the maximum number "
+            f"of run_query_bounded calls allowed in flight at once (default "
+            f"{_DEFAULT_MAX_IN_FLIGHT_QUERIES})."
+        )
+    return value
+
+
+_MAX_IN_FLIGHT_QUERIES = _load_max_in_flight_queries()
+_RUN_QUERY_BOUNDED_IN_FLIGHT = threading.BoundedSemaphore(_MAX_IN_FLIGHT_QUERIES)
+
+
+def _run_query_bounded_holding_in_flight_slot(
+    engine: Engine,
+    sql: str,
+    max_bytes_billed: int | None,
+    max_rows: int | None,
+    max_estimated_cost_usd: float | None,
+    warehouse: str | None,
+    warehouse_size: str | None,
+    edition: str | None,
+    *,
+    before_execute: Callable[[], None] | None = None,
+) -> BoundedQueryResult:
+    # Runs INSIDE the worker thread, deliberately. Both the acquire and the release must
+    # live here: anyio's WorkerThread.run skips the function entirely when the future is
+    # already cancelled by the time the thread picks the job up, so an acquire on the async
+    # side could leak a slot that no thread would ever release; and a blocking acquire would
+    # park one of anyio's shared thread-pool tokens behind a full cap instead of refusing.
+    # The non-blocking refusal happens before any warehouse connection is opened.
+    if not _RUN_QUERY_BOUNDED_IN_FLIGHT.acquire(blocking=False):
+        raise UserVisibleError(
+            f"run_query_bounded: {_MAX_IN_FLIGHT_QUERIES} queries are already in flight "
+            f"({_MAX_IN_FLIGHT_QUERIES_ENV_VAR}={_MAX_IN_FLIGHT_QUERIES}); wait for one to "
+            "finish - a cancelled call keeps its slot until its warehouse query completes or "
+            "the ~120 s watchdog cancels it."
+        )
+    try:
+        return _run_query_bounded(
+            engine,
+            sql,
+            max_bytes_billed,
+            max_rows,
+            max_estimated_cost_usd,
+            warehouse,
+            warehouse_size,
+            edition,
+            before_execute=before_execute,
+        )
+    finally:
+        _RUN_QUERY_BOUNDED_IN_FLIGHT.release()
+
 
 async def _run_query_bounded_in_thread(
     engine: Engine,
@@ -74,31 +160,53 @@ async def _run_query_bounded_in_thread(
     # mcp.server.mcpserver.utilities.func_metadata.FuncMetadata.call_fn). abandon_on_cancel=True
     # makes cancellation prompt at the MCP bookkeeping level only - the abandoned thread (and
     # the warehouse-side query it's running) keeps going until the existing per-engine
-    # watchdog (~120s) cancels it; see README's Known limitations.
+    # watchdog (~120s) cancels it; see README's Known limitations and DECISIONS.md #14.
+    #
+    # before_execute=anyio.from_thread.check_cancelled is the cooperative half of that
+    # trade-off: the tool body calls it once, after the estimate and every cap check and
+    # immediately before the execution is dispatched, so a cancel that arrived during the
+    # estimate raises inside the (already abandoned) worker thread instead of letting it
+    # submit a billable query into a cancelled future nobody reads. It inspects the thread's
+    # anyio cancel-scope chain - the mcp dispatcher cancels the handler's CancelScope
+    # (peer_cancel_mode "interrupt"), which is what trips it; a bare asyncio Task.cancel()
+    # would not. Bound here, not in the tool body: check_cancelled raises NoEventLoopError
+    # when called outside an anyio worker thread.
     return await anyio.to_thread.run_sync(
-        _run_query_bounded,
-        engine,
-        sql,
-        max_bytes_billed,
-        max_rows,
-        max_estimated_cost_usd,
-        warehouse,
-        warehouse_size,
-        edition,
+        functools.partial(
+            _run_query_bounded_holding_in_flight_slot,
+            engine,
+            sql,
+            max_bytes_billed,
+            max_rows,
+            max_estimated_cost_usd,
+            warehouse,
+            warehouse_size,
+            edition,
+            before_execute=anyio.from_thread.check_cancelled,
+        ),
         abandon_on_cancel=True,
     )
 
 
 # Wrapping the async helper (not the sync implementation) keeps as_tool_error's async code
-# path, exactly as when it was stacked on the async tool itself.
+# path, exactly as when it was stacked on the async tool itself. The helper is renamed first
+# so the per-call outcome record (functools.wraps copies __name__ at wrap time) reads
+# `tool=run_query_bounded` - the registered tool - rather than naming this thread helper;
+# nothing else reads that __name__.
+_run_query_bounded_in_thread.__name__ = "run_query_bounded"
 _run_query_bounded_safe = as_tool_error(_run_query_bounded_in_thread)
 
 
 @mcp.tool(annotations=_CHECK_CREDENTIALS_ANNOTATIONS)
 def check_credentials(engine: Engine, warehouse: str | None = None) -> CredentialCheckResult:
-    """Verify credentials/connectivity for an engine without running any real query or
-    dry-run estimate. Call this once after configuring a new engine (or when a real tool
-    call fails) to get a fast, clear yes/no signal instead of debugging via trial queries.
+    """Verify credentials/connectivity for an engine with one lightweight session-context
+    statement - no real query and no dry-run estimate. Call this once after configuring a new
+    engine (or when a real tool call fails) to get a fast, clear yes/no signal instead of
+    debugging via trial queries.
+
+    Compute disclosure: on Snowflake and Databricks that statement runs on the named (or
+    default/configured) warehouse session, which can resume a suspended or start a stopped
+    warehouse and bill compute unless it is already running.
     """
     return _check_credentials_safe(engine, warehouse)
 
@@ -124,11 +232,20 @@ def estimate_query_cost(
     """Estimate the cost of a SQL query before running it. ALWAYS call this before running
     an expensive-looking query. The response's accuracy_tier tells you how much to trust
     the number: PRECISE (exact), UPPER_BOUND (real cap, may overstate), HEURISTIC (rough).
+    Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
+    more statements is refused before anything is estimated.
 
     warehouse_size (Snowflake/Databricks only, e.g. "SMALL", "X-Large") and edition
-    (Snowflake only, e.g. "enterprise") default to the smallest/standard tier if omitted —
-    set them to match the warehouse you actually run this query on, or the dollar figure
-    will understate cost on a larger warehouse."""
+    (Snowflake only, e.g. "enterprise") can only raise the estimate: the dollar figure is
+    priced at the warehouse the query is pinned to as the server observes it (its size, type
+    and generation) and at the operator-configured edition, whichever is higher. Warehouse
+    types without a modelled rate (Snowpark-optimized, Databricks Classic/Pro) get no dollar
+    figure.
+
+    Compute disclosure: on Snowflake and Databricks the EXPLAIN and the warehouse/history
+    metadata lookups run on the named (or default/configured) warehouse session, which can
+    resume a suspended or start a stopped warehouse and bill compute unless it is already
+    running."""
     return _estimate_query_cost_safe(engine, sql, warehouse, warehouse_size, edition)
 
 
@@ -147,10 +264,12 @@ async def run_query_bounded(
     otherwise (check result.status — "refused" means it did NOT run and result.hint explains
     why). NOTE: unlike estimate_query_cost, a successful call here has a real monetary/quota
     side effect — don't call this repeatedly without inspecting the result of each call.
+    Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
+    more statements is refused before anything is estimated or run.
 
-    warehouse_size/edition (see estimate_query_cost) default to the smallest/standard tier
-    if omitted - set them to match the warehouse you actually run on, since max_estimated_cost_usd
-    is checked against the estimate they produce."""
+    warehouse_size/edition (see estimate_query_cost) can only raise the estimate that
+    max_estimated_cost_usd is checked against - it is priced at the observed warehouse, never
+    below it, and a warehouse type without a modelled rate makes a dollar cap refuse."""
     return await _run_query_bounded_safe(
         engine,
         sql,

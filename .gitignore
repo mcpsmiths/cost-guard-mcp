@@ -10,3 +10,19 @@ dist/
 .coverage
 .gstack/
 scratch-pad/
+# Credential files an operator may create at the project root (README, "A note on
+# credentials with MCP hosts"): never committable, whatever the host layout.
+*.p8
+*.pem
+*.key
+.mcp.json
+# Project-level host configs the README's tool table points real credentials at.
+.cursor/mcp.json
+.vscode/mcp.json
+credentials*.json
+# The GCP key name used throughout README and .mcp.json.example.
+*service-account*.json
+# .env is ignored above; its per-environment variants must be too.
+.env.*
+# ...except a committed example (placeholder values only), which .env.* would silently hide.
+!.env.example

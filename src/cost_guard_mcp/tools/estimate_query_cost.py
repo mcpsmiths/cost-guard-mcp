@@ -2,6 +2,7 @@ from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines import databricks as databricks_engine
 from cost_guard_mcp.engines import snowflake as snowflake_engine
 from cost_guard_mcp.errors import UserVisibleError
+from cost_guard_mcp.sql_scope import assert_single_statement
 from cost_guard_mcp.types import CostEstimate, Engine
 
 
@@ -12,6 +13,8 @@ def estimate_query_cost(
     warehouse_size: str | None = None,
     edition: str | None = None,
 ) -> CostEstimate:
+    # The estimate prices the text as one unit, so the text must BE one unit - see sql_scope.
+    assert_single_statement(sql, engine)
     if engine == "bigquery":
         return bigquery_engine.dry_run(sql)
     if engine == "snowflake":
