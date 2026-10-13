@@ -33,13 +33,25 @@ jobs:
       # file at the tagged commit, so what actually binds release authority is the tag
       # ruleset, the `pypi` environment's tag-only deployment policy and PyPI's publisher
       # binding to that environment - see DECISIONS.md #10. HEAD^{commit} rather than
-      # $GITHUB_SHA because the release tags are annotated and $GITHUB_SHA can be the tag
-      # object itself, which merge-base rejects.
+      # $GITHUB_SHA because the release tags are annotated and $GITHUB_SHA may be the tag
+      # object itself; peeling it ourselves keeps the comparison independent of git's
+      # version-specific handling of tag objects in merge-base.
+      # The comparison uses the fully qualified refs/remotes/origin/main on purpose:
+      # fetch-depth: 0 also fetches +refs/tags/*:refs/tags/*, so a pusher who adds a tag
+      # literally named `origin/main` at the unreviewed commit makes the bare refname
+      # ambiguous and git resolves it to the tag (refs/tags/ wins over refs/remotes/) -
+      # found by runtime verification of PR #86 and pinned by
+      # tests/unit/test_release_metadata.py.
       - name: Verify tagged commit is on main
         run: |
           git fetch --no-tags origin main
+          MAIN_REF=refs/remotes/origin/main
+          if ! git rev-parse --verify --quiet "$MAIN_REF^{commit}" >/dev/null; then
+            echo "$MAIN_REF is not available after fetch - refusing to release"
+            exit 1
+          fi
           TAGGED_COMMIT="$(git rev-parse 'HEAD^{commit}')"
-          if ! git merge-base --is-ancestor "$TAGGED_COMMIT" origin/main; then
+          if ! git merge-base --is-ancestor "$TAGGED_COMMIT" "$MAIN_REF"; then
             echo "Tag $GITHUB_REF_NAME at $TAGGED_COMMIT is not an ancestor of origin/main - release tags must point at reviewed, merged history"
             exit 1
           fi

@@ -496,3 +496,92 @@ def test_gitignore_covers_private_keys_and_mcp_host_credentials():
     gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     ignored = {line.strip() for line in gitignore}
     assert {"*.p8", "*.pem", "*.key", ".mcp.json", "credentials*.json", ".env"} <= ignored
+
+
+def test_release_ancestry_gate_is_not_fooled_by_a_tag_named_origin_main(tmp_path):
+    # Runtime verification of PR #86 found this bypass: actions/checkout with fetch-depth: 0
+    # fetches +refs/tags/*:refs/tags/*, so a pusher who also pushes a *tag* literally named
+    # `origin/main` at the unreviewed commit makes the bare refname `origin/main` ambiguous,
+    # and git resolves it to the tag (refs/tags/ wins over refs/remotes/). The gate must
+    # compare against the fully qualified remote-tracking ref and still refuse v9.9.9.
+    env = _hermetic_git_env(tmp_path)
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    runner = tmp_path / "runner"
+    _git("init", "--bare", "--initial-branch=main", str(origin), cwd=tmp_path, env=env)
+    _git("init", "--initial-branch=main", str(seed), cwd=tmp_path, env=env)
+    (seed / "reviewed.txt").write_text("merged through a PR\n", encoding="utf-8")
+    _git("add", ".", cwd=seed, env=env)
+    _git("commit", "-q", "-m", "reviewed", cwd=seed, env=env)
+    _git("checkout", "-q", "-b", "unreviewed", cwd=seed, env=env)
+    (seed / "payload.txt").write_text("never reviewed\n", encoding="utf-8")
+    _git("add", ".", cwd=seed, env=env)
+    _git("commit", "-q", "-m", "unreviewed", cwd=seed, env=env)
+    _git("tag", "-a", "v9.9.9", "-m", "release off main", cwd=seed, env=env)
+    _git("tag", "origin/main", cwd=seed, env=env)  # the shadowing tag, at the unreviewed commit
+    _git("remote", "add", "origin", str(origin), cwd=seed, env=env)
+    _git("push", "-q", "origin", "main", "v9.9.9", "refs/tags/origin/main", cwd=seed, env=env)
+    _git("clone", "-q", str(origin), str(runner), cwd=tmp_path, env=env)
+    assert _git("rev-parse", "--verify", "refs/tags/origin/main", cwd=runner, env=env)
+
+    build_job = _job_block(RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8"), "build")
+    script = _step_run_script(_named_step(build_job, "Verify tagged commit is on main"))
+
+    _git("checkout", "-q", "--detach", "v9.9.9", cwd=runner, env=env)
+    tag_object = _git("rev-parse", "v9.9.9", cwd=runner, env=env)
+    refused = _run_step_script(
+        script,
+        cwd=runner,
+        env={**env, "GITHUB_REF_NAME": "v9.9.9", "GITHUB_SHA": tag_object},
+        scratch=tmp_path,
+    )
+    assert refused.returncode == 1, refused.stdout + refused.stderr
+    assert "not an ancestor of origin/main" in refused.stdout
+
+
+def _is_ignored(rel: str, *, cwd, env) -> bool:
+    # `git check-ignore -q` exits 0 when the path is ignored and 1 when it is not; any
+    # other code is a real failure. Fixed argv, no shell, so S603/S607 do not apply.
+    result = subprocess.run(  # noqa: S603
+        [shutil.which("git") or "git", "check-ignore", "-q", rel],
+        cwd=cwd,
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode in (0, 1), result.stderr.decode(errors="replace")
+    return result.returncode == 0
+
+
+def test_gitignore_covers_the_host_layouts_and_key_names_the_readme_documents(tmp_path):
+    # README's "Use with other AI coding tools" table sends real credentials to
+    # .cursor/mcp.json and .vscode/mcp.json, and names the GCP key service-account.json;
+    # all of them must be ignored by the committed .gitignore, while the tracked examples
+    # must stay visible. Checked at the git surface, not by string inspection.
+    env = _hermetic_git_env(tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git("init", "--initial-branch=main", str(repo), cwd=tmp_path, env=env)
+    (repo / ".gitignore").write_text(
+        (REPO_ROOT / ".gitignore").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    for rel in (
+        ".cursor/mcp.json",
+        ".vscode/mcp.json",
+        ".mcp.json",
+        "service-account.json",
+        "gcp-service-account-prod.json",
+        "credentials.json",
+        ".env.local",
+        ".env.production",
+        "rsa_key.p8",
+    ):
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("secret\n", encoding="utf-8")
+        assert _is_ignored(rel, cwd=repo, env=env), f"{rel} is committable (not ignored)"
+    for rel in (".mcp.json.example", "server.json", "src/x.py"):
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("tracked\n", encoding="utf-8")
+        assert not _is_ignored(rel, cwd=repo, env=env), f"{rel} must stay committable"
