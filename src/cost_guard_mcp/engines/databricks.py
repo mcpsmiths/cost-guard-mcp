@@ -293,6 +293,17 @@ _FAIL_CLOSED_HINT = (
     "for it; omit the dollar cap to run on this warehouse."
 )
 
+# Reported by explain_estimate whenever _lookup_warehouse returned None, with or without a
+# dollar figure: it is the one sentence that tells the operator WHY the estimate is priced
+# blind (and, for a fail-open configuration, the only diagnostic they get). The pricing clause
+# that used to be glued to it lives in _rate_for and appears only beside a figure (PR #86
+# round-2 review of f384634: the no-statistics branch dropped both together).
+_UNOBSERVED_WAREHOUSE_CAVEAT = (
+    "The configured SQL warehouse could not be observed (DATABRICKS_HTTP_PATH is not a "
+    "/sql/1.0/warehouses/<id> path, or GET /api/2.0/sql/warehouses/<id> failed - e.g. the "
+    "principal lacks CAN_VIEW/CAN_USE on it)."
+)
+
 
 def _rate_for(
     facts: _WarehouseFacts | None, warehouse_size: str
@@ -304,18 +315,17 @@ def _rate_for(
     (Classic/Pro add a separate cloud VM cost this project does not model) or reports a size the
     rate table lacks; explain_estimate then returns estimated_cost_usd=None so run_query_bounded
     refuses a dollar cap (DECISIONS.md #5). A failed lookup (facts is None) keeps the
-    caller-asserted/default size with an explicit caveat so principals without CAN_VIEW/CAN_USE
-    on the warehouse keep working (DECISIONS.md #19).
+    caller-asserted/default size so principals without CAN_VIEW/CAN_USE on the warehouse keep
+    working (DECISIONS.md #19); its caveat here is only the pricing clause - the observation
+    itself (_UNOBSERVED_WAREHOUSE_CAVEAT) is explain_estimate's to report in every outcome.
     """
     asserted_rate = dbus_per_hour(warehouse_size)
     if facts is None:
         caveat = (
-            "The configured SQL warehouse could not be observed (DATABRICKS_HTTP_PATH is not a "
-            "/sql/1.0/warehouses/<id> path, or GET /api/2.0/sql/warehouses/<id> failed - e.g. "
-            "the principal lacks CAN_VIEW/CAN_USE on it) — priced at the caller-asserted "
-            f"{warehouse_size} size assuming a Serverless SQL warehouse; the real cost is higher "
-            "if the warehouse is larger, and Classic/Pro warehouses add a separate cloud VM cost "
-            "not modeled here."
+            f"Priced at the caller-asserted {warehouse_size} size assuming a Serverless SQL "
+            "warehouse, because the configured warehouse was not observed; the real cost is "
+            "higher if the warehouse is larger, and Classic/Pro warehouses add a separate cloud "
+            "VM cost not modeled here."
         )
         return asserted_rate, warehouse_size, [caveat]
     if not facts.is_serverless:
@@ -383,7 +393,8 @@ def explain_estimate(
     # clear (sanitized) ValueError that never costs an API call.
     dbus_per_hour(warehouse_size)
     config = load_databricks_config()
-    rate, size_label, rate_caveats = _rate_for(_lookup_warehouse(config), warehouse_size)
+    facts = _lookup_warehouse(config)
+    rate, size_label, rate_caveats = _rate_for(facts, warehouse_size)
 
     conn = _connect()
     try:
@@ -413,8 +424,12 @@ def explain_estimate(
         # "Priced at the caller-asserted ... size") when rate is not None, or why there is
         # none when it is. They are kept with a figure, or when they ARE the refusal; a
         # no-statistics estimate carries no pricing sentence, and a rate-None estimate no
-        # runtime-baseline sentence, because neither describes anything that happened.
+        # runtime-baseline sentence, because neither describes anything that happened. The
+        # observation that the warehouse could not be looked up is not a pricing sentence: it
+        # happened in every outcome and is reported in every outcome.
         estimated_cost_usd: float | None = None
+        if facts is None:
+            caveats.append(_UNOBSERVED_WAREHOUSE_CAVEAT)
         if rate is None:
             caveats.extend(rate_caveats)
         if max_size_in_bytes is None:

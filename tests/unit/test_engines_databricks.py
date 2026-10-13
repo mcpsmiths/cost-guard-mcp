@@ -888,8 +888,16 @@ def test_explain_estimate_returns_no_dollar_figure_when_a_serverless_warehouse_r
 
 _NO_STATISTICS_PLAN = "== Optimized Logical Plan ==\nRelation[a,b] csv\n"
 _TIER_PREFIX = "Databricks has no BigQuery-style dry-run"
+_UNOBSERVED_PREFIX = "The configured SQL warehouse could not be observed"
+_PRICED_AT_ASSERTED_PREFIX = "Priced at the caller-asserted"
 _NO_STATISTICS_PREFIX = "EXPLAIN COST returned no size statistics"
 _RUNTIME_BASELINE_PREFIX = "Cost assumes a baseline"
+
+
+def _assert_caveat_prefixes(caveats, *prefixes):
+    assert len(caveats) == len(prefixes), caveats
+    for caveat, prefix in zip(caveats, prefixes, strict=True):
+        assert caveat.startswith(prefix), (caveat, prefix)
 
 
 def _assert_no_pricing_language(caveats):
@@ -904,12 +912,49 @@ def _assert_no_pricing_language(caveats):
 def test_explain_estimate_without_statistics_omits_the_pricing_caveats(mock_connect):
     # Lookup failed -> an asserted rate exists, but no statistics -> no dollar figure. The
     # live output paired "Priced at the caller-asserted X-Small size ..." with
-    # estimated_cost_usd null.
+    # estimated_cost_usd null. The pricing clause goes; the OBSERVATION sentence stays: the
+    # PR #86 round-2 review of f384634 found it dropped with the pricing clause, so the one
+    # line telling the operator that the warehouse could not be observed (the principal
+    # lacks CAN_VIEW/CAN_USE on it) vanished exactly when nothing else explained the outcome.
     estimate = _explain_with(mock_connect, explain_output=_NO_STATISTICS_PLAN)
 
     assert estimate.estimated_cost_usd is None
-    assert [c[:40] for c in estimate.caveats] == [_TIER_PREFIX, _NO_STATISTICS_PREFIX]
+    _assert_caveat_prefixes(
+        estimate.caveats, _TIER_PREFIX, _UNOBSERVED_PREFIX, _NO_STATISTICS_PREFIX
+    )
+    assert "CAN_VIEW/CAN_USE" in estimate.caveats[1]
     _assert_no_pricing_language(estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_with_a_figure_and_a_failed_lookup_lists_observation_then_pricing(
+    mock_connect,
+):
+    # Positive control for the split: with a figure the observation sentence is followed by
+    # the pricing clause it used to be glued to, then the runtime baseline.
+    estimate = _explain_with(mock_connect)
+
+    assert estimate.estimated_cost_usd is not None
+    _assert_caveat_prefixes(
+        estimate.caveats,
+        _TIER_PREFIX,
+        _UNOBSERVED_PREFIX,
+        _PRICED_AT_ASSERTED_PREFIX,
+        _RUNTIME_BASELINE_PREFIX,
+    )
+    assert "X-Small size assuming a Serverless SQL warehouse" in estimate.caveats[2]
+
+
+def test_rate_for_without_facts_returns_only_the_pricing_clause():
+    # The observation ("could not be observed ...") is explain_estimate's to report whenever
+    # the lookup failed; _rate_for's caveat is the pricing clause that only a figure justifies.
+    rate, size_label, caveats = _rate_for(None, "Medium")
+
+    assert rate == dbus_per_hour("Medium")
+    assert size_label == "Medium"
+    assert len(caveats) == 1
+    assert caveats[0].startswith(f"{_PRICED_AT_ASSERTED_PREFIX} Medium size")
+    assert "could not be observed" not in caveats[0]
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
