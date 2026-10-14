@@ -14,6 +14,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cost_guard_mcp.config import (
+    DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR,
+    SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR,
+)
+
+
+@pytest.fixture(autouse=True)
+def _warehouse_state_guards_enforced(monkeypatch):
+    """The read-only warehouse-state guards (DECISIONS.md #20) are read from the environment at
+    call time; unset both opt-ins so the suite runs with the guards enforced regardless of the
+    developer's shell. Opt-in tests set `monkeypatch.setenv(NAME, "true")` themselves."""
+    monkeypatch.delenv(DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR, raising=False)
+    monkeypatch.delenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, raising=False)
+
+
 # Column order of a SHOW WAREHOUSES result as the engine maps it by cursor.description
 # name; the real command returns many more columns, in a different order - the engine must
 # never rely on positions, only on these names.
