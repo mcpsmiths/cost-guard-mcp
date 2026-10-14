@@ -12,7 +12,13 @@ def estimate_query_cost(
     warehouse: str | None = None,
     warehouse_size: str | None = None,
     edition: str | None = None,
+    *,
+    allow_warehouse_wake: bool = False,
 ) -> CostEstimate:
+    """`allow_warehouse_wake` is keyword-only and is NOT a tool argument (server.py never passes
+    it, so the published inputSchema is unchanged): it is run_query_bounded's bypass of the
+    read-only warehouse-state guards (DECISIONS.md #20) - its execution wakes the warehouse
+    anyway. The read-only estimate_query_cost tool leaves it False. BigQuery ignores it."""
     # The estimate prices the text as one unit, so the text must BE one unit - see sql_scope.
     assert_single_statement(sql, engine)
     if engine == "bigquery":
@@ -28,7 +34,9 @@ def estimate_query_cost(
         databricks_kwargs: dict[str, str] = {}
         if warehouse_size is not None:
             databricks_kwargs["warehouse_size"] = warehouse_size
-        return databricks_engine.explain_estimate(sql, warehouse, **databricks_kwargs)
+        return databricks_engine.explain_estimate(
+            sql, warehouse, allow_warehouse_wake=allow_warehouse_wake, **databricks_kwargs
+        )
     raise UserVisibleError(
         f"estimate_query_cost: engine '{engine}' is not yet supported. "
         "Supported engines: ['bigquery', 'snowflake', 'databricks']."

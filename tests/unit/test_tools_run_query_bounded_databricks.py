@@ -7,9 +7,11 @@ module rather than test_tools_run_query_bounded.py so that file keeps a single w
 """
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from databricks.sdk.service.sql import GetWarehouseResponse, State
 
 from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 from cost_guard_mcp.types import RefusalReason
@@ -37,7 +39,7 @@ _FAKE_PAT = "fake-pat-placeholder"
 
 
 @pytest.fixture(autouse=True)
-def _databricks_warehouse_lookup_unavailable():
+def databricks_warehouse_lookup_unavailable():
     """explain_estimate observes the configured SQL warehouse through the Databricks SDK before
     pricing (the observed-warehouse decision). These gate tests pin the statistics-less -> None
     contract at the caller-asserted X-Small rate, so the lookup is made to fail (no network) and
@@ -58,7 +60,7 @@ def _databricks_warehouse_lookup_unavailable():
         mock_workspace_client_cls.return_value.warehouses.get.side_effect = RuntimeError(
             "warehouses.get not stubbed by this test"
         )
-        yield
+        yield SimpleNamespace(workspace_client_cls=mock_workspace_client_cls)
 
 
 def _mock_explain_connection(rows):
@@ -185,3 +187,28 @@ def test_databricks_long_max_sentinel_plan_refuses_both_caps(mock_connect, mock_
     assert result.estimate.estimated_bytes is None
     assert result.estimate.estimated_cost_usd is None
     mock_execute_bounded.assert_not_called()
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine.execute_bounded")
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_run_query_bounded_runs_on_a_stopped_databricks_warehouse_without_caps(
+    mock_connect, mock_execute_bounded, databricks_warehouse_lookup_unavailable
+):
+    # DECISIONS.md #20: the read-only guard refuses on a STOPPED warehouse, but run_query_bounded
+    # bypasses it (allow_warehouse_wake=True through the real tools layer) - the estimate's
+    # session opens and the execution happens, with the opt-in unset.
+    get = databricks_warehouse_lookup_unavailable.workspace_client_cls.return_value.warehouses.get
+    get.side_effect = None
+    get.return_value = GetWarehouseResponse(
+        id="abc123", cluster_size="X-Small", enable_serverless_compute=True, state=State.STOPPED
+    )
+    mock_connect.return_value = _mock_explain_connection(_PLAN_WITH_50TB_LEAF)
+    mock_execute_bounded.return_value = ([{"a": 1}], 1, False)
+
+    result = run_query_bounded("databricks", "SELECT * FROM t")
+
+    assert result.status == "ok"
+    assert result.estimate.estimated_cost_usd == _EXPECTED_50TB_COST_USD
+    mock_connect.assert_called_once()
+    mock_execute_bounded.assert_called_once_with("SELECT * FROM t", warehouse=None, max_rows=None)
+    assert not any("no session was opened" in c for c in result.estimate.caveats)

@@ -66,3 +66,28 @@ def test_warehouse_engines_disclose_that_read_only_tools_can_start_or_resume_a_w
         "check_credentials" in gap and "estimate_query_cost" in gap and "compute" in gap
         for gap in caps.known_gaps
     )
+
+
+def test_databricks_discloses_the_state_guard_and_its_opt_in():
+    # DECISIONS.md #20: the gap names the default (refuse unless RUNNING, fail closed when
+    # unreadable), the exact opt-in, and that run_query_bounded is not gated.
+    caps = describe_engine_capabilities("databricks")
+    guard_gap = next(gap for gap in caps.known_gaps if "run_query_bounded is not gated" in gap)
+    assert "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true" in guard_gap
+    assert "RUNNING" in guard_gap
+    assert "check_credentials" in guard_gap and "estimate_query_cost" in guard_gap
+    assert "compute" in guard_gap
+    assert "run_query_bounded is not gated" in guard_gap
+    assert "cannot be read" in guard_gap
+
+
+def test_databricks_no_longer_promises_the_lookup_fallback_unconditionally():
+    # The caller-asserted-size fallback on a failed lookup now exists only for
+    # run_query_bounded or under the opt-in; every gap that mentions it must say so.
+    caps = describe_engine_capabilities("databricks")
+    fallback_gaps = [gap for gap in caps.known_gaps if "falls back to the caller-asserted" in gap]
+    assert fallback_gaps
+    for gap in fallback_gaps:
+        assert "run_query_bounded" in gap
+        assert "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true" in gap
+        assert "by default" in gap and "refuse" in gap

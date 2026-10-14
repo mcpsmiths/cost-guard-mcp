@@ -11,7 +11,12 @@ from databricks.sdk.core import Config, oauth_service_principal
 from databricks.sdk.credentials_provider import OAuthCredentialsProvider
 from databricks.sdk.service.sql import GetWarehouseResponse
 
-from cost_guard_mcp.config import DatabricksConfig, load_databricks_config
+from cost_guard_mcp.config import (
+    DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR,
+    DatabricksConfig,
+    databricks_warehouse_start_allowed,
+    load_databricks_config,
+)
 from cost_guard_mcp.errors import (
     SanitizedEngineError,
     present_remote_text,
@@ -105,12 +110,17 @@ def _connect(statement_timeout_seconds: int = _MAX_API_WAIT_SECONDS) -> "sql.cli
 def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     """Verify Databricks credentials/connectivity by opening a session on the
     DATABRICKS_HTTP_PATH warehouse and executing `SELECT current_user()` - a lightweight
-    context statement, not EXPLAIN COST or a real query. It does run on the warehouse, so it
-    can start a STOPPED SQL warehouse and bill compute until the warehouse auto-stops again
-    (whether the Thrift session alone auto-starts it is the pending owner observation in audit
-    record read-only-tools-auto-start-stopped-warehouse; the fail-closed warehouse-state guard
-    with its COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START opt-in is that record's open decision
-    and would reuse _lookup_warehouse's `state`).
+    context statement, not EXPLAIN COST or a real query. The session itself is what can start
+    a STOPPED Classic/Pro SQL warehouse and bill compute until it auto-stops again, so by
+    default (DECISIONS.md #20, issue #91) the warehouse's state is read first through the
+    Warehouses API (`_lookup_warehouse`: GET /api/2.0/sql/warehouses/{id}, a control-plane call
+    that does not start the warehouse) and the session is opened only when it is RUNNING.
+    Every other state, and an unreadable state, returns ok=False with no session (fail closed).
+    COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true (exactly that value) restores the 0.4.0
+    control flow: no state read, straight to the session. The state read adds one bounded
+    control-plane call (about 2 x _MAX_API_WAIT_SECONDS worst case on an unreachable workspace
+    with PAT auth; OAuth M2M keeps the databricks-sdk's own OIDC discovery budget on this call
+    as on _connect(), see README Known limitations).
 
     `warehouse` is accepted only for calling-convention consistency with the bigquery/
     snowflake engines and is a documented no-op: Databricks has no per-query USE WAREHOUSE
@@ -123,6 +133,22 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     """
     conn: sql.client.Connection | None = None
     try:
+        # A ConfigError here lands in the same broad except it did when _connect() raised it.
+        config = load_databricks_config()
+        if databricks_warehouse_start_allowed():
+            logger.info(
+                "engine=databricks warehouse_state_guard=skipped reason=%s=true",
+                DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR,
+            )
+        else:
+            facts = _lookup_warehouse(config)
+            if not _warehouse_is_running(facts):
+                # Refused: the README-promised WARNING for every ok=false, and only that record
+                # - the detail is server-authored, bounded and one line already, so it is
+                # logged as-is and no second (INFO) record describes the same event.
+                refusal = _not_verified_detail(config, facts)
+                logger.warning("engine=databricks check_credentials_failed detail=%s", refusal)
+                return CredentialCheckResult(engine="databricks", ok=False, detail=refusal)
         conn = _connect()
         with conn.cursor() as cur:
             cur.execute("SELECT current_user()")
@@ -231,9 +257,9 @@ def _warehouse_id(http_path: str) -> str:
 
 @dataclass(frozen=True)
 class _WarehouseFacts:
-    """What GET /api/2.0/sql/warehouses/{id} says about the http_path warehouse. `state` is
-    carried for the pending read-only warehouse-state guard (audit record read-only-tools-
-    auto-start-stopped-warehouse) so it can share this one bounded call."""
+    """What GET /api/2.0/sql/warehouses/{id} says about the http_path warehouse. `state` feeds
+    the read-only warehouse-state guard (DECISIONS.md #20, audit record read-only-tools-
+    auto-start-stopped-warehouse), which shares this one bounded call with the pricing."""
 
     state: str | None
     cluster_size: str | None
@@ -309,6 +335,109 @@ _UNOBSERVED_WAREHOUSE_CAVEAT = (
 )
 
 
+# --- read-only warehouse-state guard (DECISIONS.md #20; issue #91) ----------------------------
+#
+# The Thrift session (sql.connect) is what starts a STOPPED Classic/Pro SQL warehouse; the only
+# compute-side statements the read-only paths run (SELECT current_user(), EXPLAIN COST) sit
+# behind it. So the guard stops sql.connect itself unless the Warehouses API reports RUNNING.
+# The SDK State enum (databricks-sdk 0.148.0): DELETED, DELETING, RUNNING, STARTING, STOPPED,
+# STOPPING - only RUNNING passes; the transitional STARTING refuses too (a session on it still
+# bills). An unreadable state (lookup failed, non-warehouse http_path, no state field) is "not
+# RUNNING": fail closed, the owner's decision in #91. This narrows #19's fail-open on the
+# read-only paths for principals without CAN_VIEW/CAN_USE; #19's fallback survives for
+# run_query_bounded (allow_warehouse_wake=True) and under the opt-in.
+_RUNNING_STATE = "RUNNING"
+
+_WAREHOUSE_START_HINT = (
+    "Start the warehouse (or wait for it to finish starting) and retry, or set "
+    f"{DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true (exactly that value) to let "
+    "check_credentials and estimate_query_cost open a session on a non-RUNNING warehouse, which "
+    "starts it and bills compute until it auto-stops."
+)
+_WAREHOUSE_UNREADABLE_HINT = (
+    "Fix DATABRICKS_HTTP_PATH or grant CAN_VIEW/CAN_USE on the warehouse, or set "
+    f"{DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true (exactly that value) to open the session "
+    "regardless (which starts a stopped warehouse and bills compute)."
+)
+_NO_EXPLAIN_RAN = (
+    "No EXPLAIN COST was run: the byte and dollar estimates are unavailable, not zero."
+)
+
+
+def _present_observed(value: object) -> str:
+    """An API-returned value on its way into a detail or a caveat: present_remote_text over its
+    text (bounded, repr-quoted, one line - DECISIONS.md #18), the bare word None for a missing
+    value so it does not read as the text 'None'. Same helper as snowflake._present_observed."""
+    if value is None:
+        return "None"
+    text = str(value)
+    return present_remote_text(redact_secrets(text), total_chars=len(text))
+
+
+def _warehouse_is_running(facts: _WarehouseFacts | None) -> bool:
+    return facts is not None and facts.state == _RUNNING_STATE
+
+
+def _not_running_sentence(warehouse_id: str, facts: _WarehouseFacts) -> str:
+    # warehouse_id passed _WAREHOUSE_ID_RE (the lookup succeeded), so it is safe raw; the state
+    # is API-returned text and is presented. Never the hostname, http_path or an env value.
+    return (
+        f"The configured SQL warehouse {warehouse_id} is {_present_observed(facts.state)}, not "
+        f"{_RUNNING_STATE}, so no session was opened: opening one would start the warehouse "
+        "and bill compute (fail closed)."
+    )
+
+
+def _state_unreadable_sentence(warehouse_id: str | None, facts: _WarehouseFacts | None) -> str:
+    if facts is None or warehouse_id is None:
+        return (
+            f"{_UNOBSERVED_WAREHOUSE_CAVEAT} Its state is therefore unknown and no session was "
+            "opened (fail closed: a session on a non-RUNNING warehouse would start it and bill "
+            "compute)."
+        )
+    return (
+        f"The configured SQL warehouse {warehouse_id} reports no state through the Warehouses "
+        "API, so its state is unknown and no session was opened (fail closed: a session on a "
+        "non-RUNNING warehouse would start it and bill compute)."
+    )
+
+
+def _guard_core_and_hint(
+    config: DatabricksConfig, facts: _WarehouseFacts | None
+) -> tuple[str, str]:
+    """The (core sentence, remedy hint) pair for a refused read-only call."""
+    if facts is None:
+        return _state_unreadable_sentence(None, None), _WAREHOUSE_UNREADABLE_HINT
+    # Cannot raise: facts is not None means _warehouse_id already accepted this path.
+    warehouse_id = _warehouse_id(config.http_path)
+    if facts.state is None:
+        return _state_unreadable_sentence(warehouse_id, facts), _WAREHOUSE_UNREADABLE_HINT
+    return _not_running_sentence(warehouse_id, facts), _WAREHOUSE_START_HINT
+
+
+def _not_verified_detail(config: DatabricksConfig, facts: _WarehouseFacts | None) -> str:
+    core, hint = _guard_core_and_hint(config, facts)
+    return f"Not verified: {core} {hint}"
+
+
+def _refused_estimate(config: DatabricksConfig, facts: _WarehouseFacts | None) -> CostEstimate:
+    """The estimate_query_cost outcome when the guard refuses: no figures, exactly one caveat
+    (no tier sentence, no pricing clause, no statistics sentence - none of those happened)."""
+    core, hint = _guard_core_and_hint(config, facts)
+    state = facts.state if facts is not None else None
+    logger.info(
+        "engine=databricks warehouse_state_guard=refused path=estimate_query_cost state=%s",
+        _present_observed(state),
+    )
+    return CostEstimate(
+        engine="databricks",
+        accuracy_tier=AccuracyTier.HEURISTIC,
+        estimated_bytes=None,
+        estimated_cost_usd=None,
+        caveats=[f"{core} {_NO_EXPLAIN_RAN} {hint}"],
+    )
+
+
 def _rate_for(
     facts: _WarehouseFacts | None, warehouse_size: str
 ) -> tuple[float | None, str, list[str]]:
@@ -381,7 +510,11 @@ def _rate_for(
 
 @sanitize_exceptions("databricks")
 def explain_estimate(
-    sql_text: str, warehouse: str | None, warehouse_size: str = "X-Small"
+    sql_text: str,
+    warehouse: str | None,
+    warehouse_size: str = "X-Small",
+    *,
+    allow_warehouse_wake: bool = False,
 ) -> CostEstimate:
     """Estimate Databricks query cost via EXPLAIN COST. Always HEURISTIC - never PRECISE
     or UPPER_BOUND - since Databricks has no dry-run and EXPLAIN COST's plan-node
@@ -396,12 +529,27 @@ def explain_estimate(
     `warehouse_size` can only raise the estimate. Non-Serverless (Classic/Pro) warehouses and
     unrecognised sizes yield estimated_cost_usd=None so run_query_bounded fails closed on a
     dollar cap (DECISIONS.md #5, #19).
+
+    The same lookup feeds the read-only warehouse-state guard (DECISIONS.md #20, issue #91):
+    unless the observed state is RUNNING - also when it cannot be read - no session is opened
+    and the estimate carries estimated_bytes=None, estimated_cost_usd=None and one caveat.
+    `allow_warehouse_wake` (keyword-only, never a tool argument) is run_query_bounded's bypass:
+    the execution that follows wakes the warehouse anyway. The operator opt-in
+    COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true bypasses it for the read-only tool too.
     """
     # Validate the caller-asserted size before any lookup or connection: an unknown size is a
     # clear (sanitized) ValueError that never costs an API call.
     dbus_per_hour(warehouse_size)
     config = load_databricks_config()
     facts = _lookup_warehouse(config)
+    env_opt_in = not allow_warehouse_wake and databricks_warehouse_start_allowed()
+    if env_opt_in:
+        logger.info(
+            "engine=databricks warehouse_state_guard=skipped reason=%s=true",
+            DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR,
+        )
+    if not (allow_warehouse_wake or env_opt_in) and not _warehouse_is_running(facts):
+        return _refused_estimate(config, facts)
     rate, size_label, rate_caveats = _rate_for(facts, warehouse_size)
 
     conn = _connect()

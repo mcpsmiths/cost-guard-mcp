@@ -41,7 +41,9 @@ def test_estimate_query_cost_dispatches_to_databricks(mock_engine):
         engine="databricks", accuracy_tier=AccuracyTier.HEURISTIC, estimated_bytes=100
     )
     result = estimate_query_cost("databricks", "SELECT 1", warehouse="ignored")
-    mock_engine.explain_estimate.assert_called_once_with("SELECT 1", "ignored")
+    mock_engine.explain_estimate.assert_called_once_with(
+        "SELECT 1", "ignored", allow_warehouse_wake=False
+    )
     assert result.engine == "databricks"
 
 
@@ -67,7 +69,7 @@ def test_estimate_query_cost_threads_warehouse_size_to_databricks(mock_engine):
     )
     estimate_query_cost("databricks", "SELECT 1", warehouse_size="4X-Large")
     mock_engine.explain_estimate.assert_called_once_with(
-        "SELECT 1", None, warehouse_size="4X-Large"
+        "SELECT 1", None, allow_warehouse_wake=False, warehouse_size="4X-Large"
     )
 
 
@@ -86,3 +88,48 @@ def test_estimate_query_cost_refuses_multi_statement_text_before_any_engine_call
     mock_bigquery.dry_run.assert_not_called()
     mock_snowflake.explain_estimate.assert_not_called()
     mock_databricks.explain_estimate.assert_not_called()
+
+
+# --- DECISIONS.md #20: the warehouse-wake flag is threaded to the warehouse engines only -------
+
+
+@patch("cost_guard_mcp.tools.estimate_query_cost.databricks_engine")
+@patch("cost_guard_mcp.tools.estimate_query_cost.bigquery_engine")
+def test_read_only_estimates_do_not_ask_to_wake_the_warehouse(mock_bigquery, mock_databricks):
+    mock_databricks.explain_estimate.return_value = CostEstimate(
+        engine="databricks", accuracy_tier=AccuracyTier.HEURISTIC, estimated_bytes=1
+    )
+    mock_bigquery.dry_run.return_value = CostEstimate(
+        engine="bigquery", accuracy_tier=AccuracyTier.PRECISE, estimated_bytes=1
+    )
+
+    estimate_query_cost("databricks", "SELECT 1")
+    estimate_query_cost("bigquery", "SELECT 1")
+
+    mock_databricks.explain_estimate.assert_called_once_with(
+        "SELECT 1", None, allow_warehouse_wake=False
+    )
+    mock_bigquery.dry_run.assert_called_once_with("SELECT 1")
+
+
+@patch("cost_guard_mcp.tools.estimate_query_cost.databricks_engine")
+def test_allow_warehouse_wake_is_threaded_to_the_warehouse_engines(mock_databricks):
+    mock_databricks.explain_estimate.return_value = CostEstimate(
+        engine="databricks", accuracy_tier=AccuracyTier.HEURISTIC, estimated_bytes=1
+    )
+
+    estimate_query_cost("databricks", "SELECT 1", warehouse_size="Small", allow_warehouse_wake=True)
+
+    mock_databricks.explain_estimate.assert_called_once_with(
+        "SELECT 1", None, allow_warehouse_wake=True, warehouse_size="Small"
+    )
+
+
+def test_allow_warehouse_wake_is_keyword_only():
+    # It must never be passable positionally as a tool argument (same reasoning as
+    # before_execute): the published tool signatures do not carry it.
+    import inspect
+
+    parameter = inspect.signature(estimate_query_cost).parameters["allow_warehouse_wake"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is False

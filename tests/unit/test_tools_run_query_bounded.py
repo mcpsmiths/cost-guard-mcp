@@ -134,7 +134,22 @@ def test_run_query_bounded_threads_warehouse_size_and_edition_to_cap_check(
         edition="enterprise",
     )
 
-    mock_estimate.assert_called_once_with("snowflake", "SELECT 1", "WH", "X6LARGE", "enterprise")
+    mock_estimate.assert_called_once_with(
+        "snowflake", "SELECT 1", "WH", "X6LARGE", "enterprise", allow_warehouse_wake=True
+    )
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_run_query_bounded_estimate_is_allowed_to_wake_the_warehouse(mock_estimate, mock_engine):
+    # DECISIONS.md #20: the read-only warehouse-state guards do not apply here - the execution
+    # that follows wakes the warehouse anyway, so the cap gate is fed the full-lookup estimate.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_engine.execute_bounded.return_value = ([], 0, False)
+
+    run_query_bounded("bigquery", "SELECT 1")
+
+    assert mock_estimate.call_args.kwargs == {"allow_warehouse_wake": True}
 
 
 @patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")

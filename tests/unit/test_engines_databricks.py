@@ -6,14 +6,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 from databricks.sdk.service.sql import GetWarehouseResponse, State
 
+from cost_guard_mcp.config import DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR
 from cost_guard_mcp.engines.databricks import (
     _FAIL_CLOSED_HINT,
     _MAX_API_WAIT_SECONDS,
     _SOCKET_TIMEOUT_SECONDS,
+    _UNOBSERVED_WAREHOUSE_CAVEAT,
     _connect,
     _lookup_warehouse,
     _rate_for,
     _warehouse_id,
+    _warehouse_is_running,
     _WarehouseFacts,
     check_credentials,
 )
@@ -73,6 +76,27 @@ def databricks_env():
             config_cls=mock_config_cls,
             workspace_client_cls=mock_workspace_client_cls,
         )
+
+
+def _stub_warehouse(databricks_env, response):
+    get = databricks_env.workspace_client_cls.return_value.warehouses.get
+    get.side_effect = None
+    get.return_value = response
+    return get
+
+
+@pytest.fixture
+def running_warehouse(databricks_env):
+    """A RUNNING 5X-Large Serverless warehouse: since DECISIONS.md #20 the read-only paths open
+    a session only after observing this state, so every test of that session needs it."""
+    return _stub_warehouse(databricks_env, _warehouse_response())
+
+
+@pytest.fixture
+def allow_warehouse_start(monkeypatch):
+    """The operator opt-in that restores the 0.4.0 control flow (DECISIONS.md #20), including
+    #19's caller-asserted-rate fallback on a failed lookup."""
+    monkeypatch.setenv(DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR, "true")
 
 
 def _assert_connect_kwargs_are_bounded(kwargs, *, statement_timeout):
@@ -148,8 +172,9 @@ def test_connect_uses_oauth_m2m_when_client_credentials_set(
 @patch("cost_guard_mcp.engines.databricks.sql.connect")
 @patch("cost_guard_mcp.engines.databricks.load_databricks_config")
 def test_read_only_paths_open_sessions_with_the_api_ceiling_statement_timeout(
-    mock_load_config, mock_connect
+    mock_load_config, mock_connect, running_warehouse
 ):
+    # DECISIONS.md #20: a RUNNING observed warehouse is the precondition for the session.
     # check_credentials and explain_estimate (read_only_hint=True) must open their sessions
     # with the API ceiling, not the 120 s execution bound reserved for run_query_bounded.
     mock_load_config.return_value = _pat_config()
@@ -168,7 +193,7 @@ def test_read_only_paths_open_sessions_with_the_api_ceiling_statement_timeout(
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_ok_when_query_succeeds(mock_connect):
+def test_check_credentials_ok_when_query_succeeds(mock_connect, running_warehouse):
     mock_cursor = MagicMock()
     mock_cursor.fetchone.return_value = ("alice@example.com",)
     mock_conn = MagicMock()
@@ -184,7 +209,7 @@ def test_check_credentials_ok_when_query_succeeds(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_reports_failure_as_data_not_a_raise(mock_connect):
+def test_check_credentials_reports_failure_as_data_not_a_raise(mock_connect, running_warehouse):
     mock_connect.side_effect = Exception("401 Unauthorized")
 
     result = check_credentials()
@@ -195,7 +220,7 @@ def test_check_credentials_reports_failure_as_data_not_a_raise(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_closes_connection_on_success(mock_connect):
+def test_check_credentials_closes_connection_on_success(mock_connect, running_warehouse):
     mock_cursor = MagicMock()
     mock_cursor.fetchone.return_value = ("alice@example.com",)
     mock_conn = MagicMock()
@@ -209,7 +234,7 @@ def test_check_credentials_closes_connection_on_success(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_closes_connection_even_on_failure(mock_connect):
+def test_check_credentials_closes_connection_even_on_failure(mock_connect, running_warehouse):
     mock_conn = MagicMock()
     mock_conn.cursor.side_effect = RuntimeError("boom")
     mock_connect.return_value = mock_conn
@@ -222,7 +247,7 @@ def test_check_credentials_closes_connection_even_on_failure(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_handles_no_rows_returned(mock_connect):
+def test_check_credentials_handles_no_rows_returned(mock_connect, running_warehouse):
     mock_cursor = MagicMock()
     mock_cursor.fetchone.return_value = None
     mock_conn = MagicMock()
@@ -236,7 +261,7 @@ def test_check_credentials_handles_no_rows_returned(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_ignores_warehouse_parameter(mock_connect):
+def test_check_credentials_ignores_warehouse_parameter(mock_connect, running_warehouse):
     # Databricks has no per-query USE WAREHOUSE - the warehouse parameter exists only
     # for calling-convention consistency with bigquery/snowflake and is a documented
     # no-op here.
@@ -262,7 +287,9 @@ def _check_credentials_with_current_user(mock_connect, current_user):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_presents_current_user_on_one_line(mock_connect, caplog):
+def test_check_credentials_presents_current_user_on_one_line(
+    mock_connect, running_warehouse, caplog
+):
     # PR #86 runtime verification, probe-4 p5c (evidence/probe-4/p5c-dbx-cc-user.json): the
     # ok=True detail interpolated SELECT current_user() raw, so structuredContent.detail
     # carried literal U+000A, ESC, CR, U+0085 and U+2028 - every boundary str.splitlines
@@ -299,7 +326,9 @@ def test_rate_caveat_redacts_secrets_in_an_unmodelled_cluster_size():
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_redacts_secrets_in_current_user_before_presenting(mock_connect):
+def test_check_credentials_redacts_secrets_in_current_user_before_presenting(
+    mock_connect, running_warehouse
+):
     # PR #86 delta verification (be81124 vs 8a16733 drift): same redact -> present chain as
     # BigQuery and the failure path.
     result = _check_credentials_with_current_user(mock_connect, "alice password=hunter2")
@@ -310,7 +339,9 @@ def test_check_credentials_redacts_secrets_in_current_user_before_presenting(moc
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_check_credentials_ok_detail_reads_naturally_for_an_ordinary_user(mock_connect):
+def test_check_credentials_ok_detail_reads_naturally_for_an_ordinary_user(
+    mock_connect, running_warehouse
+):
     result = _check_credentials_with_current_user(mock_connect, "alice@example.com")
 
     assert result.detail == "Authenticated as 'alice@example.com'."
@@ -321,7 +352,7 @@ from cost_guard_mcp.types import AccuracyTier
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_explain_estimate_parses_max_size_in_bytes_from_statistics(mock_connect):
+def test_explain_estimate_parses_max_size_in_bytes_from_statistics(mock_connect, running_warehouse):
     # Real confirmed EXPLAIN COST output shape (docs.databricks.com/aws/en/optimizations/cbo,
     # live-verified 2026-09-13): one Statistics(sizeInBytes=X unit, rowCount=Y) tuple per
     # plan node, larger unit suffixes (GB) alongside smaller ones (B) in the same plan.
@@ -397,7 +428,7 @@ def test_parse_max_size_in_bytes_treats_long_max_sentinel_as_unknown(sentinel_te
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_explain_estimate_handles_missing_statistics(mock_connect):
+def test_explain_estimate_handles_missing_statistics(mock_connect, allow_warehouse_start):
     # Real, confirmed case: no ANALYZE TABLE run, streaming source, or non-Delta external
     # table with no collected stats.
     explain_output = "== Optimized Logical Plan ==\nRelation[a,b] csv\n"
@@ -424,7 +455,7 @@ def test_explain_estimate_handles_missing_statistics(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_explain_estimate_cost_math_matches_pricing_table(mock_connect):
+def test_explain_estimate_cost_math_matches_pricing_table(mock_connect, allow_warehouse_start):
     mock_cursor = MagicMock()
     mock_cursor.fetchall.return_value = [("Relation[a] parquet, Statistics(sizeInBytes=1.0 B)",)]
     mock_conn = MagicMock()
@@ -440,7 +471,9 @@ def test_explain_estimate_cost_math_matches_pricing_table(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_explain_estimate_cost_scales_up_for_large_byte_estimate(mock_connect):
+def test_explain_estimate_cost_scales_up_for_large_byte_estimate(
+    mock_connect, allow_warehouse_start
+):
     explain_output = "Relation[a] parquet, Statistics(sizeInBytes=50.0 GB, rowCount=1)"
     mock_cursor = MagicMock()
     mock_cursor.fetchall.return_value = [(explain_output,)]
@@ -458,7 +491,7 @@ def test_explain_estimate_cost_scales_up_for_large_byte_estimate(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_explain_estimate_closes_connection_on_success(mock_connect):
+def test_explain_estimate_closes_connection_on_success(mock_connect, running_warehouse):
     explain_output = "Relation[a] parquet, Statistics(sizeInBytes=1.0 B)"
     mock_cursor = MagicMock()
     mock_cursor.fetchall.return_value = [(explain_output,)]
@@ -472,7 +505,7 @@ def test_explain_estimate_closes_connection_on_success(mock_connect):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_explain_estimate_closes_connection_even_on_failure(mock_connect):
+def test_explain_estimate_closes_connection_even_on_failure(mock_connect, running_warehouse):
     mock_cursor = MagicMock()
     mock_cursor.execute.side_effect = RuntimeError("EXPLAIN COST failed")
     mock_conn = MagicMock()
@@ -724,13 +757,6 @@ def test_warehouse_id_rejects_paths_outside_the_allowlist(http_path):
         _warehouse_id(http_path)
 
 
-def _stub_warehouse(databricks_env, response):
-    get = databricks_env.workspace_client_cls.return_value.warehouses.get
-    get.side_effect = None
-    get.return_value = response
-    return get
-
-
 def test_lookup_warehouse_builds_a_bounded_pat_client_and_reads_the_warehouse(databricks_env):
     get = _stub_warehouse(databricks_env, _warehouse_response())
 
@@ -861,8 +887,10 @@ def test_explain_estimate_returns_no_dollar_figure_for_an_unrecognised_cluster_s
 
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_explain_estimate_keeps_the_asserted_rate_with_a_caveat_when_the_lookup_fails(
-    mock_connect, databricks_env
+    mock_connect, databricks_env, allow_warehouse_start
 ):
+    # DECISIONS.md #20: with the guard on, a failed lookup refuses; the #19 fail-open pricing
+    # pinned here now exists only under the opt-in (and for run_query_bounded's estimate).
     # Design decision (recommended default): principals without CAN_VIEW/CAN_USE on the
     # warehouse keep working at the caller-asserted/default rate, with an explicit caveat.
     estimate = _explain_with(mock_connect)
@@ -874,8 +902,9 @@ def test_explain_estimate_keeps_the_asserted_rate_with_a_caveat_when_the_lookup_
 
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_explain_estimate_falls_back_when_http_path_is_not_a_warehouse_path(
-    mock_connect, databricks_env
+    mock_connect, databricks_env, allow_warehouse_start
 ):
+    # DECISIONS.md #20: the fail-open fallback survives only under the opt-in.
     databricks_env.load_config.return_value = _pat_config(http_path="/sql/protocolv1/o/123/abc")
 
     estimate = _explain_with(mock_connect, warehouse_size="Medium")
@@ -934,7 +963,9 @@ def _assert_no_pricing_language(caveats):
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
-def test_explain_estimate_without_statistics_omits_the_pricing_caveats(mock_connect):
+def test_explain_estimate_without_statistics_omits_the_pricing_caveats(
+    mock_connect, allow_warehouse_start
+):
     # Lookup failed -> an asserted rate exists, but no statistics -> no dollar figure. The
     # live output paired "Priced at the caller-asserted X-Small size ..." with
     # estimated_cost_usd null. The pricing clause goes; the OBSERVATION sentence stays: the
@@ -953,8 +984,9 @@ def test_explain_estimate_without_statistics_omits_the_pricing_caveats(mock_conn
 
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_explain_estimate_with_a_figure_and_a_failed_lookup_lists_observation_then_pricing(
-    mock_connect,
+    mock_connect, allow_warehouse_start
 ):
+    # DECISIONS.md #20: a failed lookup prices fail-open only under the opt-in.
     # Positive control for the split: with a figure the observation sentence is followed by
     # the pricing clause it used to be glued to, then the runtime baseline.
     estimate = _explain_with(mock_connect)
@@ -1102,3 +1134,449 @@ def test_check_credentials_docstring_states_the_statement_it_runs():
     assert "SELECT current_user()" in docstring
     assert "start" in docstring and "warehouse" in docstring
     assert "without running" not in docstring
+    # DECISIONS.md #20: the guard shipped, so the docstring names it and its opt-in, and no
+    # longer calls it pending.
+    assert "RUNNING" in docstring
+    assert DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR in docstring
+    assert "pending" not in docstring
+    # OAuth M2M keeps the SDK's own discovery budget (README Known limitations).
+    assert "OAuth M2M" in docstring
+
+
+# --- read-only warehouse-state guard (DECISIONS.md #20; issue #91) ----------------------------
+#
+# check_credentials and estimate_query_cost open a session (sql.connect, which is what starts a
+# STOPPED Classic/Pro warehouse) only after the Warehouses API reports RUNNING. "no sql.connect"
+# below = the patched _connect was never called; one test per path also patches sql.connect
+# itself to pin the literal claim.
+
+_GUARD_LOGGER = "cost_guard_mcp.engines.databricks"
+_NON_RUNNING_STATES = [State.STARTING, State.STOPPING, State.DELETING, State.DELETED]
+
+
+def _hostile_state_response(total_chars):
+    # _lookup_warehouse stores getattr(response.state, "value", None) when it is a str.
+    return MagicMock(
+        state=MagicMock(value=_hostile_text(total_chars)),
+        cluster_size="X-Small",
+        enable_serverless_compute=True,
+    )
+
+
+def _ok_connection(mock_connect, current_user="alice@example.com"):
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = (current_user,)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    return mock_cursor
+
+
+@pytest.mark.parametrize(
+    ("facts", "expected"),
+    [
+        (_WarehouseFacts(state="RUNNING", cluster_size="X-Small", is_serverless=True), True),
+        (_WarehouseFacts(state="STOPPED", cluster_size="X-Small", is_serverless=True), False),
+        (_WarehouseFacts(state="STARTING", cluster_size="X-Small", is_serverless=True), False),
+        (_WarehouseFacts(state=None, cluster_size="X-Small", is_serverless=True), False),
+        (None, False),
+    ],
+)
+def test_warehouse_is_running_predicate(facts, expected):
+    assert _warehouse_is_running(facts) is expected
+
+
+@patch("cost_guard_mcp.engines.databricks.sql.connect")
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_refuses_without_connecting_when_the_warehouse_is_stopped(
+    mock_connect, mock_sql_connect, databricks_env, caplog
+):
+    # Issue #91: after 0.4.0's 60 s connector bound a read-only call against a STOPPED warehouse
+    # started (and billed) it and then failed with no result. The state read is a control-plane
+    # GET that does not start the warehouse; the session is what does.
+    get = _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+
+    result = check_credentials()
+
+    assert result.engine == "databricks"
+    assert result.ok is False
+    assert "abc123" in result.detail
+    assert "'STOPPED'" in result.detail
+    assert "not RUNNING" in result.detail
+    assert "no session was opened" in result.detail
+    assert f"{DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true" in result.detail
+    assert "my-workspace" not in result.detail
+    assert "/sql/1.0/" not in result.detail
+    mock_connect.assert_not_called()
+    mock_sql_connect.assert_not_called()
+    get.assert_called_once_with("abc123")
+    records = [r for r in caplog.records if r.name == _GUARD_LOGGER]
+    # The README-promised WARNING for every ok=false, and nothing else (no second INFO record
+    # for the same event); T-D1 is server-authored, bounded and one line already.
+    assert [r.levelname for r in records] == ["WARNING"]
+    assert "check_credentials_failed detail=" in records[0].message
+    assert result.detail in records[0].message
+    assert "\n" not in records[0].message
+
+
+@pytest.mark.parametrize("state", _NON_RUNNING_STATES)
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_refuses_every_non_running_state(mock_connect, databricks_env, state):
+    # Transitional states refuse too: a session on a STARTING warehouse still bills it.
+    _stub_warehouse(databricks_env, _warehouse_response(state=state))
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert f"'{state.value}'" in result.detail
+    assert "wait for it to finish starting" in result.detail
+    mock_connect.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_fails_closed_when_the_warehouse_state_cannot_be_read(
+    mock_connect, databricks_env
+):
+    # The autouse default: warehouses.get raises (a principal without CAN_VIEW/CAN_USE, network,
+    # timeout). Unknown state is not RUNNING - the owner's "fail closed when the state cannot be
+    # read" (#91), narrowing #19's fail-open on the read-only paths only.
+    result = check_credentials()
+
+    assert result.ok is False
+    assert "could not be observed" in result.detail
+    assert "fail closed" in result.detail
+    assert "CAN_VIEW/CAN_USE" in result.detail
+    assert f"{DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true" in result.detail
+    mock_connect.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_fails_closed_when_the_state_field_is_missing(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, GetWarehouseResponse(id="abc123"))
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert "abc123" in result.detail
+    assert "reports no state" in result.detail
+    mock_connect.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_fails_closed_for_a_non_warehouse_http_path_without_an_api_call(
+    mock_connect, databricks_env
+):
+    databricks_env.load_config.return_value = _pat_config(http_path="/sql/protocolv1/o/123/abc")
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert "could not be observed" in result.detail
+    assert "protocolv1" not in result.detail
+    databricks_env.workspace_client_cls.assert_not_called()
+    mock_connect.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_opens_a_session_when_the_warehouse_is_running(
+    mock_connect, running_warehouse, caplog
+):
+    caplog.set_level(logging.DEBUG, logger="cost_guard_mcp")
+    mock_cursor = _ok_connection(mock_connect)
+
+    result = check_credentials()
+
+    assert result.ok is True
+    assert result.detail == "Authenticated as 'alice@example.com'."
+    mock_cursor.execute.assert_called_once_with("SELECT current_user()")
+    running_warehouse.assert_called_once_with("abc123")
+    # The success path stays log-free (no guard record when the guard passes).
+    assert not [r for r in caplog.records if r.name.startswith("cost_guard_mcp")]
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_reports_a_config_error_as_data_not_a_raise(mock_connect, databricks_env):
+    # R9: load_databricks_config() now runs before the lookup; its ConfigError must land in the
+    # same broad except it did when _connect() raised it - no GET, no session, ok=false.
+    from cost_guard_mcp.config import ConfigError
+
+    databricks_env.load_config.side_effect = ConfigError("DATABRICKS_HTTP_PATH must be set")
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert "DATABRICKS_HTTP_PATH must be set" in result.detail
+    databricks_env.workspace_client_cls.assert_not_called()
+    mock_connect.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_opt_in_restores_the_unguarded_path(
+    mock_connect, databricks_env, allow_warehouse_start, caplog
+):
+    # D4: with the opt-in the 0.4.0 control flow is byte-for-byte - no Warehouses API call at
+    # all, straight to the session; one INFO record says the env var caused the bypass.
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+    _ok_connection(mock_connect)
+
+    result = check_credentials()
+
+    assert result.ok is True
+    databricks_env.workspace_client_cls.assert_not_called()
+    mock_connect.assert_called_once_with()
+    skipped = [r for r in caplog.records if "warehouse_state_guard=skipped" in r.message]
+    assert len(skipped) == 1
+    assert skipped[0].levelname == "INFO"
+    assert f"reason={DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true" in skipped[0].message
+
+
+@pytest.mark.parametrize("raw", ["1", "TRUE", " true"])
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_opt_in_requires_exactly_true(
+    mock_connect, databricks_env, monkeypatch, raw
+):
+    monkeypatch.setenv(DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR, raw)
+    _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+
+    result = check_credentials()
+
+    assert result.ok is False
+    mock_connect.assert_not_called()
+
+
+@pytest.mark.parametrize("total_chars", [300, 1_200])
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_refusal_presents_the_state_bounded_and_quoted(
+    mock_connect, databricks_env, total_chars
+):
+    # The state is API-returned text: presented (bounded, repr-quoted, one line - DECISIONS.md
+    # #18), never interpolated raw into this server's own sentence.
+    hostile = _hostile_text(total_chars)
+    _stub_warehouse(databricks_env, _hostile_state_response(total_chars))
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert len(result.detail.splitlines()) == 1
+    assert "\x1b" not in result.detail and "\r" not in result.detail
+    assert present_remote_text(hostile) in result.detail
+    if total_chars > 1_000:
+        assert f"' ... [truncated; {total_chars} chars total]" in result.detail
+        assert hostile[:1_001] not in result.detail
+    else:
+        assert f"{hostile!r}," in result.detail
+    mock_connect.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_refusal_detail_never_names_the_host_or_path(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+
+    result = check_credentials()
+
+    assert "my-workspace.cloud.databricks.com" not in result.detail
+    assert "/sql/1.0/warehouses/abc123" not in result.detail
+    assert _FAKE_PAT not in result.detail
+
+
+@patch("cost_guard_mcp.engines.databricks.sql.connect")
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_returns_no_figures_without_connecting_when_the_warehouse_is_stopped(
+    mock_connect, mock_sql_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+
+    estimate = _explain_with(mock_connect)
+
+    mock_connect.assert_not_called()
+    mock_sql_connect.assert_not_called()
+    assert estimate.engine == "databricks"
+    assert estimate.estimated_bytes is None
+    assert estimate.estimated_cost_usd is None
+    assert estimate.accuracy_tier is AccuracyTier.HEURISTIC
+    assert len(estimate.caveats) == 1
+    caveat = estimate.caveats[0]
+    assert "abc123" in caveat and "'STOPPED'" in caveat
+    assert "No EXPLAIN COST was run" in caveat
+    assert "unavailable, not zero" in caveat
+    assert f"{DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true" in caveat
+    _assert_no_pricing_language(estimate.caveats)
+    assert "size statistics" not in caveat
+    assert not caveat.startswith(_TIER_PREFIX)
+
+
+@pytest.mark.parametrize("state", _NON_RUNNING_STATES)
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_refuses_every_non_running_state(mock_connect, databricks_env, state):
+    _stub_warehouse(databricks_env, _warehouse_response(state=state))
+
+    estimate = _explain_with(mock_connect)
+
+    mock_connect.assert_not_called()
+    assert estimate.estimated_cost_usd is None and estimate.estimated_bytes is None
+    assert len(estimate.caveats) == 1
+    assert f"'{state.value}'" in estimate.caveats[0]
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_fails_closed_when_the_state_cannot_be_read(mock_connect, databricks_env):
+    estimate = _explain_with(mock_connect)
+
+    mock_connect.assert_not_called()
+    assert estimate.estimated_cost_usd is None and estimate.estimated_bytes is None
+    assert len(estimate.caveats) == 1
+    caveat = estimate.caveats[0]
+    assert caveat.startswith(_UNOBSERVED_WAREHOUSE_CAVEAT)
+    # The diagnostic sentence is embedded once, not appended a second time.
+    assert caveat.count("could not be observed") == 1
+    assert "fail closed" in caveat
+    assert f"{DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true" in caveat
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_fails_closed_when_the_state_field_is_missing(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(
+        databricks_env,
+        GetWarehouseResponse(id="abc123", cluster_size="X-Small", enable_serverless_compute=True),
+    )
+
+    estimate = _explain_with(mock_connect)
+
+    mock_connect.assert_not_called()
+    assert len(estimate.caveats) == 1
+    assert "reports no state" in estimate.caveats[0]
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_runs_explain_cost_when_the_warehouse_is_running(
+    mock_connect, running_warehouse
+):
+    # Identical to the observed-size pricing outcome at 69c971d: the guard passes silently.
+    estimate = _explain_with(mock_connect)
+
+    assert estimate.estimated_cost_usd == round(1042 * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
+    assert any("understated" in c and "5X-Large" in c for c in estimate.caveats)
+    cursor = mock_connect.return_value.cursor.return_value.__enter__.return_value
+    cursor.execute.assert_called_once_with("EXPLAIN COST SELECT 1")
+    assert not any("no session was opened" in c for c in estimate.caveats)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_opt_in_restores_the_fail_open_lookup_path(
+    mock_connect, databricks_env, allow_warehouse_start
+):
+    # D8: today's #19 outcome - dollar figure at the asserted X-Small, "could not be observed".
+    estimate = _explain_with(mock_connect)
+
+    expected = round(dbus_per_hour("X-Small") * SERVERLESS_USD_PER_DBU * (30 / 3600), 6)
+    assert estimate.estimated_cost_usd == expected
+    assert any(c.startswith(_UNOBSERVED_WAREHOUSE_CAVEAT) for c in estimate.caveats)
+    mock_connect.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_opt_in_logs_one_info_record_naming_the_variable(
+    mock_connect, databricks_env, allow_warehouse_start, caplog
+):
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+
+    _explain_with(mock_connect)
+
+    skipped = [r for r in caplog.records if "warehouse_state_guard=skipped" in r.message]
+    assert len(skipped) == 1
+    assert skipped[0].levelname == "INFO"
+    assert f"reason={DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true" in skipped[0].message
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_allow_warehouse_wake_bypasses_the_guard(
+    mock_connect, databricks_env, caplog
+):
+    # run_query_bounded's own pre-execution estimate: the execution wakes the warehouse anyway.
+    # The env record is NOT logged here - the flag, not the variable, caused the bypass.
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+    _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+
+    estimate = _explain_with(mock_connect, allow_warehouse_wake=True)
+
+    mock_connect.assert_called_once()
+    cursor = mock_connect.return_value.cursor.return_value.__enter__.return_value
+    cursor.execute.assert_called_once_with("EXPLAIN COST SELECT 1")
+    assert estimate.estimated_cost_usd is not None
+    assert not any("no session was opened" in c for c in estimate.caveats)
+    assert not [r for r in caplog.records if "warehouse_state_guard" in r.message]
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_validates_the_asserted_size_before_the_state_guard(
+    mock_connect, databricks_env
+):
+    _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+
+    with pytest.raises(SanitizedEngineError, match="unknown Databricks warehouse size"):
+        explain_estimate("SELECT 1", warehouse=None, warehouse_size="Gigantic")
+
+    databricks_env.workspace_client_cls.assert_not_called()
+    mock_connect.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_guard_logs_one_info_record_with_the_presented_state(
+    mock_connect, databricks_env, caplog
+):
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+    _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+
+    _explain_with(mock_connect)
+
+    records = [r for r in caplog.records if r.name == _GUARD_LOGGER]
+    assert len(records) == 1
+    assert records[0].levelname == "INFO"
+    assert "warehouse_state_guard=refused" in records[0].message
+    assert "path=estimate_query_cost" in records[0].message
+    assert "state='STOPPED'" in records[0].message
+
+
+@pytest.mark.parametrize("total_chars", [300, 1_200])
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_guard_caveat_presents_the_state_bounded_and_quoted(
+    mock_connect, databricks_env, total_chars
+):
+    hostile = _hostile_text(total_chars)
+    _stub_warehouse(databricks_env, _hostile_state_response(total_chars))
+
+    estimate = _explain_with(mock_connect)
+
+    assert len(estimate.caveats) == 1
+    caveat = estimate.caveats[0]
+    assert present_remote_text(hostile) in caveat
+    assert "\n" not in caveat and "\x1b" not in caveat and "\r" not in caveat
+    if total_chars > 1_000:
+        assert f"' ... [truncated; {total_chars} chars total]" in caveat
+    else:
+        assert f"{hostile!r}," in caveat
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_does_not_consult_the_warehouse_state(mock_connect, databricks_env):
+    # D9: run_query_bounded's execution is untouched - no Warehouses API call, the session opens.
+    _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+    mock_connect.return_value = _make_mock_cursor_connection([(1,)])
+
+    execute_bounded("SELECT 1", None, max_rows=5)
+
+    databricks_env.workspace_client_cls.assert_not_called()
+    mock_connect.assert_called_once()
+
+
+def _make_mock_cursor_connection(rows):
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = _make_mock_cursor(rows)
+    return mock_conn

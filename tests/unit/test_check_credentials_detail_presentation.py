@@ -6,6 +6,7 @@ Amendment A6 of the security-audit remediation plan; audit record
 warehouse-error-text-forwarded-as-client-failure-without-origin-marking:src/cost_guard_mcp/errors.py.
 """
 
+import contextlib
 import logging
 from unittest.mock import MagicMock, patch
 
@@ -39,10 +40,33 @@ def _snowflake_failure(exc):
     return patch("cost_guard_mcp.engines.snowflake._connect", return_value=mock_conn)
 
 
+# Placeholder value for the mocked config below - never a real credential.
+_FAKE_PAT = "fake-pat-placeholder"
+
+
+@contextlib.contextmanager
 def _databricks_failure(exc):
+    # DECISIONS.md #20: the read-only path opens its session only after the Warehouses API
+    # reports RUNNING, so the guard is satisfied here and the forged cursor failure is what the
+    # test observes.
     mock_conn = MagicMock()
     mock_conn.cursor.side_effect = exc
-    return patch("cost_guard_mcp.engines.databricks._connect", return_value=mock_conn)
+    config = MagicMock(
+        server_hostname="my-workspace.cloud.databricks.com",
+        http_path="/sql/1.0/warehouses/abc123",
+        access_token=_FAKE_PAT,
+        client_id=None,
+        client_secret=None,
+    )
+    running = databricks_engine._WarehouseFacts(
+        state="RUNNING", cluster_size="X-Small", is_serverless=True
+    )
+    with (
+        patch("cost_guard_mcp.engines.databricks._connect", return_value=mock_conn),
+        patch("cost_guard_mcp.engines.databricks.load_databricks_config", return_value=config),
+        patch("cost_guard_mcp.engines.databricks._lookup_warehouse", return_value=running),
+    ):
+        yield
 
 
 _ENGINES = [
