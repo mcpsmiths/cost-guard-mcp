@@ -9,7 +9,9 @@ imported this script (1) makes every socket.connect to a non-loopback address ra
 fake-SDK module:
 
     CG_VERIFY_FAKE_PATH=<dir>      added to sys.path first (e.g. the archive's harness/lead)
-    CG_VERIFY_FAKE_MODULE=<name>   imported, then its install() is called (e.g. fake_backends)
+    CG_VERIFY_FAKE_MODULE=<name>   imported; its install() is called, then its install_network_guard()
+                                   if it defines one (the archive fake records both: harness/install,
+                                   then harness/network_guard state=enabled)
 
 No credential is set here. Dummy SNOWFLAKE_* / DATABRICKS_* values belong in a 0600 env
 file passed with `stdio_rpc.py --env-file`; BigQuery needs nothing when its Client is faked.
@@ -62,7 +64,11 @@ def main() -> None:
         fake_path = os.environ.get("CG_VERIFY_FAKE_PATH")
         if fake_path and fake_path not in sys.path:
             sys.path.insert(0, fake_path)
-        __import__(fake_module).install()
+        fake = __import__(fake_module)
+        fake.install()
+        fake_guard = getattr(fake, "install_network_guard", None)
+        if callable(fake_guard):
+            fake_guard()  # the fake's own guard + its record, stacked on the guard installed above
     if "cost_guard_mcp" in sys.modules:
         raise SystemExit("cost_guard_mcp was imported before the guard/fakes were installed")
     from cost_guard_mcp.server import main as server_main

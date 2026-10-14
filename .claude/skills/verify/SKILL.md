@@ -9,7 +9,8 @@ Observe the REAL server (console script `cost-guard-mcp`, `src/cost_guard_mcp/se
 stdio JSON-RPC only - there is no HTTP listener) with the warehouse SDKs replaced by loopback
 fakes. Unit tests, mypy and ruff are a spec to read, never evidence. Everything below ran on
 2026-10-14 against `main` b3c7201 (PR #86 merged); the full harness archive this skill distils is
-`scratch-pad/security-verification-2026-10/` (RECIPE.md, RECIPE-DELTA.md, harness/, evidence/).
+`$M/scratch-pad/security-verification-2026-10/verify/` (RECIPE.md, RECIPE-DELTA.md, harness/lead/, evidence/) where
+`$M` is the MAIN checkout: `scratch-pad/` is gitignored, so a fresh worktree has none of it (section 1).
 
 Hard rules: never read/source/copy `.env` or a real credential (dummy values only, generated into a
 0600 file, never typed on a command line); never contact a real backend (the launcher's socket guard
@@ -20,6 +21,7 @@ do not run `tests/integration/*`; stop every process you start by pid; ports 127
 
 ```bash
 W=/path/to/worktree            # never the main checkout; `git worktree add <path> -b <branch> main`
+M=/path/to/main-checkout       # READ-ONLY: scratch-pad/ (the harness archive) is gitignored and exists ONLY here
 S=$W/.claude/skills/verify/scripts
 E=$W/../evidence/<lane>        # or scratch-pad/<run>/evidence - outside the tracked tree
 mkdir -p "$E"; cd "$W" && uv sync --all-groups          # editable install: src/ IS the code under test
@@ -54,10 +56,13 @@ connect), `SNOWFLAKE_SECONDARY_ROLES` (NONE|ALL), `SNOWFLAKE_EDITION`, `DATABRIC
 
 ## 2. Fake backends
 
-The fake is too large to ship here (1033 lines). Reuse the archive's directly - it plugs into the launcher:
+The fake is too large to ship here (1033 lines). Reuse the archive's directly from the MAIN checkout - a fresh
+worktree has no `scratch-pad/`, and the archive must not be copied into one. It plugs into the launcher, which calls
+its `install()` and then its `install_network_guard()` (the fake's own guard, stacked on the launcher's):
 
 ```bash
-A=$W/scratch-pad/security-verification-2026-10/verify/harness/lead   # fake_backends.py + launch_server.py + mcp_client.py
+A=$M/scratch-pad/security-verification-2026-10/verify/harness/lead   # fake_backends.py + launch_server.py + mcp_client.py
+ls "$A/fake_backends.py"                                              # must exist BEFORE any fake-backed probe
 --env CG_VERIFY_FAKE_PATH=$A --env CG_VERIFY_FAKE_MODULE=fake_backends --env CG_FAKE_RECORD_FILE=$E/<probe>.fake-calls.json
 ```
 
@@ -86,7 +91,7 @@ $RPC raw "$E/nan.jsonl" -- $PY $S/launch_guarded.py > "$E/nan.json"
 # bounds that must refuse BEFORE any estimate: max_rows 0/-1, max_bytes_billed 2**63, warehouse_size "gigantic", NaN; +inf = no cap
 # admin role refused before connect (zero `snowflake connect` records even with the fake installed)
 $RPC --env-file "$E/dummy.env" --env SNOWFLAKE_ROLE="'ACCOUNTADMIN'" call check_credentials '{"engine":"snowflake"}' -- $PY $S/launch_guarded.py
-# with the archive fake: estimate + run under a cap, caveats, refusals (expect fake-calls.json to start with harness/install + network_guard)
+# with the archive fake: estimate + run under a cap, caveats, refusals (fake-calls.json entry 0 = harness/install, entry 1 = harness/network_guard state=enabled)
 $RPC --env-file "$E/dummy.env" --env CG_VERIFY_FAKE_PATH=$A --env CG_VERIFY_FAKE_MODULE=fake_backends \
   --env CG_FAKE_RECORD_FILE=$E/cc-bq.fake-calls.json call check_credentials '{"engine":"bigquery"}' -- $PY $S/launch_guarded.py
 ```
@@ -131,8 +136,10 @@ git -C $W check-ignore -v .env .mcp.json service-account.json .cursor/mcp.json  
   the fake record entry (`backend`, `call`, `kwargs`). Say which file and which entry.
 - Verdict per claim: PASS / FAIL / BLOCKED (exact point) / SKIP (why). A probe that "broke" a control is a FAIL
   even if a test passes. Running pytest/mypy/ruff or importing a function is never evidence.
-- Check the first two entries of every fake record file are `harness/install` and `harness/network_guard state=enabled`;
-  zero `network_blocked` / `network_guard: refused` events.
+- Check the first two entries of every fake record file are `harness/install` (listing the six patched attributes) and
+  `harness/network_guard state=enabled` (written by the fake's own guard, which `launch_guarded.py` installs right after
+  `install()`); zero `network_blocked` records; zero `network_guard: refused` stderr lines. Without a fake there is no
+  record file - the guard evidence is then the stderr banner `launch_guarded: pid=... network_guard=on fake=none`.
 
 ## 5. Gotchas (all bitten before)
 
@@ -157,3 +164,6 @@ git -C $W check-ignore -v .env .mcp.json service-account.json .cursor/mcp.json  
   the dry-run bytes, not what the provider bills (`CG_FAKE_BQ_EXECUTE_BYTES` shows the gap).
 - Delays inside fakes block a real worker thread; the BigQuery/Databricks watchdogs are 120 s constants.
 - `uv run` re-resolves; use `$W/.venv/bin/python` directly once synced so the venv under test is explicit.
+- `extract_step.py` stops at the next step boundary: a `uses:` step or a single-line/folded `run:` exits 1 naming the
+  step instead of handing back the NEXT step's body, and it echoes the matched line (file:line) to stderr - check it is
+  the step you meant before running the extracted script.
