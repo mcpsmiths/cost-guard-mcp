@@ -5,8 +5,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cost_guard_mcp.config import SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR
 from cost_guard_mcp.engines.snowflake import (
     _ASSUMED_RUNTIME_HOURS,
+    _CORTEX_CAVEAT,
     _FAIL_CLOSED_HINT,
     _GENERATION_LOOKUP_TIMEOUT_SECONDS,
     _HISTORY_LOOKUP_TIMEOUT_SECONDS,
@@ -18,11 +20,13 @@ from cost_guard_mcp.engines.snowflake import (
     _SINGLE_STATEMENT_COUNT,
     _apply_statement_timeout,
     _asserted_size_key,
+    _compute_lookups_allowed,
     _connect,
     _lookup_historical_runtime,
     _lookup_warehouse_facts,
     _normalize_sql_for_matching,
     _rate_for,
+    _show_warehouse_row,
     _size_to_pricing_key,
     _UnresolvedWarehouse,
     _UnsafeWarehouseName,
@@ -427,13 +431,16 @@ def test_explain_estimate_skips_use_warehouse_when_warehouse_is_none(mock_connec
     explain_estimate("SELECT 1", warehouse=None)
 
     executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
-    # Three statements: EXPLAIN, then SELECT CURRENT_WAREHOUSE() (the warehouse-facts lookup
+    # Two statements: EXPLAIN, then SELECT CURRENT_WAREHOUSE() (the warehouse-facts lookup
     # resolves the session's active warehouse when none is pinned - this mock answers it with
-    # the plan text, which fails the identifier allowlist, so the lookup degrades to None),
-    # then the warehouse-history calibration lookup. None of them issues USE WAREHOUSE when
-    # warehouse=None - that's the substantive behaviour this test guards.
-    assert len(executed_sql) == 3
+    # the plan text, which fails the identifier allowlist, so the warehouse is unobserved).
+    # The warehouse-history calibration read no longer follows: with no warehouse argument
+    # and an unknown state the warehouse-state guard skips it (DECISIONS.md #20). None of
+    # them issues USE WAREHOUSE when warehouse=None - that's the substantive behaviour this
+    # test guards.
+    assert len(executed_sql) == 2
     assert not any("USE WAREHOUSE" in stmt for stmt in executed_sql)
+    assert not any("QUERY_HISTORY" in stmt for stmt in executed_sql)
     assert "EXPLAIN USING JSON SELECT 1" in executed_sql[0]
     assert "SELECT CURRENT_WAREHOUSE()" in executed_sql[1]
 
@@ -1838,11 +1845,16 @@ def test_explain_estimate_prices_from_history_when_bytes_assigned_is_null(snowfl
 
 
 @patch("cost_guard_mcp.engines.snowflake._lookup_historical_runtime")
+@patch("cost_guard_mcp.engines.snowflake._lookup_warehouse_facts")
 @patch("cost_guard_mcp.engines.snowflake._connect")
-def test_explain_estimate_uses_historical_signal_when_available(mock_connect, mock_lookup):
+def test_explain_estimate_uses_historical_signal_when_available(
+    mock_connect, mock_lookup_facts, mock_lookup
+):
     # Integration-level wiring test (plan Task 2.1 Step 7): proves explain_estimate itself
     # picks the historical path when _lookup_historical_runtime returns a signal, rather than
-    # just testing the isolated lookup function above.
+    # just testing the isolated lookup function above. DECISIONS.md #20: the history read runs
+    # only for a caller-named warehouse observed STARTED, hence the facts patch.
+    mock_lookup_facts.return_value = _facts(name="WH", generation=None, cloud_provider=None)
     plan_json = json.dumps(
         {"GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}}
     )
@@ -1889,24 +1901,49 @@ def test_explain_estimate_uses_tiered_heuristic_when_no_historical_signal(
     assert not any("informed by" in c for c in estimate.caveats)
 
 
-@patch("cost_guard_mcp.engines.snowflake._connect")
-def test_check_credentials_ok_and_pins_warehouse_when_given(mock_connect):
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = (
-        "COST_GUARD_READER",
-        '{"roles":"","value":""}',
-        "COMPUTE_WH",
-        "ABC12345",
+_CONTEXT_SELECT = (
+    "SELECT CURRENT_ROLE(), CURRENT_SECONDARY_ROLES(), CURRENT_WAREHOUSE(), CURRENT_ACCOUNT()"
+)
+_SECONDARY_NONE = '{"roles":"","value":""}'
+
+
+def _check_with(
+    snowflake_fakes,
+    *,
+    show_rows=None,
+    warehouse="COMPUTE_WH",
+    current_warehouse=None,
+    context_row=("COST_GUARD_READER", _SECONDARY_NONE, "COMPUTE_WH", "ABC12345"),
+    fail_on=(),
+):
+    """Drive check_credentials against the fake cursor. Default: a STARTED COMPUTE_WH row - since
+    DECISIONS.md #20 the context SELECT runs only after SHOW WAREHOUSES reports STARTED."""
+    if show_rows is None:
+        show_rows = [snowflake_fakes.show_row("COMPUTE_WH", "X-Small")]
+    cursor = snowflake_fakes.cursor(
+        show_rows=show_rows,
+        current_warehouse=current_warehouse,
+        context_row=context_row,
+        fail_on=fail_on,
     )
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_connect.return_value = mock_conn
+    with patch(
+        "cost_guard_mcp.engines.snowflake._connect",
+        return_value=snowflake_fakes.connection(cursor),
+    ) as mock_connect:
+        result = check_credentials(warehouse=warehouse)
+    assert mock_connect.call_args == ((), {})  # read-only: default statement-timeout target
+    return result, cursor
 
-    result = check_credentials(warehouse="COMPUTE_WH")
 
-    mock_connect.assert_called_once_with()  # read-only: default statement-timeout target
-    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
-    assert "USE WAREHOUSE COMPUTE_WH" in executed_sql[0]
+def test_check_credentials_ok_and_pins_warehouse_when_given(snowflake_fakes):
+    result, cursor = _check_with(snowflake_fakes, warehouse="COMPUTE_WH")
+
+    # DECISIONS.md #20: USE WAREHOUSE, then the state read, then the context SELECT.
+    assert cursor.executed == [
+        "USE WAREHOUSE COMPUTE_WH",
+        "SHOW WAREHOUSES LIKE 'COMPUTE_WH'",
+        _CONTEXT_SELECT,
+    ]
     assert result.engine == "snowflake"
     assert result.ok is True
     assert "COST_GUARD_READER" in result.detail
@@ -1914,63 +1951,57 @@ def test_check_credentials_ok_and_pins_warehouse_when_given(mock_connect):
     assert "ABC12345" in result.detail
 
 
-@patch("cost_guard_mcp.engines.snowflake._connect")
-def test_check_credentials_probes_and_reports_secondary_roles(mock_connect):
+def test_check_credentials_probes_and_reports_secondary_roles(snowflake_fakes):
     # Security audit snowflake-role-pin-does-not-bound-session-authority-secondary-roles-
     # default-all: the operator's one in-tool identity check must show the effective
     # authority (primary role AND the active secondary-role set), not CURRENT_ROLE() alone.
-    secondary = '{"roles":"","value":""}'
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = ("DUMMY_ROLE", secondary, "DUMMY_WH", "DUMMYACCT")
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_connect.return_value = mock_conn
+    result, cursor = _check_with(
+        snowflake_fakes,
+        warehouse=None,
+        current_warehouse="DUMMY_WH",
+        show_rows=[snowflake_fakes.show_row("DUMMY_WH", "X-Small")],
+        context_row=("DUMMY_ROLE", _SECONDARY_NONE, "DUMMY_WH", "DUMMYACCT"),
+    )
 
-    result = check_credentials(warehouse=None)
-
-    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
-    assert len(executed_sql) == 1
-    assert "CURRENT_ROLE()" in executed_sql[0]
-    assert "CURRENT_SECONDARY_ROLES()" in executed_sql[0]
+    # DECISIONS.md #20: the session warehouse is resolved and its state read before the probe.
+    assert cursor.executed == [
+        "SELECT CURRENT_WAREHOUSE()",
+        "SHOW WAREHOUSES LIKE 'DUMMY_WH'",
+        _CONTEXT_SELECT,
+    ]
     assert result.ok is True
     assert "DUMMY_ROLE" in result.detail
     assert "secondary roles" in result.detail
-    assert secondary in result.detail
+    assert _SECONDARY_NONE in result.detail
     assert "DUMMYACCT" in result.detail
     assert "DUMMY_WH" in result.detail
 
 
-@patch("cost_guard_mcp.engines.snowflake._connect")
-def test_check_credentials_skips_use_warehouse_when_none(mock_connect):
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = (
-        "COST_GUARD_READER",
-        '{"roles":"","value":""}',
-        None,
-        "ABC12345",
+def test_check_credentials_skips_use_warehouse_when_none(snowflake_fakes):
+    _, cursor = _check_with(
+        snowflake_fakes,
+        warehouse=None,
+        current_warehouse="COMPUTE_WH",
+        context_row=("COST_GUARD_READER", _SECONDARY_NONE, None, "ABC12345"),
     )
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_connect.return_value = mock_conn
 
-    check_credentials(warehouse=None)
-
-    executed_sql = [call.args[0] for call in mock_cursor.execute.call_args_list]
-    assert len(executed_sql) == 1
-    assert not any("USE WAREHOUSE" in stmt for stmt in executed_sql)
+    assert not any("USE WAREHOUSE" in stmt for stmt in cursor.executed)
+    assert cursor.executed == [
+        "SELECT CURRENT_WAREHOUSE()",
+        "SHOW WAREHOUSES LIKE 'COMPUTE_WH'",
+        _CONTEXT_SELECT,
+    ]
 
 
-def _check_credentials_with_context_row(mock_connect, row):
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = row
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_connect.return_value = mock_conn
-    return check_credentials(warehouse=None)
+def _check_credentials_with_context_row(snowflake_fakes, row):
+    # No warehouse argument, a STARTED session warehouse (DECISIONS.md #20 precondition).
+    result, _ = _check_with(
+        snowflake_fakes, warehouse=None, current_warehouse="COMPUTE_WH", context_row=row
+    )
+    return result
 
 
-@patch("cost_guard_mcp.engines.snowflake._connect")
-def test_check_credentials_presents_session_identity_values_on_one_line(mock_connect, caplog):
+def test_check_credentials_presents_session_identity_values_on_one_line(snowflake_fakes, caplog):
     # PR #86 runtime verification, probe-4 p5a (evidence/probe-4/p5a-sf-cc-ctxrow.json): the
     # ok=True detail interpolated CURRENT_ROLE(), CURRENT_SECONDARY_ROLES(),
     # CURRENT_WAREHOUSE() and CURRENT_ACCOUNT() raw, so structuredContent.detail carried a
@@ -1983,7 +2014,7 @@ def test_check_credentials_presents_session_identity_values_on_one_line(mock_con
     account = "ABC12345\u2029Y"
 
     result = _check_credentials_with_context_row(
-        mock_connect, (role, secondary, warehouse, account)
+        snowflake_fakes, (role, secondary, warehouse, account)
     )
 
     assert result.ok is True
@@ -1992,17 +2023,17 @@ def test_check_credentials_presents_session_identity_values_on_one_line(mock_con
     for value in (role, secondary, warehouse, account):
         assert present_remote_text(value) in result.detail
     assert "\\n" in result.detail and "\\x1b" in result.detail and "\\u2028" in result.detail
-    # The success path stays log-free: nothing for a forged record to land in.
+    # The success path stays log-free: nothing for a forged record to land in (the guard
+    # passed silently on the STARTED warehouse).
     assert not [record for record in caplog.records if record.name.startswith("cost_guard_mcp")]
 
 
-@patch("cost_guard_mcp.engines.snowflake._connect")
-def test_check_credentials_redacts_secrets_in_identity_values_before_presenting(mock_connect):
+def test_check_credentials_redacts_secrets_in_identity_values_before_presenting(snowflake_fakes):
     # PR #86 delta verification (be81124 vs 8a16733 drift): BigQuery ran redact_secrets on its
     # success detail, Snowflake and Databricks only presented - the same chain applies to all.
     role = "COST_GUARD_READER password=hunter2"
     result = _check_credentials_with_context_row(
-        mock_connect, (role, '{"roles":"","value":""}', "COMPUTE_WH", "ABC12345")
+        snowflake_fakes, (role, _SECONDARY_NONE, "COMPUTE_WH", "ABC12345")
     )
 
     assert result.ok is True
@@ -2010,15 +2041,12 @@ def test_check_credentials_redacts_secrets_in_identity_values_before_presenting(
     assert "REDACTED" in result.detail
 
 
-@patch("cost_guard_mcp.engines.snowflake._connect")
-def test_check_credentials_ok_detail_reads_naturally_for_ordinary_values(mock_connect):
-    secondary = '{"roles":"","value":""}'
-
+def test_check_credentials_ok_detail_reads_naturally_for_ordinary_values(snowflake_fakes):
     with_warehouse = _check_credentials_with_context_row(
-        mock_connect, ("COST_GUARD_READER", secondary, "COMPUTE_WH", "ABC12345")
+        snowflake_fakes, ("COST_GUARD_READER", _SECONDARY_NONE, "COMPUTE_WH", "ABC12345")
     )
     without_warehouse = _check_credentials_with_context_row(
-        mock_connect, ("COST_GUARD_READER", secondary, None, "ABC12345")
+        snowflake_fakes, ("COST_GUARD_READER", _SECONDARY_NONE, None, "ABC12345")
     )
 
     assert with_warehouse.detail == (
@@ -2052,16 +2080,11 @@ def test_check_credentials_redacts_secrets_in_failure_detail(mock_connect):
     assert "REDACTED" in result.detail
 
 
-@patch("cost_guard_mcp.engines.snowflake._connect")
-def test_check_credentials_reports_no_rows_as_failure_not_a_raise(mock_connect):
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = None
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_connect.return_value = mock_conn
+def test_check_credentials_reports_no_rows_as_failure_not_a_raise(snowflake_fakes):
+    # A STARTED row so the context SELECT runs (DECISIONS.md #20) and returns no row.
+    result, cursor = _check_with(snowflake_fakes, context_row=None)
 
-    result = check_credentials()
-
+    assert cursor.executed[-1] == _CONTEXT_SELECT
     assert result.ok is False
     assert "no rows" in result.detail
 
@@ -2080,23 +2103,18 @@ def test_check_credentials_rejects_invalid_warehouse_name_as_failure_not_a_raise
     mock_cursor.execute.assert_not_called()
 
 
-@patch("cost_guard_mcp.engines.snowflake._connect")
-def test_check_credentials_closes_connection_on_success(mock_connect):
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = (
-        "COST_GUARD_READER",
-        '{"roles":"","value":""}',
-        "COMPUTE_WH",
-        "ABC12345",
+def test_check_credentials_closes_connection_on_success(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")],
+        current_warehouse="COMPUTE_WH",
     )
-    mock_conn = MagicMock()
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_connect.return_value = mock_conn
-
-    result = check_credentials()
+    conn = snowflake_fakes.connection(cursor)
+    with patch("cost_guard_mcp.engines.snowflake._connect", return_value=conn):
+        result = check_credentials()
 
     assert result.ok is True
-    mock_conn.close.assert_called_once()
+    assert cursor.executed[-1] == _CONTEXT_SELECT
+    conn.close.assert_called_once()
 
 
 @patch("cost_guard_mcp.engines.snowflake._connect")
@@ -2443,3 +2461,710 @@ def test_execute_bounded_survives_a_failed_connection_close(mock_connect, _mock_
     assert row_count == 1
     assert row_cap_hit is False
     mock_conn.close.assert_called_once()
+
+
+# --- read-only warehouse-state guard (DECISIONS.md #20; issue #92) ----------------------------
+#
+# SELECT CURRENT_REGION(), the QUERY_HISTORY table-function SELECT and check_credentials'
+# session-context SELECT can resume a suspended AUTO_RESUME warehouse. They run only when the
+# pinned warehouse's SHOW WAREHOUSES state is STARTED (or under the opt-in); the QUERY_HISTORY
+# read additionally runs only for a caller-named warehouse (the owner's literal rule in #92:
+# "When warehouse is None, skip the QUERY_HISTORY lookup unless opted in"). USE WAREHOUSE,
+# EXPLAIN USING JSON, SHOW WAREHOUSES and SELECT CURRENT_WAREHOUSE() always run.
+
+_GUARD_LOGGER = "cost_guard_mcp.engines.snowflake"
+_NOT_STARTED_STATES = ["SUSPENDED", "RESUMING", "SUSPENDING", "RESIZING"]
+_HISTORY_MATCH = [("SELECT 1", 3_600_000, 10)]
+_GEN1_HEURISTIC_COST = round(
+    credits_per_hour("XSMALL")
+    * usd_per_credit("standard")
+    * scale_runtime_hours(1000, baseline_hours=_ASSUMED_RUNTIME_HOURS),
+    6,
+)
+
+
+def _no(cursor, needle):
+    return not any(needle in stmt for stmt in cursor.executed)
+
+
+def _state_caveats(estimate):
+    # Every guard caveat names the opt-in; the amended _rate_for generation caveat does not.
+    return [c for c in estimate.caveats if SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR in c]
+
+
+@pytest.mark.parametrize(
+    ("state", "allow", "expected"),
+    [
+        ("STARTED", False, True),
+        ("SUSPENDED", False, False),
+        ("RESUMING", False, False),
+        (None, False, False),
+        ("SUSPENDED", True, True),
+        (None, True, True),
+    ],
+)
+def test_compute_lookups_allowed_predicate(state, allow, expected):
+    assert _compute_lookups_allowed(state, allow) is expected
+
+
+def test_show_warehouse_row_reads_the_row_without_current_region(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")])
+
+    facts = _show_warehouse_row(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert isinstance(facts, _WarehouseFacts)
+    assert facts.state == "STARTED" and facts.cloud_provider is None
+    assert cursor.executed == ["SHOW WAREHOUSES LIKE 'COMPUTE_WH'"]
+
+
+@pytest.mark.parametrize("state", _NOT_STARTED_STATES)
+def test_lookup_warehouse_facts_skips_current_region_when_the_warehouse_is_not_started(
+    snowflake_fakes, state
+):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large", state=state)]
+    )
+
+    facts = _lookup_warehouse_facts(
+        snowflake_fakes.connection(cursor), "COMPUTE_WH", allow_resume=False
+    )
+
+    assert isinstance(facts, _WarehouseFacts)
+    assert facts.state == state and facts.cloud_provider is None
+    assert facts.size_key == "X4LARGE" and facts.warehouse_type == "STANDARD"
+    assert facts.generation == "2"
+    assert cursor.executed == ["SHOW WAREHOUSES LIKE 'COMPUTE_WH'"]
+
+
+def test_lookup_warehouse_facts_defaults_to_the_guarded_lookup(snowflake_fakes):
+    # allow_resume defaults to False: a caller that forgets the flag gets the guard, not the
+    # lookups - and every existing two-positional-argument call keeps its meaning.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert isinstance(facts, _WarehouseFacts) and facts.cloud_provider is None
+    assert _no(cursor, "CURRENT_REGION")
+
+
+def test_lookup_warehouse_facts_skips_current_region_when_the_state_column_is_null(
+    snowflake_fakes,
+):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=None)]
+    )
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert isinstance(facts, _WarehouseFacts) and facts.state is None
+    assert _no(cursor, "CURRENT_REGION")
+
+
+def test_lookup_warehouse_facts_runs_current_region_when_started(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")])
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert isinstance(facts, _WarehouseFacts) and facts.cloud_provider == "AWS"
+    assert cursor.executed == ["SHOW WAREHOUSES LIKE 'COMPUTE_WH'", "SELECT CURRENT_REGION()"]
+
+
+def test_lookup_warehouse_facts_runs_current_region_when_resume_is_allowed(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")]
+    )
+
+    facts = _lookup_warehouse_facts(
+        snowflake_fakes.connection(cursor), "COMPUTE_WH", allow_resume=True
+    )
+
+    assert isinstance(facts, _WarehouseFacts)
+    assert facts.state == "SUSPENDED" and facts.cloud_provider == "AWS"
+    assert cursor.executed == ["SHOW WAREHOUSES LIKE 'COMPUTE_WH'", "SELECT CURRENT_REGION()"]
+
+
+def test_lookup_warehouse_facts_skips_current_region_for_an_unresolved_warehouse(snowflake_fakes):
+    # Only a quoted lower-case sibling answers: no row names the pinned COMPUTE_WH.
+    cursor = snowflake_fakes.cursor(show_rows=[snowflake_fakes.show_row("compute_wh", "6X-Large")])
+
+    facts = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert isinstance(facts, _UnresolvedWarehouse)
+    assert _no(cursor, "CURRENT_REGION")
+
+
+def test_lookup_warehouse_facts_skips_current_region_for_an_empty_show_result(snowflake_fakes):
+    cursor = snowflake_fakes.cursor(show_rows=[])
+
+    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH") is None
+    assert cursor.executed == ["SHOW WAREHOUSES LIKE 'COMPUTE_WH'"]
+
+
+@pytest.mark.parametrize(
+    "show_rows_key", ["unresolved", "empty"], ids=["unresolved-rows", "empty-result"]
+)
+def test_lookup_warehouse_facts_with_resume_allowed_skips_current_region_for_an_unresolved_result(
+    snowflake_fakes, show_rows_key
+):
+    # Not byte-identical to 0.4.0 under the opt-in: CURRENT_REGION() used to run (unused) even
+    # when SHOW returned no rows or an unresolved result. One fewer statement in the fail-safe
+    # direction; pinned so the shape is deliberate.
+    rows = {
+        "unresolved": [snowflake_fakes.show_row("compute_wh", "6X-Large")],
+        "empty": [],
+    }[show_rows_key]
+    cursor = snowflake_fakes.cursor(show_rows=rows)
+
+    facts = _lookup_warehouse_facts(
+        snowflake_fakes.connection(cursor), "COMPUTE_WH", allow_resume=True
+    )
+
+    assert not isinstance(facts, _WarehouseFacts)
+    assert cursor.executed == ["SHOW WAREHOUSES LIKE 'COMPUTE_WH'"]
+
+
+def test_lookup_warehouse_facts_still_returns_none_when_current_region_fails_on_a_started_warehouse(
+    snowflake_fakes,
+):
+    # R5: today's contract pinned - a CURRENT_REGION() failure makes the whole lookup None.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")], fail_on=("CURRENT_REGION",)
+    )
+
+    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH") is None
+
+
+@pytest.mark.parametrize("state", _NOT_STARTED_STATES)
+def test_explain_estimate_skips_history_and_region_when_the_warehouse_is_not_started(
+    snowflake_fakes, state
+):
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=state)],
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert cursor.executed == [
+        "USE WAREHOUSE COMPUTE_WH",
+        "EXPLAIN USING JSON SELECT 1",
+        "SHOW WAREHOUSES LIKE 'COMPUTE_WH'",
+    ]
+    # Gen1 at the observed size with the byte-tier heuristic, NOT the 3600 s history runtime.
+    assert estimate.estimated_cost_usd == _GEN1_HEURISTIC_COST
+    assert estimate.accuracy_tier is AccuracyTier.UPPER_BOUND
+    (caveat,) = _state_caveats(estimate)
+    assert "COMPUTE_WH" in caveat and f"'{state}'" in caveat and "not STARTED" in caveat
+    assert "auto_resume 'true'" in caveat
+    assert "lookups skipped" in caveat
+    assert f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true" in caveat
+    assert "wait for it to finish resuming" in caveat
+    assert any("could not be determined" in c for c in estimate.caveats)
+    assert not any("informed by" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_caveat_order_puts_the_state_caveat_right_after_cortex(snowflake_fakes):
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+    )
+
+    assert estimate.caveats[0] == _CORTEX_CAVEAT
+    assert estimate.caveats[1].startswith("Warehouse COMPUTE_WH is 'SUSPENDED'")
+
+
+def test_explain_estimate_prices_at_the_observed_size_even_when_suspended(snowflake_fakes):
+    # #19's observed-size floor is kept: the SHOW row's size/type/generation are still read.
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large", state="SUSPENDED")],
+    )
+
+    expected = round(
+        credits_per_hour("X4LARGE")
+        * usd_per_credit("standard")
+        * scale_runtime_hours(1000, baseline_hours=_ASSUMED_RUNTIME_HOURS),
+        6,
+    )
+    assert estimate.estimated_cost_usd == expected
+    assert any("understated" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_still_fails_closed_on_a_non_standard_suspended_warehouse(
+    snowflake_fakes,
+):
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[
+            snowflake_fakes.show_row(
+                "COMPUTE_WH", "X-Small", state="SUSPENDED", warehouse_type="SNOWPARK-OPTIMIZED"
+            )
+        ],
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert estimate.estimated_cost_usd is None
+    assert any("SNOWPARK-OPTIMIZED" in c for c in estimate.caveats)
+    assert len(_state_caveats(estimate)) == 1
+    assert _no(cursor, "QUERY_HISTORY")
+
+
+def test_explain_estimate_skips_history_when_no_warehouse_is_pinned(snowflake_fakes):
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[],
+        warehouse=None,
+        current_warehouse=None,
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert cursor.executed == ["EXPLAIN USING JSON SELECT 1", "SELECT CURRENT_WAREHOUSE()"]
+    (caveat,) = _state_caveats(estimate)
+    assert "could not be read" in caveat and "no warehouse is pinned" in caveat
+    # Today's facts-None pricing: Gen1 at the caller-asserted (default XSMALL) size.
+    assert estimate.estimated_cost_usd == _GEN1_HEURISTIC_COST
+
+
+def test_explain_estimate_skips_history_when_show_warehouses_fails(snowflake_fakes):
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large")],
+        fail_on=("SHOW WAREHOUSES",),
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert _no(cursor, "QUERY_HISTORY") and _no(cursor, "CURRENT_REGION")
+    assert any("could not be read" in c for c in estimate.caveats)
+    assert any("could not be determined" in c for c in estimate.caveats)
+    assert estimate.estimated_cost_usd == _GEN1_HEURISTIC_COST
+
+
+def test_explain_estimate_skips_history_for_an_unresolved_warehouse(snowflake_fakes):
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("compute_wh", "6X-Large")],
+        warehouse="COMPUTE_WH",
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert _no(cursor, "QUERY_HISTORY") and _no(cursor, "CURRENT_REGION")
+    assert estimate.estimated_cost_usd is None
+    assert any("could not be read" in c for c in estimate.caveats)
+    assert any("could not be resolved to exactly one" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_skips_history_for_an_unsafe_session_warehouse_name(snowflake_fakes):
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("big-wh", "6X-Large")],
+        warehouse=None,
+        current_warehouse="big-wh",
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert cursor.executed == ["EXPLAIN USING JSON SELECT 1", "SELECT CURRENT_WAREHOUSE()"]
+    assert estimate.estimated_cost_usd is None
+    assert any("could not be read" in c for c in estimate.caveats)
+
+
+def test_explain_estimate_skips_history_when_the_state_column_is_null(snowflake_fakes):
+    # S3: a resolved row whose state is NULL - the warehouse is named, the state is not known.
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=None)],
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert _no(cursor, "QUERY_HISTORY") and _no(cursor, "CURRENT_REGION")
+    (caveat,) = _state_caveats(estimate)
+    assert caveat.startswith("Warehouse COMPUTE_WH reports no state")
+    assert "not known to be STARTED" in caveat
+    assert "could not be read" not in caveat
+
+
+def test_explain_estimate_runs_every_lookup_when_the_warehouse_is_started(snowflake_fakes):
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")],
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert cursor.executed[:4] == [
+        "USE WAREHOUSE COMPUTE_WH",
+        "EXPLAIN USING JSON SELECT 1",
+        "SHOW WAREHOUSES LIKE 'COMPUTE_WH'",
+        "SELECT CURRENT_REGION()",
+    ]
+    assert len(cursor.executed) == 5 and "QUERY_HISTORY" in cursor.executed[4]
+    assert any("informed by 1 historical run" in c for c in estimate.caveats)
+    assert not _state_caveats(estimate)
+
+
+def test_explain_estimate_skips_history_on_a_started_session_warehouse_without_an_argument(
+    snowflake_fakes,
+):
+    # The owner's literal rule (#92: "When warehouse is None, skip the QUERY_HISTORY lookup
+    # unless opted in"), adopted over the design's "when CURRENT_WAREHOUSE() is NULL" reading
+    # (DECISIONS.md #20 records the deviation). The session warehouse is still resolved and
+    # observed for #19 pricing (SHOW + CURRENT_REGION on a STARTED row); only history is lost.
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", generation="2")],
+        warehouse=None,
+        current_warehouse="COMPUTE_WH",
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert cursor.executed == [
+        "EXPLAIN USING JSON SELECT 1",
+        "SELECT CURRENT_WAREHOUSE()",
+        "SHOW WAREHOUSES LIKE 'COMPUTE_WH'",
+        "SELECT CURRENT_REGION()",
+    ]
+    # Gen2/AWS rate (the region lookup ran) with the heuristic runtime (history did not).
+    expected = round(
+        credits_per_hour("XSMALL", generation="2", cloud_provider="AWS")
+        * usd_per_credit("standard")
+        * scale_runtime_hours(1000, baseline_hours=_ASSUMED_RUNTIME_HOURS),
+        6,
+    )
+    assert estimate.estimated_cost_usd == expected
+    assert any("Gen2 on AWS" in c for c in estimate.caveats)
+    assert not any("informed by" in c for c in estimate.caveats)
+    (caveat,) = _state_caveats(estimate)
+    assert "No warehouse argument was given" in caveat
+    assert "QUERY_HISTORY read was skipped" in caveat
+    assert "Pass a warehouse argument" in caveat
+    assert f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true" in caveat
+
+
+def test_explain_estimate_opt_in_runs_the_lookups_on_a_suspended_warehouse(
+    snowflake_fakes, monkeypatch, caplog
+):
+    monkeypatch.setenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, "true")
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert not _no(cursor, "CURRENT_REGION") and not _no(cursor, "QUERY_HISTORY")
+    assert any("Gen2 on AWS" in c for c in estimate.caveats)
+    assert any("informed by" in c for c in estimate.caveats)
+    assert not _state_caveats(estimate)
+    skipped = [r for r in caplog.records if "warehouse_state_guard=skipped" in r.message]
+    assert len(skipped) == 1 and skipped[0].levelname == "INFO"
+    assert f"reason={SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true" in skipped[0].message
+
+
+def test_explain_estimate_opt_in_runs_history_without_a_warehouse_argument(
+    snowflake_fakes, monkeypatch
+):
+    monkeypatch.setenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, "true")
+
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")],
+        warehouse=None,
+        current_warehouse="COMPUTE_WH",
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert not _no(cursor, "QUERY_HISTORY")
+    assert any("informed by" in c for c in estimate.caveats)
+    assert not _state_caveats(estimate)
+
+
+@pytest.mark.parametrize("raw", ["TRUE", "1"])
+def test_explain_estimate_opt_in_requires_exactly_true(snowflake_fakes, monkeypatch, raw):
+    monkeypatch.setenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, raw)
+
+    _, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert _no(cursor, "CURRENT_REGION") and _no(cursor, "QUERY_HISTORY")
+
+
+def test_explain_estimate_allow_warehouse_wake_bypasses_the_guard(snowflake_fakes, caplog):
+    # run_query_bounded's own estimate; the env record is NOT logged (the flag caused it).
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+        history_rows=_HISTORY_MATCH,
+        allow_warehouse_wake=True,
+    )
+
+    assert not _no(cursor, "CURRENT_REGION") and not _no(cursor, "QUERY_HISTORY")
+    assert not _state_caveats(estimate)
+    assert not [r for r in caplog.records if "warehouse_state_guard" in r.message]
+
+
+@pytest.mark.parametrize("total_chars", [300, 1_200])
+def test_explain_estimate_state_caveat_presents_state_and_auto_resume_bounded_and_quoted(
+    snowflake_fakes, total_chars
+):
+    hostile = _hostile_text(total_chars)
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=hostile)],
+    )
+
+    (caveat,) = _state_caveats(estimate)
+    # _text_or_none(upper=True) stores the upper-cased, stripped text.
+    _assert_presented_whole_and_on_one_line(caveat, hostile.strip().upper())
+
+
+def test_explain_estimate_state_caveat_redacts_secrets_in_the_state_text(snowflake_fakes):
+    body = base64.b64decode(b"YWJjMTIzc2VjcmV0").decode()
+    prefix = "-----BEGIN " + "PRIVATE KEY" + "-----"
+    estimate, _ = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=prefix + body)],
+    )
+
+    (caveat,) = _state_caveats(estimate)
+    assert body.upper() not in caveat and body not in caveat
+    assert "REDACTED" in caveat
+
+
+def test_explain_estimate_guard_logs_one_info_record(snowflake_fakes, caplog):
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+
+    _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+    )
+
+    records = [r for r in caplog.records if r.name == _GUARD_LOGGER]
+    assert len(records) == 1 and records[0].levelname == "INFO"
+    assert "warehouse_state_guard=enforced" in records[0].message
+    assert "path=estimate_query_cost" in records[0].message
+    assert "state='SUSPENDED'" in records[0].message
+    assert "skipped=current_region,query_history" in records[0].message
+
+
+def test_rate_for_generation_caveat_names_the_skipped_region_lookup():
+    _, _, caveats = _rate_for(_facts(generation="2", cloud_provider=None), "XSMALL")
+
+    (caveat,) = caveats
+    assert "could not be determined" in caveat and "assuming Gen1" in caveat
+    assert "skipped because the warehouse is not STARTED" in caveat
+
+
+@pytest.mark.parametrize("state", _NOT_STARTED_STATES)
+def test_check_credentials_skips_the_context_select_when_the_warehouse_is_not_started(
+    snowflake_fakes, state
+):
+    result, cursor = _check_with(
+        snowflake_fakes, show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=state)]
+    )
+
+    assert cursor.executed == ["USE WAREHOUSE COMPUTE_WH", "SHOW WAREHOUSES LIKE 'COMPUTE_WH'"]
+    assert result.ok is True
+    assert result.detail.startswith("Authenticated: login succeeded (session identity not probed).")
+    assert "COMPUTE_WH" in result.detail and f"'{state}'" in result.detail
+    assert "auto_resume 'true'" in result.detail
+    assert "session-context SELECT was skipped" in result.detail
+    assert f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true" in result.detail
+    # Configured values are not echoed (config.py's own convention): neither the role nor the
+    # account from the autouse config appear.
+    assert "COST_GUARD_READER" not in result.detail and "abc123" not in result.detail
+
+
+def test_check_credentials_resolves_the_session_warehouse_before_gating(snowflake_fakes):
+    result, cursor = _check_with(
+        snowflake_fakes,
+        warehouse=None,
+        current_warehouse="COMPUTE_WH",
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+    )
+
+    assert cursor.executed == ["SELECT CURRENT_WAREHOUSE()", "SHOW WAREHOUSES LIKE 'COMPUTE_WH'"]
+    assert result.ok is True
+    assert "Warehouse COMPUTE_WH is 'SUSPENDED'" in result.detail
+
+
+def test_check_credentials_fails_closed_when_no_warehouse_is_pinned(snowflake_fakes):
+    # A session with no current warehouse is treated as unknown state, not as provably free,
+    # so the rule stays uniform (DECISIONS.md #20).
+    result, cursor = _check_with(snowflake_fakes, warehouse=None, current_warehouse=None)
+
+    assert cursor.executed == ["SELECT CURRENT_WAREHOUSE()"]
+    assert result.ok is True
+    assert "could not be read" in result.detail
+    assert "Pass a warehouse argument" in result.detail
+
+
+def test_check_credentials_fails_closed_when_show_warehouses_fails(snowflake_fakes):
+    result, cursor = _check_with(snowflake_fakes, fail_on=("SHOW WAREHOUSES",))
+
+    assert _no(cursor, "CURRENT_ROLE()")
+    assert result.ok is True
+    assert "could not be read" in result.detail
+
+
+@pytest.mark.parametrize("shape", ["unresolved", "unsafe"])
+def test_check_credentials_fails_closed_for_an_unresolved_or_unsafe_warehouse(
+    snowflake_fakes, shape
+):
+    if shape == "unresolved":
+        result, cursor = _check_with(
+            snowflake_fakes,
+            warehouse="COMPUTE_WH",
+            show_rows=[snowflake_fakes.show_row("compute_wh", "6X-Large")],
+        )
+    else:
+        result, cursor = _check_with(snowflake_fakes, warehouse=None, current_warehouse="big-wh")
+
+    assert _no(cursor, "CURRENT_ROLE()")
+    assert result.ok is True
+    assert "could not be read" in result.detail
+
+
+def test_check_credentials_fails_closed_when_the_state_column_is_null(snowflake_fakes):
+    result, cursor = _check_with(
+        snowflake_fakes, show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=None)]
+    )
+
+    assert _no(cursor, "CURRENT_ROLE()")
+    assert result.ok is True
+    assert "Warehouse COMPUTE_WH reports no state" in result.detail
+
+
+def test_check_credentials_runs_the_context_select_when_the_warehouse_is_started(snowflake_fakes):
+    result, cursor = _check_with(snowflake_fakes)
+
+    assert cursor.executed == [
+        "USE WAREHOUSE COMPUTE_WH",
+        "SHOW WAREHOUSES LIKE 'COMPUTE_WH'",
+        _CONTEXT_SELECT,
+    ]
+    assert result.detail == (
+        "Authenticated as role 'COST_GUARD_READER' (secondary roles: "
+        '\'{"roles":"","value":""}\') on account \'ABC12345\', warehouse \'COMPUTE_WH\'.'
+    )
+
+
+def test_check_credentials_opt_in_skips_show_warehouses_and_runs_the_context_select(
+    snowflake_fakes, monkeypatch, caplog
+):
+    # S10: byte-for-byte the 0.4.0 path - no SHOW at all; one INFO record names the variable.
+    monkeypatch.setenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, "true")
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+
+    result, cursor = _check_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+    )
+
+    assert cursor.executed == ["USE WAREHOUSE COMPUTE_WH", _CONTEXT_SELECT]
+    assert result.detail.startswith("Authenticated as role 'COST_GUARD_READER'")
+    skipped = [r for r in caplog.records if "warehouse_state_guard=skipped" in r.message]
+    assert len(skipped) == 1
+    assert f"reason={SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true" in skipped[0].message
+
+
+def test_check_credentials_opt_in_requires_exactly_true(snowflake_fakes, monkeypatch):
+    monkeypatch.setenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, "TRUE")
+
+    _, cursor = _check_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+    )
+
+    assert "SHOW WAREHOUSES LIKE 'COMPUTE_WH'" in cursor.executed
+    assert _no(cursor, "CURRENT_ROLE()")
+
+
+@pytest.mark.parametrize("state", ["STARTED", "SUSPENDED"])
+def test_check_credentials_never_runs_current_region(snowflake_fakes, state):
+    _, cursor = _check_with(
+        snowflake_fakes, show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=state)]
+    )
+
+    assert _no(cursor, "CURRENT_REGION")
+
+
+@pytest.mark.parametrize("total_chars", [300, 1_200])
+def test_check_credentials_gated_detail_presents_state_bounded_and_quoted(
+    snowflake_fakes, total_chars
+):
+    hostile = _hostile_text(total_chars)
+    result, _ = _check_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=hostile)],
+    )
+
+    assert len(result.detail.splitlines()) == 1
+    _assert_presented_whole_and_on_one_line(result.detail, hostile.strip().upper())
+
+
+def test_check_credentials_gated_detail_is_not_a_warning(snowflake_fakes, caplog):
+    caplog.set_level(logging.DEBUG, logger="cost_guard_mcp")
+
+    _check_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+    )
+
+    records = [r for r in caplog.records if r.name.startswith("cost_guard_mcp")]
+    assert [r.levelname for r in records] == ["INFO"]
+    assert "warehouse_state_guard=enforced" in records[0].message
+    assert "path=check_credentials" in records[0].message
+    assert "skipped=context_select" in records[0].message
+    assert "state='SUSPENDED'" in records[0].message
+
+
+def test_check_credentials_gated_detail_never_echoes_config_values(
+    snowflake_fakes, snowflake_config
+):
+    # The gated detail is built from the SHOW row only; configured identity and secrets never
+    # travel outbound (config.py: "it never echoes the env value back"). Placeholders are built
+    # at runtime from the field names, never spelled as literals.
+    fields = ("account", "user", "role", "private_key_path", "private_key_passphrase", "password")
+    placeholders = {field: f"{field}-placeholder-{index}" for index, field in enumerate(fields)}
+    snowflake_config.return_value = MagicMock(edition="standard", **placeholders)
+
+    result, _ = _check_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")],
+    )
+
+    for placeholder in placeholders.values():
+        assert placeholder not in result.detail
+
+
+def test_check_credentials_use_warehouse_failure_still_reports_ok_false(snowflake_fakes):
+    result, cursor = _check_with(snowflake_fakes, fail_on=("USE WAREHOUSE",))
+
+    assert result.ok is False
+    assert "fake failure on USE WAREHOUSE" in result.detail
+    assert _no(cursor, "SHOW WAREHOUSES")
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+def test_execute_bounded_does_not_consult_the_warehouse_state(_mock_sleep, snowflake_fakes):
+    # S12: run_query_bounded's execution is untouched - no SHOW WAREHOUSES on this path.
+    cursor = snowflake_fakes.cursor(
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state="SUSPENDED")]
+    )
+    cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    cursor.execute_async = lambda sql, num_statements=None: cursor.execute(
+        sql, num_statements=num_statements
+    )
+    cursor.get_results_from_sfqid = lambda query_id: None
+    conn = snowflake_fakes.connection(cursor)
+    conn.is_still_running.return_value = False
+    with patch("cost_guard_mcp.engines.snowflake._connect", return_value=conn):
+        execute_bounded("SELECT 1", "COMPUTE_WH", max_rows=5)
+
+    assert _no(cursor, "SHOW WAREHOUSES")
+    assert cursor.executed[0] == "USE WAREHOUSE COMPUTE_WH"

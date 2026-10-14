@@ -29,7 +29,9 @@ def estimate_query_cost(
             snowflake_kwargs["warehouse_size"] = warehouse_size
         if edition is not None:
             snowflake_kwargs["edition"] = edition
-        return snowflake_engine.explain_estimate(sql, warehouse, **snowflake_kwargs)
+        return snowflake_engine.explain_estimate(
+            sql, warehouse, allow_warehouse_wake=allow_warehouse_wake, **snowflake_kwargs
+        )
     if engine == "databricks":
         databricks_kwargs: dict[str, str] = {}
         if warehouse_size is not None:

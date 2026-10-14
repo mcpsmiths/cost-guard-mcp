@@ -31,7 +31,10 @@ def test_estimate_query_cost_dispatches_to_snowflake(mock_engine):
         engine="snowflake", accuracy_tier=AccuracyTier.UPPER_BOUND, estimated_bytes=100
     )
     result = estimate_query_cost("snowflake", "SELECT 1", warehouse="WH")
-    mock_engine.explain_estimate.assert_called_once_with("SELECT 1", "WH")
+    # DECISIONS.md #20: the read-only tool never asks the engine to wake the warehouse.
+    mock_engine.explain_estimate.assert_called_once_with(
+        "SELECT 1", "WH", allow_warehouse_wake=False
+    )
     assert result.engine == "snowflake"
 
 
@@ -58,7 +61,7 @@ def test_estimate_query_cost_threads_warehouse_size_and_edition_to_snowflake(moc
         "snowflake", "SELECT 1", warehouse="WH", warehouse_size="X6LARGE", edition="enterprise"
     )
     mock_engine.explain_estimate.assert_called_once_with(
-        "SELECT 1", "WH", warehouse_size="X6LARGE", edition="enterprise"
+        "SELECT 1", "WH", allow_warehouse_wake=False, warehouse_size="X6LARGE", edition="enterprise"
     )
 
 
@@ -94,8 +97,14 @@ def test_estimate_query_cost_refuses_multi_statement_text_before_any_engine_call
 
 
 @patch("cost_guard_mcp.tools.estimate_query_cost.databricks_engine")
+@patch("cost_guard_mcp.tools.estimate_query_cost.snowflake_engine")
 @patch("cost_guard_mcp.tools.estimate_query_cost.bigquery_engine")
-def test_read_only_estimates_do_not_ask_to_wake_the_warehouse(mock_bigquery, mock_databricks):
+def test_read_only_estimates_do_not_ask_to_wake_the_warehouse(
+    mock_bigquery, mock_snowflake, mock_databricks
+):
+    mock_snowflake.explain_estimate.return_value = CostEstimate(
+        engine="snowflake", accuracy_tier=AccuracyTier.UPPER_BOUND, estimated_bytes=1
+    )
     mock_databricks.explain_estimate.return_value = CostEstimate(
         engine="databricks", accuracy_tier=AccuracyTier.HEURISTIC, estimated_bytes=1
     )
@@ -103,9 +112,13 @@ def test_read_only_estimates_do_not_ask_to_wake_the_warehouse(mock_bigquery, moc
         engine="bigquery", accuracy_tier=AccuracyTier.PRECISE, estimated_bytes=1
     )
 
+    estimate_query_cost("snowflake", "SELECT 1", warehouse="WH")
     estimate_query_cost("databricks", "SELECT 1")
     estimate_query_cost("bigquery", "SELECT 1")
 
+    mock_snowflake.explain_estimate.assert_called_once_with(
+        "SELECT 1", "WH", allow_warehouse_wake=False
+    )
     mock_databricks.explain_estimate.assert_called_once_with(
         "SELECT 1", None, allow_warehouse_wake=False
     )
@@ -113,13 +126,21 @@ def test_read_only_estimates_do_not_ask_to_wake_the_warehouse(mock_bigquery, moc
 
 
 @patch("cost_guard_mcp.tools.estimate_query_cost.databricks_engine")
-def test_allow_warehouse_wake_is_threaded_to_the_warehouse_engines(mock_databricks):
+@patch("cost_guard_mcp.tools.estimate_query_cost.snowflake_engine")
+def test_allow_warehouse_wake_is_threaded_to_the_warehouse_engines(mock_snowflake, mock_databricks):
+    mock_snowflake.explain_estimate.return_value = CostEstimate(
+        engine="snowflake", accuracy_tier=AccuracyTier.UPPER_BOUND, estimated_bytes=1
+    )
     mock_databricks.explain_estimate.return_value = CostEstimate(
         engine="databricks", accuracy_tier=AccuracyTier.HEURISTIC, estimated_bytes=1
     )
 
+    estimate_query_cost("snowflake", "SELECT 1", warehouse="WH", allow_warehouse_wake=True)
     estimate_query_cost("databricks", "SELECT 1", warehouse_size="Small", allow_warehouse_wake=True)
 
+    mock_snowflake.explain_estimate.assert_called_once_with(
+        "SELECT 1", "WH", allow_warehouse_wake=True
+    )
     mock_databricks.explain_estimate.assert_called_once_with(
         "SELECT 1", None, allow_warehouse_wake=True, warehouse_size="Small"
     )

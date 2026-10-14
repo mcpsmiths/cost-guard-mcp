@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import re
@@ -8,7 +9,11 @@ from typing import TypeGuard
 
 import snowflake.connector
 
-from cost_guard_mcp.config import load_snowflake_config
+from cost_guard_mcp.config import (
+    SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR,
+    load_snowflake_config,
+    snowflake_warehouse_resume_allowed,
+)
 from cost_guard_mcp.errors import (
     SanitizedEngineError,
     present_remote_text,
@@ -287,9 +292,13 @@ class _WarehouseFacts:
 
     `size_key` is the pricing-table key for the row's `size` text (`size_text`), or None when
     the text is not a size this project prices; `generation`/`cloud_provider` are None when
-    their value is not one of the recognised ones. `state`/`auto_resume` are carried for the
-    pending read-only warehouse-state guard (audit record read-only-tools-resume-suspended-
-    warehouse) so it can reuse this single lookup instead of issuing another one.
+    their value is not one of the recognised ones (`cloud_provider` is also None when the
+    CURRENT_REGION() lookup was skipped by the warehouse-state guard). `state`/`auto_resume`
+    feed the read-only warehouse-state guard (DECISIONS.md #20, audit record read-only-tools-
+    resume-suspended-warehouse), which reuses this single SHOW lookup instead of issuing
+    another one. The owner's live per-statement attribution test (which of the statements the
+    read-only paths still run actually resumes a suspended AUTO_RESUME warehouse) is the
+    recorded follow-up in DECISIONS.md #20; its result belongs next to this docstring.
     """
 
     name: str
@@ -441,14 +450,16 @@ def _cloud_provider_from_region(region_row: object) -> str | None:
     return cloud_provider if cloud_provider in _CLOUD_PROVIDERS else None
 
 
-def _lookup_warehouse_facts(
+def _show_warehouse_row(
     conn: "snowflake.connector.SnowflakeConnection", warehouse: str | None
 ) -> _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None:
     """Best-effort, non-privileged observation of the warehouse the query is pinned to - its
-    size, type, generation and state from its SHOW WAREHOUSES row, plus the account's cloud
-    provider from CURRENT_REGION() - used by explain_estimate() to bind the cap-gate rate to
-    the warehouse that will actually execute instead of to the caller's warehouse_size string
-    (DECISIONS.md #19). Mirrors _lookup_historical_runtime's contract for failures: a lookup
+    size, type, generation, state and auto_resume from its SHOW WAREHOUSES row (no
+    CURRENT_REGION(): `cloud_provider` is None here; _lookup_warehouse_facts adds it when the
+    warehouse-state guard allows). Used by explain_estimate() to bind the cap-gate rate to the
+    warehouse that will actually execute instead of to the caller's warehouse_size string
+    (DECISIONS.md #19), and by both read-only paths to read the state the guard decides on
+    (DECISIONS.md #20). Mirrors _lookup_historical_runtime's contract for failures: a lookup
     that fails - permission, network, malformed response shape, timeout - or that finds no
     warehouse at all (an empty SHOW result, no CURRENT_WAREHOUSE()) returns None, never raises;
     explain_estimate() then degrades to the caller-asserted/Gen1 rate plus an explicit caveat.
@@ -487,6 +498,9 @@ def _lookup_warehouse_facts(
 
     SHOW WAREHOUSES, CURRENT_WAREHOUSE() and CURRENT_REGION() are all ordinary, non-privileged
     SQL - no ACCOUNTADMIN or elevated grant is required (AGENTS.md / DECISIONS.md #7).
+    SHOW WAREHOUSES and SELECT CURRENT_WAREHOUSE() are deliberately NOT gated on the warehouse
+    state (DECISIONS.md #20): the state itself comes from the SHOW row, and without
+    CURRENT_WAREHOUSE() the no-argument paths could not name the warehouse whose state to read.
     """
     if warehouse is None:
         try:
@@ -521,9 +535,6 @@ def _lookup_warehouse_facts(
             )
             columns = [str(column[0]).lower() for column in (cur.description or ())]
             rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
-
-            cur.execute("SELECT CURRENT_REGION()", timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS)
-            region_row = cur.fetchone()
     except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
         return None
 
@@ -544,13 +555,72 @@ def _lookup_warehouse_facts(
     return _WarehouseFacts(
         name=row["name"],
         generation=generation if generation in ("1", "2") else None,
-        cloud_provider=_cloud_provider_from_region(region_row),
+        cloud_provider=None,
         size_key=_size_to_pricing_key(row.get("size")),
         size_text=_text_or_none(row.get("size")),
         warehouse_type=_text_or_none(row.get("type"), upper=True),
         state=_text_or_none(row.get("state"), upper=True),
         auto_resume=_text_or_none(row.get("auto_resume")),
     )
+
+
+def _cloud_provider(conn: "snowflake.connector.SnowflakeConnection") -> str | None:
+    """The account's cloud provider from SELECT CURRENT_REGION() (same 5 s bound as the SHOW).
+    Raises on a connector failure - the caller decides what a failed region read means."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT CURRENT_REGION()", timeout=_GENERATION_LOOKUP_TIMEOUT_SECONDS)
+        return _cloud_provider_from_region(cur.fetchone())
+
+
+# --- read-only warehouse-state guard (DECISIONS.md #20; issue #92) ----------------------------
+#
+# SELECT CURRENT_REGION(), the QUERY_HISTORY table-function SELECT and check_credentials'
+# session-context SELECT can resume a suspended AUTO_RESUME warehouse and bill compute until it
+# auto-suspends. They run only when the pinned warehouse's SHOW WAREHOUSES state is STARTED, or
+# under the operator opt-in / run_query_bounded's allow_warehouse_wake. SHOW WAREHOUSES values:
+# STARTED, SUSPENDED, RESUMING, SUSPENDING, RESIZING - only STARTED passes; an unknown state
+# (no pinned warehouse, no or ambiguous SHOW row, an allowlist-refused name, a NULL state
+# column, a failed lookup) counts as not STARTED. A session with no current warehouse is
+# treated as unknown state rather than as provably free so the rule stays uniform.
+_STARTED_STATE = "STARTED"
+
+
+def _compute_lookups_allowed(state: str | None, allow_resume: bool) -> bool:
+    return allow_resume or state == _STARTED_STATE
+
+
+def _observed_state(
+    facts: _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None,
+) -> str | None:
+    return facts.state if isinstance(facts, _WarehouseFacts) else None
+
+
+def _lookup_warehouse_facts(
+    conn: "snowflake.connector.SnowflakeConnection",
+    warehouse: str | None,
+    *,
+    allow_resume: bool = False,
+) -> _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None:
+    """_show_warehouse_row plus, for a resolved row whose state passes the guard (STARTED, or
+    `allow_resume`), the cloud provider from SELECT CURRENT_REGION(). A CURRENT_REGION()
+    failure still makes the whole lookup None (the pre-#20 contract: explain_estimate then
+    prices at the caller-asserted Gen1 rate with its caveat - fail-closed direction for the
+    guard too, since an unknown state skips the history read). For a non-STARTED row, a NULL
+    state, an unresolved/unsafe name or an empty result the SHOW outcome is returned as is and
+    CURRENT_REGION() is never issued (before #20 it ran, unused, for empty and unresolved
+    results too). `allow_resume` defaults to False so a caller that forgets it gets the guard,
+    not the lookups; existing two-argument callers rely on that default.
+    """
+    facts = _show_warehouse_row(conn, warehouse)
+    if not isinstance(facts, _WarehouseFacts):
+        return facts
+    if not _compute_lookups_allowed(facts.state, allow_resume):
+        return facts
+    try:
+        cloud_provider = _cloud_provider(conn)
+    except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
+        return None
+    return dataclasses.replace(facts, cloud_provider=cloud_provider)
 
 
 _CORTEX_CAVEAT = (
@@ -658,9 +728,10 @@ def _rate_for(
         return rate, size_key, caveats
     caveats.append(
         f"Warehouse generation could not be determined for {facts.name} (SHOW WAREHOUSES "
-        "reported an unrecognised generation, or CURRENT_REGION() an unrecognised cloud "
-        "provider) — assuming Gen1 credit rates; actual cost will be higher than this estimate "
-        "if the warehouse is really Gen2."
+        "reported an unrecognised generation, CURRENT_REGION() an unrecognised cloud provider, "
+        "or CURRENT_REGION() was skipped because the warehouse is not STARTED - see the "
+        "warehouse-state caveat) — assuming Gen1 credit rates; actual cost will be higher than "
+        "this estimate if the warehouse is really Gen2."
     )
     return credits_per_hour(size_key), size_key, caveats
 
@@ -685,13 +756,16 @@ def _runtime_for(
     sql: str,
     bytes_assigned: object,
     size_key: str,
+    *,
+    history_allowed: bool,
 ) -> tuple[float | None, list[str]]:
     """Runtime hours for the dollar figure: a historical run of this exact SQL when there is
-    one, else the byte-tier heuristic - but only from a real, non-negative integer bytesAssigned.
-    A null/non-integer value used to flow into scale_runtime_hours as None and yield the
-    information-free baseline figure DECISIONS.md #5 forbids; it now yields None (no dollar
-    estimate) unless the query-dependent historical signal exists."""
-    historical = _lookup_historical_runtime(conn, sql)
+    one (and the warehouse-state guard allows the QUERY_HISTORY read - `history_allowed`,
+    DECISIONS.md #20), else the byte-tier heuristic - but only from a real, non-negative
+    integer bytesAssigned. A null/non-integer value used to flow into scale_runtime_hours as
+    None and yield the information-free baseline figure DECISIONS.md #5 forbids; it now yields
+    None (no dollar estimate) unless the query-dependent historical signal exists."""
+    historical = _lookup_historical_runtime(conn, sql) if history_allowed else None
     if historical is not None:
         caveat = (
             f"Cost is informed by {historical.sample_count} historical run(s) of this "
@@ -718,12 +792,99 @@ def _runtime_for(
     return None, [caveat]
 
 
+_WAREHOUSE_RESUME_HINT = (
+    "Resume the warehouse (or wait for it to finish resuming) and retry, or set "
+    f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true (exactly that value) to run them "
+    "regardless, accepting that they can resume the warehouse and bill compute until it "
+    "auto-suspends."
+)
+_LOOKUPS_SKIPPED = (
+    "lookups skipped: SELECT CURRENT_REGION() and the QUERY_HISTORY read were not run because "
+    "either could resume it, so the cloud provider is unknown (Gen1 credit rates assumed at the "
+    "observed size) and the runtime is the byte-tier heuristic."
+)
+# The pinned warehouse's state is unknown (no pinned warehouse, no or ambiguous SHOW row, an
+# allowlist-refused name, or the lookup failed): the resume-prone lookups are skipped.
+_WAREHOUSE_STATE_UNKNOWN_CAVEAT = (
+    "The pinned warehouse's state could not be read (no warehouse is pinned to this session, it "
+    "did not resolve to exactly one SHOW WAREHOUSES row, or the lookup failed) - so the "
+    "resume-prone lookups were skipped: the QUERY_HISTORY read was not run, and SELECT "
+    "CURRENT_REGION() runs only for a warehouse observed STARTED, because either could resume a "
+    "suspended warehouse and bill compute (fail closed). Set "
+    f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true (exactly that value) to run them regardless."
+)
+# The owner's literal rule (issue #92): without a warehouse argument the QUERY_HISTORY read is
+# skipped even on a STARTED session warehouse; the session warehouse is still resolved and
+# observed (SHOW, CURRENT_REGION) for DECISIONS.md #19 pricing.
+_NO_WAREHOUSE_ARGUMENT_HISTORY_CAVEAT = (
+    "No warehouse argument was given, so the QUERY_HISTORY read was skipped: it runs only for a "
+    "caller-named warehouse that is STARTED, because it could resume a suspended warehouse and "
+    "bill compute (fail closed); the runtime is the byte-tier heuristic. Pass a warehouse "
+    f"argument, or set {SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true (exactly that value) to "
+    "run it regardless."
+)
+
+
+def _not_started_phrase(facts: _WarehouseFacts) -> str:
+    """'Warehouse W is 'SUSPENDED', not STARTED (auto_resume 'true')' - or, for a row whose
+    state column is NULL, 'Warehouse W reports no state ...'. facts.name passed the allowlist
+    and the exact-match rule, so it is safe raw; state/auto_resume are SHOW text, presented."""
+    auto_resume = f"(auto_resume {_present_observed(facts.auto_resume)})"
+    if facts.state is None:
+        return (
+            f"Warehouse {facts.name} reports no state in its SHOW WAREHOUSES row, so it is not "
+            f"known to be {_STARTED_STATE} {auto_resume}"
+        )
+    return (
+        f"Warehouse {facts.name} is {_present_observed(facts.state)}, not {_STARTED_STATE} "
+        f"{auto_resume}"
+    )
+
+
+def _state_caveat(facts: _WarehouseFacts) -> str:
+    return f"{_not_started_phrase(facts)} - {_LOOKUPS_SKIPPED} {_WAREHOUSE_RESUME_HINT}"
+
+
+def _estimate_guard(
+    facts: _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None,
+    warehouse: str | None,
+    allow_resume: bool,
+) -> tuple[list[str], bool]:
+    """(guard caveats, history_allowed) for explain_estimate. CURRENT_REGION() has already been
+    decided inside _lookup_warehouse_facts on the same state; this records what was skipped."""
+    if allow_resume:
+        return [], True
+    state = _observed_state(facts)
+    if isinstance(facts, _WarehouseFacts) and _compute_lookups_allowed(state, allow_resume=False):
+        if warehouse is not None:
+            return [], True
+        logger.info(
+            "engine=snowflake warehouse_state_guard=enforced path=estimate_query_cost "
+            "state=%s skipped=query_history",
+            _present_observed(state),
+        )
+        return [_NO_WAREHOUSE_ARGUMENT_HISTORY_CAVEAT], False
+    logger.info(
+        "engine=snowflake warehouse_state_guard=enforced path=estimate_query_cost state=%s "
+        "skipped=current_region,query_history",
+        _present_observed(state),
+    )
+    caveat = (
+        _state_caveat(facts)
+        if isinstance(facts, _WarehouseFacts)
+        else _WAREHOUSE_STATE_UNKNOWN_CAVEAT
+    )
+    return [caveat], False
+
+
 @sanitize_exceptions("snowflake")
 def explain_estimate(
     sql: str,
     warehouse: str | None,
     warehouse_size: str = "XSMALL",
     edition: str = "standard",
+    *,
+    allow_warehouse_wake: bool = False,
 ) -> CostEstimate:
     """Estimate Snowflake query cost via EXPLAIN. Always UPPER_BOUND — never PRECISE — since
     Snowflake bills by warehouse-time, not bytes, and EXPLAIN's byte/partition figures are
@@ -735,6 +896,15 @@ def explain_estimate(
     can only raise the estimate. Warehouse types the rate table does not model, and a plan
     without a usable bytesAssigned, yield estimated_cost_usd=None so run_query_bounded fails
     closed on a dollar cap (DECISIONS.md #5, #19).
+
+    Read-only warehouse-state guard (DECISIONS.md #20, issue #92): SELECT CURRENT_REGION() and
+    the QUERY_HISTORY read run only when the pinned warehouse's SHOW WAREHOUSES state is
+    STARTED - the QUERY_HISTORY read additionally only for a caller-named warehouse; otherwise
+    the estimate prices at Gen1 rates at the observed size with the byte-tier heuristic and
+    says so in a caveat. USE WAREHOUSE, EXPLAIN USING JSON, SHOW WAREHOUSES and SELECT
+    CURRENT_WAREHOUSE() always run. `allow_warehouse_wake` (keyword-only, never a tool
+    argument) is run_query_bounded's bypass; COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true is
+    the operator's.
     """
     # Validate every caller-asserted input before connecting: an unknown warehouse name, size
     # or edition is a clear (sanitized) ValueError that never costs a connection or a lookup.
@@ -743,6 +913,13 @@ def explain_estimate(
     credits_per_hour(asserted_size_key)
     usd_per_credit(edition)
     config = load_snowflake_config()
+    env_opt_in = not allow_warehouse_wake and snowflake_warehouse_resume_allowed()
+    if env_opt_in:
+        logger.info(
+            "engine=snowflake warehouse_state_guard=skipped reason=%s=true",
+            SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR,
+        )
+    allow_resume = allow_warehouse_wake or env_opt_in
 
     conn = _connect()
     try:
@@ -762,10 +939,13 @@ def explain_estimate(
         plan = json.loads(row[0])
         bytes_assigned = plan["GlobalStats"]["bytesAssigned"]
 
-        facts = _lookup_warehouse_facts(conn, warehouse)
+        facts = _lookup_warehouse_facts(conn, warehouse, allow_resume=allow_resume)
+        guard_caveats, history_allowed = _estimate_guard(facts, warehouse, allow_resume)
         rate, size_key, rate_caveats = _rate_for(facts, asserted_size_key)
         price, price_caveats = _price_for(config.edition, edition)
-        runtime_hours, runtime_caveats = _runtime_for(conn, sql, bytes_assigned, size_key)
+        runtime_hours, runtime_caveats = _runtime_for(
+            conn, sql, bytes_assigned, size_key, history_allowed=history_allowed
+        )
 
         estimated_cost_usd = (
             None
@@ -779,6 +959,9 @@ def explain_estimate(
             estimated_cost_usd=estimated_cost_usd,
             caveats=[
                 _CORTEX_CAVEAT,
+                # The warehouse-state caveat comes right after the Cortex one: it explains why
+                # the rate/runtime caveats that follow describe a degraded lookup.
+                *guard_caveats,
                 *rate_caveats,
                 # No rate means no dollar figure (fail-closed, DECISIONS.md #5): pricing and
                 # runtime caveats would describe an outcome that is not returned ('Cost
@@ -801,6 +984,8 @@ def explain_estimate(
 # internal retry loop, but no overall wall-clock cap — a query stuck behind slot contention
 # or a suspended/cold warehouse would otherwise block this tool call indefinitely, still
 # burning warehouse-seconds the whole time, which defeats the point of a "bounded" tool.
+# (Resuming a suspended warehouse is the accepted cost of an executed query under caps;
+# execute_bounded is deliberately outside the read-only warehouse-state guard, DECISIONS.md #20.)
 _POLL_INTERVAL_SECONDS = 2
 _MAX_EXECUTION_WAIT_SECONDS = 120
 
@@ -896,8 +1081,92 @@ def execute_bounded(
             pass
 
 
+_LOGIN_ONLY = "Authenticated: login succeeded (session identity not probed)."
+
+
+def _session_context_detail(conn: "snowflake.connector.SnowflakeConnection") -> str:
+    """The pre-#20 ok=True detail: probe the session's effective identity with one
+    context-function SELECT. CURRENT_SECONDARY_ROLES() is reported so the operator can SEE the
+    effective authority of this session (primary role plus active secondary roles), not just
+    the primary role the config asked for - see _connect()."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT CURRENT_ROLE(), CURRENT_SECONDARY_ROLES(), CURRENT_WAREHOUSE(), "
+            "CURRENT_ACCOUNT()"
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise SanitizedEngineError("session context query returned no rows")
+        role, secondary_roles, current_warehouse, account = row
+    # The four identity values are warehouse-returned text (CURRENT_ROLE() etc. echo whatever
+    # the account holds) and this detail reaches the model as structuredContent, so each is
+    # presented - bounded, repr-quoted, one line - instead of interpolated raw inside literal
+    # quotes. PR #86 verification (probe-4 p5a) delivered a detail carrying U+000A, ESC, CR,
+    # U+0085 and U+2028 through this f-string.
+    return (
+        f"Authenticated as role {_present_observed(role)} (secondary roles: "
+        f"{_present_observed(secondary_roles)}) on account {_present_observed(account)}, "
+        f"warehouse {_present_observed(current_warehouse)}."
+    )
+
+
+def _gated_credentials_detail(
+    facts: _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None,
+) -> str:
+    """The ok=True detail when the context SELECT was skipped: built from the SHOW row only.
+    Deliberately no configured role/account/user (config.py's own rule: operator configuration
+    is never echoed back to the MCP client) - the probe that would report the session identity
+    is the gated statement, so the detail says so instead."""
+    if isinstance(facts, _WarehouseFacts):
+        return (
+            f"{_LOGIN_ONLY} {_not_started_phrase(facts)}, so the session-context SELECT was "
+            "skipped: it could resume the warehouse and bill compute. Resume the warehouse (or "
+            "wait for it to finish resuming) and retry, or set "
+            f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true (exactly that value) to run it "
+            "regardless."
+        )
+    return (
+        f"{_LOGIN_ONLY} The pinned warehouse's state could not be read (no warehouse is pinned "
+        "to this session, it did not resolve to exactly one SHOW WAREHOUSES row, or the lookup "
+        "failed), so the session-context SELECT was skipped (fail closed: it could resume a "
+        "suspended warehouse and bill compute). Pass a warehouse argument, or set "
+        f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true (exactly that value) to run it "
+        "regardless."
+    )
+
+
+def _credentials_detail(
+    conn: "snowflake.connector.SnowflakeConnection", warehouse: str | None
+) -> str:
+    """The ok=True detail, after login and USE WAREHOUSE succeeded (DECISIONS.md #20): probe the
+    session identity only when the pinned warehouse is observed STARTED or the operator opted
+    in; otherwise report login plus what the SHOW WAREHOUSES row says."""
+    if snowflake_warehouse_resume_allowed():
+        logger.info(
+            "engine=snowflake warehouse_state_guard=skipped reason=%s=true",
+            SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR,
+        )
+        return _session_context_detail(conn)
+    facts = _show_warehouse_row(conn, warehouse)
+    state = _observed_state(facts)
+    if _compute_lookups_allowed(state, allow_resume=False):
+        return _session_context_detail(conn)
+    # ok=True (login did succeed) and not a WARNING: nothing failed, the guard held.
+    logger.info(
+        "engine=snowflake warehouse_state_guard=enforced path=check_credentials state=%s "
+        "skipped=context_select",
+        _present_observed(state),
+    )
+    return _gated_credentials_detail(facts)
+
+
 def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
-    """Verify Snowflake credentials/connectivity without running EXPLAIN or any real query.
+    """Verify Snowflake credentials/connectivity without running EXPLAIN or any real query:
+    login, USE WAREHOUSE when a warehouse is given, then - only when the pinned warehouse's
+    SHOW WAREHOUSES state is STARTED or COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true - one
+    session-context SELECT (which could resume a suspended AUTO_RESUME warehouse, DECISIONS.md
+    #20). When that statement is skipped the result is still ok=True (login succeeded) with a
+    detail built from the SHOW row.
 
     Deliberately does NOT use @sanitize_exceptions: a failed check is the expected, useful
     result here, not an error condition — this function always returns a
@@ -907,6 +1176,7 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
     redact_secrets -> present_remote_text chain as every other outbound error text (bounded,
     repr()-quoted) and is recorded as one WARNING - also when _connect() already sanitized
     its own failure, where re-presenting the already-safe text just adds a layer of quotes.
+    The STARTED success path stays log-free.
     """
     conn: snowflake.connector.SnowflakeConnection | None = None
     try:
@@ -914,17 +1184,7 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
         with conn.cursor() as cur:
             if warehouse is not None:
                 cur.execute(f"USE WAREHOUSE {_validate_warehouse(warehouse)}")
-            # CURRENT_SECONDARY_ROLES() is reported so the operator can SEE the effective
-            # authority of this session (primary role plus active secondary roles), not just
-            # the primary role the config asked for - see _connect().
-            cur.execute(
-                "SELECT CURRENT_ROLE(), CURRENT_SECONDARY_ROLES(), CURRENT_WAREHOUSE(), "
-                "CURRENT_ACCOUNT()"
-            )
-            row = cur.fetchone()
-            if row is None:
-                raise SanitizedEngineError("session context query returned no rows")
-            role, secondary_roles, current_warehouse, account = row
+        detail = _credentials_detail(conn, warehouse)
     except Exception as exc:  # noqa: BLE001 - reporting failure as data, not raising, by design
         raw_detail = str(exc)
         safe_detail = present_remote_text(redact_secrets(raw_detail), total_chars=len(raw_detail))
@@ -939,17 +1199,4 @@ def check_credentials(warehouse: str | None = None) -> CredentialCheckResult:
             except Exception:  # noqa: BLE001, S110
                 pass
 
-    # The four identity values are warehouse-returned text (CURRENT_ROLE() etc. echo whatever
-    # the account holds) and this detail reaches the model as structuredContent, so each is
-    # presented - bounded, repr-quoted, one line - instead of interpolated raw inside literal
-    # quotes. PR #86 verification (probe-4 p5a) delivered a detail carrying U+000A, ESC, CR,
-    # U+0085 and U+2028 through this f-string. The success path stays log-free.
-    return CredentialCheckResult(
-        engine="snowflake",
-        ok=True,
-        detail=(
-            f"Authenticated as role {_present_observed(role)} (secondary roles: "
-            f"{_present_observed(secondary_roles)}) on account {_present_observed(account)}, "
-            f"warehouse {_present_observed(current_warehouse)}."
-        ),
-    )
+    return CredentialCheckResult(engine="snowflake", ok=True, detail=detail)

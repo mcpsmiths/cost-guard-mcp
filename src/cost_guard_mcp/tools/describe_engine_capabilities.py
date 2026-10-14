@@ -48,7 +48,8 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "lower it. If that lookup fails (e.g. the role cannot run SHOW WAREHOUSES) the "
                 "estimate falls back to the caller-asserted size at Gen1 rates with a caveat; "
                 "if SHOW WAREHOUSES lists rows but none named exactly like the pinned "
-                "warehouse, no dollar figure is produced and a dollar cap refuses."
+                "warehouse, no dollar figure is produced and a dollar cap refuses. The same "
+                "row's state and auto_resume drive the warehouse-state guard (last gap)."
             ),
             (
                 "Only STANDARD warehouses are priced: a Snowpark-optimized (or any other "
@@ -62,7 +63,17 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "session-context SELECT, EXPLAIN, SHOW WAREHOUSES, CURRENT_REGION(), a "
                 "QUERY_HISTORY read) on the named or default warehouse session, which can "
                 "resume a suspended AUTO_RESUME warehouse and bill compute until it suspends "
-                "again."
+                "again. By default SELECT CURRENT_REGION(), the QUERY_HISTORY read and the "
+                "session-context SELECT run only when the pinned warehouse's SHOW WAREHOUSES "
+                "state is STARTED (skipped when no warehouse is pinned or the state cannot be "
+                "read; the QUERY_HISTORY read is also skipped when estimate_query_cost gets no "
+                "warehouse argument): the estimate then prices at Gen1 rates at the observed "
+                "size with the byte-tier heuristic and a caveat, and check_credentials returns "
+                "ok=true with a detail built from the SHOW WAREHOUSES row. USE WAREHOUSE, "
+                "EXPLAIN USING JSON, SHOW WAREHOUSES and SELECT CURRENT_WAREHOUSE() always run. "
+                "COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true (exactly that value) runs the "
+                "gated statements regardless. run_query_bounded is not gated: its estimate and "
+                "execution may resume the warehouse."
             ),
         ],
     ),
