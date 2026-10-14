@@ -8,17 +8,13 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [0.4.0] - 2026-10-14
 
-The 2026-10 security-audit remediation (PR #86, 59 commits, three runtime-verification
-passes). **Breaking:** one SQL statement per call (opt-out
-`COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1`), JSON-safe result rows (bytes as base64, non-finite
-floats as strings), Snowflake sessions pinned to `SNOWFLAKE_ROLE` only (opt-out
-`SNOWFLAKE_SECONDARY_ROLES=ALL`; admin roles rejected), and Snowflake/Databricks estimates
-priced at the observed warehouse, so unmodelled warehouse types and statistics-less Databricks
-plans get no dollar figure and a `max_estimated_cost_usd` cap refuses there. Also:
-provider-side deadlines and bounded retries on every engine, a server-side BigQuery byte cap
-derived from the dollar cap, an in-flight cap (`COST_GUARD_MAX_IN_FLIGHT_QUERIES`),
-labelled/bounded/quoted warehouse text, pinned build inputs, a release gate bound to `main`,
-and the CodeQL token-permission scoping (#79). Full detail:
+The 2026-10 security-audit remediation (PR #86). **Breaking:** one SQL statement per call
+(opt-out `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1`), JSON-safe result rows, Snowflake sessions
+pinned to `SNOWFLAKE_ROLE` only (opt-out `SNOWFLAKE_SECONDARY_ROLES=ALL`; admin roles
+rejected), and Snowflake/Databricks estimates priced at the observed warehouse (no dollar
+figure, so a dollar cap refuses, on unmodelled warehouses and statistics-less Databricks
+plans). Plus provider-side deadlines on every engine, bounded BigQuery/Databricks retries, an
+in-flight cap, release/supply-chain gates and the CodeQL token scoping (#79). Full detail:
 [`changelog/v0.4.0.md`](changelog/v0.4.0.md).
 
 ## [0.3.3] - 2026-10-10
