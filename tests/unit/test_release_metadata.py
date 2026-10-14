@@ -648,3 +648,55 @@ def test_readme_observability_names_the_sdk_stderr_records_this_project_does_not
     assert "rejected arguments" in observability
     assert "key on" in observability
     assert "tool=<name> outcome=" in observability
+
+
+def _readme_section(readme: str, start: str, end: str) -> str:
+    return readme.split(start, 1)[1].split(end, 1)[0]
+
+
+def test_warehouse_state_opt_ins_document_their_scope():
+    # DECISIONS.md #20: wherever an opt-in is offered it must say what the default guard does,
+    # which statements/paths it covers, that run_query_bounded is not gated, and the exact
+    # value - or an operator enables it for the wrong reason or with the wrong spelling.
+    databricks = _env_var_description("COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START")
+    for word in (
+        "RUNNING",
+        "check_credentials",
+        "estimate_query_cost",
+        "run_query_bounded",
+        "true",
+    ):
+        assert word in databricks, word
+    assert "cannot be read" in databricks
+    snowflake = _env_var_description("COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME")
+    for word in ("STARTED", "CURRENT_REGION", "QUERY_HISTORY", "run_query_bounded", "true"):
+        assert word in snowflake, word
+    assert "without a warehouse argument" in snowflake
+    assert "SELECT CURRENT_WAREHOUSE()" in snowflake
+
+    readme = README_PATH.read_text(encoding="utf-8")
+    snowflake_setup = _readme_section(readme, "### Snowflake", "### Databricks")
+    databricks_setup = _readme_section(readme, "### Databricks", "### Concurrency")
+    limitations = readme.split("## Known limitations", 1)[1]
+    assert "`COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true`" in snowflake_setup
+    assert "`COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true`" in databricks_setup
+    for variable in (
+        "COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true",
+        "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true",
+    ):
+        assert variable in limitations, variable
+    assert "exactly" in snowflake_setup and "exactly" in databricks_setup
+    assert "`run_query_bounded` is not gated" in limitations
+    # The Databricks fallback sentence no longer promises the caller-asserted size
+    # unconditionally: by default the read-only tools refuse (R4 / Known limitations).
+    fallback = next(
+        paragraph
+        for paragraph in limitations.split("\n- ")
+        if "keeps the caller-asserted size with a caveat" in paragraph
+    )
+    assert "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true" in fallback
+    assert "refuse" in fallback
+    # The attribution test is the recorded follow-up, not a shipped claim.
+    assert "DECISIONS.md` #20" in limitations or "DECISIONS.md #20" in limitations
+    assert "attribution" in limitations
+    assert "open owner decision" not in limitations

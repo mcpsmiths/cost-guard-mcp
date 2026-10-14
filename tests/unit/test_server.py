@@ -405,7 +405,68 @@ def test_read_only_tool_descriptions_disclose_the_warehouse_compute_side_effect(
     # Databricks they run statements on the configured warehouse, which can resume/start a
     # suspended/stopped warehouse and bill compute. HANDOFF.md required that monetary side
     # effect to be stated in the description itself (hosts treat annotations as hints only).
+    # DECISIONS.md #20: the descriptions also name the default guard and both opt-ins.
     for name in ("check_credentials", "estimate_query_cost"):
         description = _tool_description(name)
         assert "warehouse" in description, name
         assert "compute" in description, name
+        assert "COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true" in description, name
+        assert "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true" in description, name
+        assert "STARTED" in description and "RUNNING" in description, name
+
+
+# The published tool contracts at 69c971d (v0.4.0). DECISIONS.md #20 changes two descriptions
+# and nothing else: the warehouse-wake flag is keyword-only below the tool layer, so every
+# inputSchema property set, its required list and every outputSchema key set are byte-identical.
+_PINNED_INPUT_SCHEMAS = {
+    "check_credentials": ({"engine", "warehouse"}, ["engine"]),
+    "describe_engine_capabilities": ({"engine"}, ["engine"]),
+    "estimate_query_cost": (
+        {"engine", "sql", "warehouse", "warehouse_size", "edition"},
+        ["engine", "sql"],
+    ),
+    "run_query_bounded": (
+        {
+            "engine",
+            "sql",
+            "max_bytes_billed",
+            "max_rows",
+            "max_estimated_cost_usd",
+            "warehouse",
+            "warehouse_size",
+            "edition",
+        },
+        ["engine", "sql"],
+    ),
+}
+_PINNED_OUTPUT_KEYS = {
+    "check_credentials": {"detail", "engine", "ok"},
+    "describe_engine_capabilities": {
+        "default_accuracy_tier",
+        "engine",
+        "known_gaps",
+        "supports_dollar_estimate",
+        "supports_precise_bytes",
+    },
+    "estimate_query_cost": {
+        "accuracy_tier",
+        "caveats",
+        "currency",
+        "engine",
+        "estimated_bytes",
+        "estimated_cost_usd",
+    },
+    "run_query_bounded": {"estimate", "hint", "reason", "row_count", "rows", "status"},
+}
+
+
+def test_tools_list_input_schemas_are_unchanged_by_the_warehouse_state_guard():
+    tools = asyncio.run(mcp.list_tools())
+    assert {tool.name for tool in tools} == set(_PINNED_INPUT_SCHEMAS)
+    for tool in tools:
+        properties, required = _PINNED_INPUT_SCHEMAS[tool.name]
+        assert set(tool.input_schema["properties"]) == properties, tool.name
+        assert tool.input_schema.get("required") == required, tool.name
+        assert "allow_warehouse_wake" not in tool.input_schema["properties"], tool.name
+        assert tool.output_schema is not None, tool.name
+        assert set(tool.output_schema["properties"]) == _PINNED_OUTPUT_KEYS[tool.name], tool.name

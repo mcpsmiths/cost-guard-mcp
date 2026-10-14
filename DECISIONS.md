@@ -562,3 +562,130 @@ the dollar cap to run there) — a breaking change released as 0.4.0. The
 `tools/list` diff). Release gates: `tests/integration/test_snowflake_live.py` pins the
 `SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution; a manual Databricks
 run must confirm `warehouses.get` succeeds with `CAN_USE` on the warehouse.
+
+## 20. Read-only tools do not wake a warehouse: fail closed on a non-running or unreadable state, opt in per engine
+
+**Context:** `check_credentials` and `estimate_query_cost` carry `readOnlyHint: true` but run
+on the pinned/configured warehouse session. Databricks: the Thrift session itself can start a
+STOPPED Classic/Pro SQL warehouse, and after 0.4.0's 60 s connector bound a read-only call
+against a STOPPED warehouse started (and billed) it and then failed with no result (PR #86,
+behaviour change 16; issue #91). Snowflake: `SELECT CURRENT_REGION()`, the
+`INFORMATION_SCHEMA.QUERY_HISTORY` table-function `SELECT` and the session-context `SELECT` can
+resume a suspended `AUTO_RESUME` warehouse (issue #92). 0.4.0 shipped disclosure only (audit
+records `read-only-tools-auto-start-stopped-warehouse-no-spend-bound` and
+`read-only-tools-resume-suspended-warehouse-no-spend-bound`); the guards were left as owner
+decisions, confirmed 2026-10-14 in #91 and #92. The state is already observed for pricing (#19):
+Databricks `_lookup_warehouse` (`GET /api/2.0/sql/warehouses/{id}`, control plane, does not
+start the warehouse) and the Snowflake `SHOW WAREHOUSES` row (`state`, `auto_resume`).
+
+**Decision:**
+- Databricks: `check_credentials` and `estimate_query_cost` open a session only when
+  `_lookup_warehouse` reports `state == RUNNING`. Every other state (`STOPPED`, `STARTING`,
+  `STOPPING`, `DELETING`, `DELETED`) and an unreadable state (lookup failed, non-warehouse
+  `DATABRICKS_HTTP_PATH`, no state field) refuse fail closed: `check_credentials` returns
+  `ok=false` with a detail naming the warehouse id and its presented state (one WARNING record,
+  the detail logged as-is - it is server-authored, bounded and one line); `estimate_query_cost`
+  returns `estimated_bytes=None`, `estimated_cost_usd=None` and exactly one caveat - no
+  `EXPLAIN COST` runs, and no pricing or statistics sentence is attached because none of that
+  happened. `check_credentials` therefore gains one bounded control-plane call (about
+  2 x 60 s worst case with PAT auth; OAuth M2M keeps the databricks-sdk's own OIDC discovery
+  budget on this call as on the session, the residual already documented for `_connect()`).
+  `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true` (exactly) restores the 0.4.0 control flow,
+  including #19's caller-asserted-rate fallback on a failed lookup. This narrows #19's
+  fail-open on the read-only paths for principals without `CAN_VIEW`/`CAN_USE`: they now get a
+  refusal unless they opt in; #19's rationale ("would refuse every cost-capped call for such
+  roles") is untouched because cost-capped calls are `run_query_bounded`, which is not gated.
+- Snowflake: the three statements are gated behind the pinned warehouse's `SHOW WAREHOUSES`
+  `state == STARTED` or `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true` (exactly):
+  `SELECT CURRENT_REGION()`, the `QUERY_HISTORY` read, and `check_credentials`' context `SELECT`.
+  Unknown state - no pinned warehouse (`CURRENT_WAREHOUSE()` NULL), no or ambiguous SHOW row, a
+  name the allowlist refuses, a NULL state column, or a failed lookup - counts as not STARTED;
+  a session with no current warehouse is treated as unknown state (not as provably free) so
+  the rule stays uniform, even though a context-function `SELECT` has nothing to resume there.
+  When gated, the estimate keeps the SHOW row's size/type/generation (so #19's observed-size
+  floor and its fail-closed types still apply) but has no cloud provider, so it prices at the
+  Gen1 rate with the byte-tier heuristic and says so in a caveat naming the warehouse and its
+  presented state (a NULL state column gets its own wording: "reports no state");
+  `check_credentials` returns `ok=true` (login succeeded) with a detail built from the SHOW row
+  only, labelled "session identity not probed". The configured role and account are NOT
+  echoed into that detail: config.py's rule is that operator configuration never travels back
+  to the MCP client, and the SHOW row carries neither value anyway (the owner's recommended
+  "role/account/warehouse/state" detail would have needed exactly the gated statement).
+  `USE WAREHOUSE`, `EXPLAIN USING JSON`, `SHOW WAREHOUSES`, `SELECT CURRENT_WAREHOUSE()` and the
+  `_connect()` session-parameter statements are never gated.
+- **Named deviations from the issue text (owner-visible, listed in the PR body):**
+  1. The no-argument rule is implemented literally as #92 states it - "When `warehouse is
+     None`, skip the QUERY_HISTORY lookup unless opted in" - i.e.
+     `history_allowed = allow_resume or (warehouse is not None and state == STARTED)`. The
+     design draft had read it as "when `CURRENT_WAREHOUSE()` is NULL", under which a
+     no-argument estimate on a STARTED session warehouse would still run the history read. The
+     literal reading is the fail-closed one and costs only history calibration on no-argument
+     calls; the session warehouse is still resolved and observed (SHOW, and CURRENT_REGION on a
+     STARTED row) so #19's observed-warehouse pricing is kept, and the caveat says why history
+     was skipped. Pinned by
+     `test_explain_estimate_skips_history_on_a_started_session_warehouse_without_an_argument`.
+  2. `SELECT CURRENT_WAREHOUSE()` is left ungated. It is not in the owner's three-statement
+     gated set and not in PR #86's six-statement attribution list; it already ran on every
+     no-argument estimate for #19, and without it the no-argument paths cannot name the
+     warehouse whose state to read (it is new on `check_credentials`' no-argument path). It is
+     the same class of statement as the gated `CURRENT_REGION()` (a context-function-only
+     `SELECT`), so the attribution test below measures seven statements, not six. Gating it
+     instead would blind every no-argument path (the rejected alternative).
+- Both opt-ins are read at call time in `config.py` and accept exactly `true`; any other value
+  leaves the guard on silently and the refusal text spells the value. Default off. Not fields
+  on the frozen config dataclasses (the unit suite builds those as `MagicMock`s, whose unknown
+  attributes are truthy). One INFO record per guard decision
+  (`engine=<e> warehouse_state_guard=<refused|enforced> path=<p> state=<presented> [skipped=...]`
+  and `warehouse_state_guard=skipped reason=<VAR>=true` when the env var - not
+  `allow_warehouse_wake` - caused a bypass), mirroring `single_statement_check=`; the success
+  paths stay log-free, and a Databricks `check_credentials` refusal keeps only its WARNING.
+- `run_query_bounded` is untouched: `tools/run_query_bounded.py` takes its estimate with
+  `allow_warehouse_wake=True` (a keyword-only flag threaded through
+  `tools.estimate_query_cost` to both engines' `explain_estimate`, never a tool argument),
+  because the execution that follows wakes the warehouse anyway and starting it is the
+  accepted cost of an executed query under caps. The published tool signatures are unchanged
+  (`tools/list` byte-identical except the two read-only tools' descriptions, pinned by
+  `test_tools_list_input_schemas_are_unchanged_by_the_warehouse_state_guard`). `execute_bounded`
+  has no guard code.
+- Rejected: pricing a known-Gen2 warehouse with an unknown provider at the highest Gen2
+  multiplier instead of Gen1 (would be the safer upper bound but is a pricing change beyond the
+  issue; the gated estimate never feeds a cap) - kept as a candidate follow-up; gating
+  `SELECT CURRENT_WAREHOUSE()` (see deviation 2); echoing the configured role/account in the
+  gated detail (see above); a retry loop around the state read (adds latency to a read-only
+  tool for a sub-second race window).
+
+**Consequences:** On a stopped Databricks warehouse the read-only tools now return promptly with
+no spend instead of starting it; on a suspended Snowflake warehouse the estimate is a Gen1
+heuristic (possibly below the real Gen2 cost by up to 1.35x - acceptable for a read-only
+estimate that never gates a cap) and `check_credentials` proves login but not the session
+identity. Transitional states (`STARTING`, `RESUMING`, `SUSPENDING`, `RESIZING`) refuse; the
+hints say to wait and retry. The state read and the gated statement are not atomic: a
+warehouse that suspends in between is resumed by the statement (accepted; the window is one
+round-trip). Under the Snowflake opt-in the statement list is 0.4.0's for a resolved row; for
+an empty, unresolved or allowlist-refused SHOW result it is one (unused) `CURRENT_REGION()`
+statement shorter, and a `CURRENT_REGION()` failure on a STARTED warehouse still makes the
+whole lookup `None` (0.4.0's contract; the guard then also skips the history read - fail-closed
+direction, pinned). Documented in README (Tools, Setup, Known limitations), `server.json`,
+`.mcp.json.example`, `describe_engine_capabilities`, the two tool descriptions and the CHANGELOG.
+`engines/snowflake.py` grows past the 500-line guideline it already exceeded (955 -> ~1200);
+splitting it is out of scope for this change.
+
+**Recorded follow-up (owner, not part of the PR):** the per-statement attribution tests from
+PR #86, items 2 and 3, on development accounts only. Databricks: a throwaway smallest warehouse,
+stopped; call `check_credentials` once while polling `GET /api/2.0/sql/warehouses/{id}`, repeat
+with `estimate_query_cost`, then (with the opt-in set) once more each; read
+`system.billing.usage` for the windows; expected: no start and no usage row for the guarded
+calls. Snowflake: a throwaway X-Small warehouse W with `AUTO_RESUME`/`AUTO_SUSPEND` and an
+observation warehouse O; re-suspend W before each statement and run, one at a time from a
+session pinned to W: `USE WAREHOUSE W`, `SELECT CURRENT_WAREHOUSE()`, `SHOW WAREHOUSES LIKE 'W'`,
+`EXPLAIN USING JSON SELECT 1`, `SELECT CURRENT_REGION()`, the `QUERY_HISTORY` table-function
+`SELECT`, and the four-function context `SELECT` (seven statements); after each, read
+`SHOW WAREHOUSES` state and `QUERY_HISTORY_BY_WAREHOUSE` from O; then end-to-end
+`estimate_query_cost`/`check_credentials` calls with and without the opt-in, and
+`WAREHOUSE_METERING_HISTORY` an hour later. Record the result here (which of the seven
+statements resumed W), next to the `_WarehouseFacts` docstring in `engines/snowflake.py` and in
+README. If a statement this decision leaves ungated resumes the warehouse, gate it (or, for
+`CURRENT_WAREHOUSE()`, resolve the session warehouse another way); if a gated one is proven
+free, un-gate it - both as a follow-up PR, each changing only the statement set, never the
+fail-closed default. `tests/integration/test_snowflake_live.py` already asserts the `state`
+column is present; a suspended-state shape test needs W.

@@ -205,8 +205,12 @@ def check_credentials(engine: Engine, warehouse: str | None = None) -> Credentia
     debugging via trial queries.
 
     Compute disclosure: on Snowflake and Databricks that statement runs on the named (or
-    default/configured) warehouse session, which can resume a suspended or start a stopped
-    warehouse and bill compute unless it is already running.
+    default/configured) warehouse session, which could resume a suspended or start a stopped
+    warehouse and bill compute. By default the server reads the warehouse's state first and
+    will not run it on a warehouse that is not STARTED (Snowflake: ok=true with a detail built
+    from the SHOW WAREHOUSES row) or not RUNNING (Databricks: ok=false, no session opened);
+    the operator opt-ins are COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true and
+    COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true.
     """
     return _check_credentials_safe(engine, warehouse)
 
@@ -243,9 +247,15 @@ def estimate_query_cost(
     figure.
 
     Compute disclosure: on Snowflake and Databricks the EXPLAIN and the warehouse/history
-    metadata lookups run on the named (or default/configured) warehouse session, which can
-    resume a suspended or start a stopped warehouse and bill compute unless it is already
-    running."""
+    metadata lookups run on the named (or default/configured) warehouse session, which could
+    resume a suspended or start a stopped warehouse and bill compute. By default the server
+    reads the warehouse's state first: on a Snowflake warehouse that is not STARTED the
+    cloud-provider and query-history lookups are skipped and the estimate says so in a caveat
+    (Gen1 rates, heuristic runtime; the query-history lookup is also skipped when no warehouse
+    argument is given); on a Databricks warehouse that is not RUNNING, or whose state cannot be
+    read, no session is opened and the estimate carries no byte or dollar figure. Operator
+    opt-ins: COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true,
+    COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true. run_query_bounded is not gated."""
     return _estimate_query_cost_safe(engine, sql, warehouse, warehouse_size, edition)
 
 
