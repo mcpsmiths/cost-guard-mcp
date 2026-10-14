@@ -583,8 +583,13 @@ start the warehouse) and the Snowflake `SHOW WAREHOUSES` row (`state`, `auto_res
   `_lookup_warehouse` reports `state == RUNNING`. Every other state (`STOPPED`, `STARTING`,
   `STOPPING`, `DELETING`, `DELETED`) and an unreadable state (lookup failed, non-warehouse
   `DATABRICKS_HTTP_PATH`, no state field) refuse fail closed: `check_credentials` returns
-  `ok=false` with a detail naming the warehouse id and its presented state (one WARNING record,
-  the detail logged as-is - it is server-authored, bounded and one line); `estimate_query_cost`
+  `ok=false` with a detail naming the presented warehouse id and state (one WARNING record,
+  the detail logged as-is - it is server-authored, bounded and one line; the id is the last
+  `DATABRICKS_HTTP_PATH` segment - allowlisted to `[A-Za-z0-9]+` but unbounded operator
+  configuration - so it goes through the same redact -> present chain as every other
+  identifier, and a response that carries no state field gets its own hint - retry, or check
+  the workspace UI - because neither "fix the path" nor "grant CAN_VIEW/CAN_USE" applies when
+  the GET succeeded); `estimate_query_cost`
   returns `estimated_bytes=None`, `estimated_cost_usd=None` and exactly one caveat - no
   `EXPLAIN COST` runs, and no pricing or statistics sentence is attached because none of that
   happened. `check_credentials` therefore gains one bounded control-plane call (about
@@ -631,6 +636,14 @@ start the warehouse) and the Snowflake `SHOW WAREHOUSES` row (`state`, `auto_res
      the same class of statement as the gated `CURRENT_REGION()` (a context-function-only
      `SELECT`), so the attribution test below measures seven statements, not six. Gating it
      instead would blind every no-argument path (the rejected alternative).
+- Casing: both guards compare the state text stripped and upper-cased against the running
+  value (`STARTED` / `RUNNING`), so a differently-cased running value passes and any other text
+  refuses. Snowflake normalises once when it reads the SHOW row (`_text_or_none(upper=True)`,
+  pre-#20, so the stored and presented state is already canonical); Databricks normalises in
+  the predicate only and keeps the SDK value as returned for the texts - the SDK's `State` enum
+  is upper-case by construction and its parser turns an unknown or differently-cased wire value
+  into `None` ("reports no state", refused), so the rule only matters for a non-SDK value.
+  Pinned by one lower-case-state test per engine.
 - Both opt-ins are read at call time in `config.py` and accept exactly `true`; any other value
   leaves the guard on silently and the refusal text spells the value. Default off. Not fields
   on the frozen config dataclasses (the unit suite builds those as `MagicMock`s, whose unknown
@@ -663,9 +676,13 @@ hints say to wait and retry. The state read and the gated statement are not atom
 warehouse that suspends in between is resumed by the statement (accepted; the window is one
 round-trip). Under the Snowflake opt-in the statement list is 0.4.0's for a resolved row; for
 an empty, unresolved or allowlist-refused SHOW result it is one (unused) `CURRENT_REGION()`
-statement shorter, and a `CURRENT_REGION()` failure on a STARTED warehouse still makes the
-whole lookup `None` (0.4.0's contract; the guard then also skips the history read - fail-closed
-direction, pinned). Documented in README (Tools, Setup, Known limitations), `server.json`,
+statement shorter, and a `CURRENT_REGION()` failure on a STARTED warehouse still discards the
+whole observation for pricing (0.4.0's contract: caller-asserted size at the Gen1 rate; the
+guard then also skips the history read - fail-closed direction, pinned) - but the caveat and
+the INFO record say what happened (`state='STARTED' current_region=failed
+skipped=query_history`, "SELECT CURRENT_REGION() failed"), not that the state could not be
+read: the SHOW row was read and is carried as `_RegionLookupFailed`. Documented in README
+(Tools, Setup, Known limitations), `server.json`,
 `.mcp.json.example`, `describe_engine_capabilities`, the two tool descriptions and the CHANGELOG.
 `engines/snowflake.py` grows past the 500-line guideline it already exceeded (955 -> ~1200);
 splitting it is out of scope for this change.

@@ -582,16 +582,37 @@ def _cloud_provider(conn: "snowflake.connector.SnowflakeConnection") -> str | No
 # (no pinned warehouse, no or ambiguous SHOW row, an allowlist-refused name, a NULL state
 # column, a failed lookup) counts as not STARTED. A session with no current warehouse is
 # treated as unknown state rather than as provably free so the rule stays uniform.
+# Casing rule (shared with databricks.py, DECISIONS.md #20): the state text is stripped and
+# upper-cased before the compare - here once, in _show_warehouse_row via
+# _text_or_none(upper=True), so _WarehouseFacts.state is already canonical when it reaches the
+# predicate and the texts - so a differently-cased running value passes and any other text
+# refuses. SHOW returns upper-case in practice; the normalisation is defensive.
 _STARTED_STATE = "STARTED"
 
 
 def _compute_lookups_allowed(state: str | None, allow_resume: bool) -> bool:
+    # `state` is the stripped, upper-cased SHOW text (or None): see the casing rule above.
     return allow_resume or state == _STARTED_STATE
 
 
-def _observed_state(
-    facts: _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None,
-) -> str | None:
+@dataclass(frozen=True)
+class _RegionLookupFailed:
+    """The SHOW row resolved and its state passed the guard, but SELECT CURRENT_REGION() then
+    failed. For pricing this is the pre-#20 failed lookup (the whole observation is discarded:
+    caller-asserted size, Gen1 rate, _rate_for's "could not be determined" caveat), and the
+    history read is skipped as it is for every failed lookup; the row is carried so the guard
+    caveat and log record can say what happened - region lookup failed on a STARTED warehouse -
+    instead of claiming the state could not be read."""
+
+    facts: _WarehouseFacts
+
+
+_LookupOutcome = (
+    _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | _RegionLookupFailed | None
+)
+
+
+def _observed_state(facts: _LookupOutcome) -> str | None:
     return facts.state if isinstance(facts, _WarehouseFacts) else None
 
 
@@ -600,16 +621,18 @@ def _lookup_warehouse_facts(
     warehouse: str | None,
     *,
     allow_resume: bool = False,
-) -> _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None:
+) -> _LookupOutcome:
     """_show_warehouse_row plus, for a resolved row whose state passes the guard (STARTED, or
     `allow_resume`), the cloud provider from SELECT CURRENT_REGION(). A CURRENT_REGION()
-    failure still makes the whole lookup None (the pre-#20 contract: explain_estimate then
-    prices at the caller-asserted Gen1 rate with its caveat - fail-closed direction for the
-    guard too, since an unknown state skips the history read). For a non-STARTED row, a NULL
-    state, an unresolved/unsafe name or an empty result the SHOW outcome is returned as is and
-    CURRENT_REGION() is never issued (before #20 it ran, unused, for empty and unresolved
-    results too). `allow_resume` defaults to False so a caller that forgets it gets the guard,
-    not the lookups; existing two-argument callers rely on that default.
+    failure returns _RegionLookupFailed, which prices exactly as the pre-#20 None did
+    (explain_estimate then uses the caller-asserted Gen1 rate with its caveat and, under the
+    guard, skips the history read - a lookup that failed on this session is not followed by
+    another statement) while still carrying the SHOW row for the guard's texts. For a
+    non-STARTED row, a NULL state, an unresolved/unsafe name or an empty result the SHOW
+    outcome is returned as is and CURRENT_REGION() is never issued (before #20 it ran, unused,
+    for empty and unresolved results too). `allow_resume` defaults to False so a caller that
+    forgets it gets the guard, not the lookups; existing two-argument callers rely on that
+    default.
     """
     facts = _show_warehouse_row(conn, warehouse)
     if not isinstance(facts, _WarehouseFacts):
@@ -619,7 +642,7 @@ def _lookup_warehouse_facts(
     try:
         cloud_provider = _cloud_provider(conn)
     except Exception:  # noqa: BLE001 - best-effort, matches _lookup_historical_runtime's own discipline
-        return None
+        return _RegionLookupFailed(facts)
     return dataclasses.replace(facts, cloud_provider=cloud_provider)
 
 
@@ -637,10 +660,7 @@ def _is_valid_byte_count(value: object) -> TypeGuard[int]:
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
-def _rate_for(
-    facts: _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None,
-    asserted_size_key: str,
-) -> tuple[float | None, str, list[str]]:
+def _rate_for(facts: _LookupOutcome, asserted_size_key: str) -> tuple[float | None, str, list[str]]:
     """Pick the credit rate the cap gate prices at: (rate, effective size key, caveats).
 
     The rate is never below the observed warehouse - the caller's warehouse_size may raise the
@@ -649,11 +669,12 @@ def _rate_for(
     was the pinned warehouse (_UnresolvedWarehouse) - there is nothing to price at, so the cap
     gate must not be handed a figure; explain_estimate then returns estimated_cost_usd=None so
     run_query_bounded refuses a dollar cap (DECISIONS.md #5: an unenforceable cap must never
-    look enforced). A failed lookup (facts is None) keeps the caller-asserted/default size at
-    the Gen1 rate with an explicit caveat, so roles that cannot run SHOW WAREHOUSES keep
-    working (DECISIONS.md #19).
+    look enforced). A failed lookup (facts is None, or _RegionLookupFailed: the SHOW row was
+    read but CURRENT_REGION() failed) keeps the caller-asserted/default size at the Gen1 rate
+    with an explicit caveat, so roles that cannot run SHOW WAREHOUSES keep working
+    (DECISIONS.md #19).
     """
-    if facts is None:
+    if facts is None or isinstance(facts, _RegionLookupFailed):
         caveat = (
             "Warehouse generation and size could not be determined (no warehouse specified or "
             "resolvable, or the SHOW WAREHOUSES/cloud-provider lookup failed) — assuming Gen1 "
@@ -845,15 +866,36 @@ def _state_caveat(facts: _WarehouseFacts) -> str:
     return f"{_not_started_phrase(facts)} - {_LOOKUPS_SKIPPED} {_WAREHOUSE_RESUME_HINT}"
 
 
+def _region_failed_caveat(facts: _WarehouseFacts) -> str:
+    """The state WAS read (STARTED) and CURRENT_REGION() was issued - and failed. Says so,
+    rather than that the state could not be read; the pricing it describes is the pre-#20
+    failed-lookup contract (_rate_for's caller-asserted Gen1 caveat follows this one)."""
+    return (
+        f"Warehouse {facts.name} is {_present_observed(facts.state)} (auto_resume "
+        f"{_present_observed(facts.auto_resume)}), but SELECT CURRENT_REGION() failed, so the "
+        "warehouse observation was discarded as a whole (Gen1 credit rates at the "
+        "caller-asserted size, as before the guard) and the QUERY_HISTORY read was not run "
+        "(fail closed: a lookup that failed on this session is not followed by another "
+        "statement); the runtime is the byte-tier heuristic. Retry, or set "
+        f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true (exactly that value) to run the "
+        "QUERY_HISTORY read regardless."
+    )
+
+
 def _estimate_guard(
-    facts: _WarehouseFacts | _UnresolvedWarehouse | _UnsafeWarehouseName | None,
-    warehouse: str | None,
-    allow_resume: bool,
+    facts: _LookupOutcome, warehouse: str | None, allow_resume: bool
 ) -> tuple[list[str], bool]:
     """(guard caveats, history_allowed) for explain_estimate. CURRENT_REGION() has already been
     decided inside _lookup_warehouse_facts on the same state; this records what was skipped."""
     if allow_resume:
         return [], True
+    if isinstance(facts, _RegionLookupFailed):
+        logger.info(
+            "engine=snowflake warehouse_state_guard=enforced path=estimate_query_cost state=%s "
+            "current_region=failed skipped=query_history",
+            _present_observed(facts.facts.state),
+        )
+        return [_region_failed_caveat(facts.facts)], False
     state = _observed_state(facts)
     if isinstance(facts, _WarehouseFacts) and _compute_lookups_allowed(state, allow_resume=False):
         if warehouse is not None:

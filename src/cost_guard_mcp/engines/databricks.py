@@ -346,6 +346,12 @@ _UNOBSERVED_WAREHOUSE_CAVEAT = (
 # RUNNING": fail closed, the owner's decision in #91. This narrows #19's fail-open on the
 # read-only paths for principals without CAN_VIEW/CAN_USE; #19's fallback survives for
 # run_query_bounded (allow_warehouse_wake=True) and under the opt-in.
+# Casing rule (shared with snowflake.py, DECISIONS.md #20): the state text is stripped and
+# upper-cased before the compare, so a differently-cased running value passes and any other
+# text refuses. The SDK enum is upper-case by construction - its parser turns an unknown or
+# differently-cased wire value into None, i.e. "reports no state" - so the normalisation only
+# matters for a non-SDK value; _WarehouseFacts.state keeps the value as returned, which is
+# what the refusal texts present.
 _RUNNING_STATE = "RUNNING"
 
 _WAREHOUSE_START_HINT = (
@@ -359,15 +365,24 @@ _WAREHOUSE_UNREADABLE_HINT = (
     f"{DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true (exactly that value) to open the session "
     "regardless (which starts a stopped warehouse and bills compute)."
 )
+# The GET succeeded (so the path and the grant are fine) but the response carried no state
+# field: neither remedy above applies, so this sub-case gets its own hint.
+_WAREHOUSE_NO_STATE_HINT = (
+    "The Warehouses API answered without a state field: retry, or check the warehouse in the "
+    f"workspace UI; or set {DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true (exactly that value) "
+    "to open the session regardless (which starts a stopped warehouse and bills compute)."
+)
 _NO_EXPLAIN_RAN = (
     "No EXPLAIN COST was run: the byte and dollar estimates are unavailable, not zero."
 )
 
 
 def _present_observed(value: object) -> str:
-    """An API-returned value on its way into a detail or a caveat: present_remote_text over its
-    text (bounded, repr-quoted, one line - DECISIONS.md #18), the bare word None for a missing
-    value so it does not read as the text 'None'. Same helper as snowflake._present_observed."""
+    """A value that did not originate in this process - API-returned text, or an operator-
+    configured identifier such as the warehouse id - on its way into a detail or a caveat:
+    present_remote_text over its text (bounded, repr-quoted, one line - DECISIONS.md #18), the
+    bare word None for a missing value so it does not read as the text 'None'. Same helper as
+    snowflake._present_observed."""
     if value is None:
         return "None"
     text = str(value)
@@ -375,30 +390,39 @@ def _present_observed(value: object) -> str:
 
 
 def _warehouse_is_running(facts: _WarehouseFacts | None) -> bool:
-    return facts is not None and facts.state == _RUNNING_STATE
-
-
-def _not_running_sentence(warehouse_id: str, facts: _WarehouseFacts) -> str:
-    # warehouse_id passed _WAREHOUSE_ID_RE (the lookup succeeded), so it is safe raw; the state
-    # is API-returned text and is presented. Never the hostname, http_path or an env value.
     return (
-        f"The configured SQL warehouse {warehouse_id} is {_present_observed(facts.state)}, not "
-        f"{_RUNNING_STATE}, so no session was opened: opening one would start the warehouse "
-        "and bill compute (fail closed)."
+        facts is not None
+        and facts.state is not None
+        and facts.state.strip().upper() == _RUNNING_STATE
     )
 
 
-def _state_unreadable_sentence(warehouse_id: str | None, facts: _WarehouseFacts | None) -> str:
-    if facts is None or warehouse_id is None:
+def _not_running_sentence(warehouse_id: str, facts: _WarehouseFacts) -> str:
+    # warehouse_id passed _WAREHOUSE_ID_RE (the lookup succeeded), but it is operator
+    # configuration (the last DATABRICKS_HTTP_PATH segment) on its way to the MCP client and the
+    # allowlist has no length bound, so it is presented like every other identifier - bounded,
+    # repr-quoted; the state is API-returned text and is presented too. Never the hostname,
+    # the http_path or an env value.
+    return (
+        f"The configured SQL warehouse {_present_observed(warehouse_id)} is "
+        f"{_present_observed(facts.state)}, not {_RUNNING_STATE}, so no session was opened: "
+        "opening one would start the warehouse and bill compute (fail closed)."
+    )
+
+
+def _state_unreadable_sentence(warehouse_id: str | None) -> str:
+    """None: the lookup itself failed (no facts, so no id to name - the existing diagnostic
+    sentence leads); otherwise the GET succeeded but the response carried no state field."""
+    if warehouse_id is None:
         return (
             f"{_UNOBSERVED_WAREHOUSE_CAVEAT} Its state is therefore unknown and no session was "
             "opened (fail closed: a session on a non-RUNNING warehouse would start it and bill "
             "compute)."
         )
     return (
-        f"The configured SQL warehouse {warehouse_id} reports no state through the Warehouses "
-        "API, so its state is unknown and no session was opened (fail closed: a session on a "
-        "non-RUNNING warehouse would start it and bill compute)."
+        f"The configured SQL warehouse {_present_observed(warehouse_id)} reports no state "
+        "through the Warehouses API, so its state is unknown and no session was opened (fail "
+        "closed: a session on a non-RUNNING warehouse would start it and bill compute)."
     )
 
 
@@ -407,11 +431,11 @@ def _guard_core_and_hint(
 ) -> tuple[str, str]:
     """The (core sentence, remedy hint) pair for a refused read-only call."""
     if facts is None:
-        return _state_unreadable_sentence(None, None), _WAREHOUSE_UNREADABLE_HINT
+        return _state_unreadable_sentence(None), _WAREHOUSE_UNREADABLE_HINT
     # Cannot raise: facts is not None means _warehouse_id already accepted this path.
     warehouse_id = _warehouse_id(config.http_path)
     if facts.state is None:
-        return _state_unreadable_sentence(warehouse_id, facts), _WAREHOUSE_UNREADABLE_HINT
+        return _state_unreadable_sentence(warehouse_id), _WAREHOUSE_NO_STATE_HINT
     return _not_running_sentence(warehouse_id, facts), _WAREHOUSE_START_HINT
 
 

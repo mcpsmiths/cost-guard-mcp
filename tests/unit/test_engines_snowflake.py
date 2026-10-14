@@ -26,6 +26,7 @@ from cost_guard_mcp.engines.snowflake import (
     _lookup_warehouse_facts,
     _normalize_sql_for_matching,
     _rate_for,
+    _RegionLookupFailed,
     _show_warehouse_row,
     _size_to_pricing_key,
     _UnresolvedWarehouse,
@@ -2625,15 +2626,82 @@ def test_lookup_warehouse_facts_with_resume_allowed_skips_current_region_for_an_
     assert cursor.executed == ["SHOW WAREHOUSES LIKE 'COMPUTE_WH'"]
 
 
-def test_lookup_warehouse_facts_still_returns_none_when_current_region_fails_on_a_started_warehouse(
+def test_lookup_warehouse_facts_reports_a_failed_region_lookup_on_a_started_warehouse(
     snowflake_fakes,
 ):
-    # R5: today's contract pinned - a CURRENT_REGION() failure makes the whole lookup None.
-    cursor = snowflake_fakes.cursor(
-        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small")], fail_on=("CURRENT_REGION",)
+    # R5 / review finding 1: a CURRENT_REGION() failure still discards the observation for
+    # pricing (0.4.0's contract, pinned below through _rate_for), but the SHOW row WAS read -
+    # the result carries it so the guard can say "STARTED, region lookup failed" instead of
+    # "state could not be read".
+    row = snowflake_fakes.show_row("COMPUTE_WH", "4X-Large")
+    cursor = snowflake_fakes.cursor(show_rows=[row], fail_on=("CURRENT_REGION",))
+
+    result = _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH")
+
+    assert isinstance(result, _RegionLookupFailed)
+    assert result.facts.name == "COMPUTE_WH" and result.facts.state == "STARTED"
+    assert result.facts.cloud_provider is None
+
+
+def test_rate_for_prices_a_failed_region_lookup_at_the_caller_asserted_size():
+    # The 0.4.0 pricing contract for a failed CURRENT_REGION(): the whole observation is
+    # discarded - caller-asserted size, Gen1 rate, the "could not be determined" caveat - even
+    # though the SHOW row (here a 4X-Large) was read.
+    rate, size_key, caveats = _rate_for(_RegionLookupFailed(_facts(size_key="X4LARGE")), "XSMALL")
+
+    assert rate == credits_per_hour("XSMALL") and size_key == "XSMALL"
+    (caveat,) = caveats
+    assert "could not be determined" in caveat and "cloud-provider lookup failed" in caveat
+
+
+def test_explain_estimate_names_the_failed_region_lookup_on_a_started_warehouse(
+    snowflake_fakes, caplog
+):
+    # Review finding 1: on a STARTED row whose SELECT CURRENT_REGION() fails the record used to
+    # say "state=None skipped=current_region,query_history" and the caveat that the state could
+    # not be read - but the state was read; the region lookup is what failed. The pricing
+    # contract is unchanged: caller-asserted XSMALL at Gen1 (not the 4X-Large row), history
+    # skipped.
+    caplog.set_level(logging.INFO, logger=_GUARD_LOGGER)
+
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "4X-Large")],
+        fail_on=("CURRENT_REGION",),
+        history_rows=_HISTORY_MATCH,
     )
 
-    assert _lookup_warehouse_facts(snowflake_fakes.connection(cursor), "COMPUTE_WH") is None
+    assert _no(cursor, "QUERY_HISTORY")
+    assert estimate.estimated_cost_usd == _GEN1_HEURISTIC_COST
+    (caveat,) = _state_caveats(estimate)
+    assert caveat.startswith("Warehouse COMPUTE_WH is 'STARTED'")
+    assert "SELECT CURRENT_REGION() failed" in caveat
+    assert "QUERY_HISTORY read was not run" in caveat
+    assert f"{SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR}=true" in caveat
+    assert "could not be read" not in caveat
+    assert any("could not be determined" in c for c in estimate.caveats)
+    records = [r for r in caplog.records if r.name == _GUARD_LOGGER]
+    assert len(records) == 1 and records[0].levelname == "INFO"
+    assert "warehouse_state_guard=enforced" in records[0].message
+    assert "state='STARTED'" in records[0].message
+    assert "current_region=failed" in records[0].message
+    assert "skipped=query_history" in records[0].message
+    assert "state=None" not in records[0].message
+    assert "skipped=current_region" not in records[0].message
+
+
+def test_explain_estimate_treats_a_lower_case_started_state_as_started(snowflake_fakes):
+    # DECISIONS.md #20 casing rule: the SHOW text is stripped and upper-cased before the
+    # compare, so a differently-cased running value passes (Databricks pins the same rule).
+    estimate, cursor = _estimate_with(
+        snowflake_fakes,
+        show_rows=[snowflake_fakes.show_row("COMPUTE_WH", "X-Small", state=" started ")],
+        history_rows=_HISTORY_MATCH,
+    )
+
+    assert not _no(cursor, "CURRENT_REGION") and not _no(cursor, "QUERY_HISTORY")
+    assert _state_caveats(estimate) == []
+    assert any("informed by 1 historical run" in c for c in estimate.caveats)
 
 
 @pytest.mark.parametrize("state", _NOT_STARTED_STATES)

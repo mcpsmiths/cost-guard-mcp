@@ -14,7 +14,9 @@ from cost_guard_mcp.engines.databricks import (
     _UNOBSERVED_WAREHOUSE_CAVEAT,
     _connect,
     _lookup_warehouse,
+    _not_running_sentence,
     _rate_for,
+    _state_unreadable_sentence,
     _warehouse_id,
     _warehouse_is_running,
     _WarehouseFacts,
@@ -1260,8 +1262,15 @@ def test_check_credentials_fails_closed_when_the_state_field_is_missing(
     result = check_credentials()
 
     assert result.ok is False
-    assert "abc123" in result.detail
+    assert "'abc123'" in result.detail
     assert "reports no state" in result.detail
+    # Review finding 3: the GET succeeded, so neither "fix DATABRICKS_HTTP_PATH" nor "grant
+    # CAN_VIEW/CAN_USE" applies - this sub-case gets its own hint.
+    assert "answered without a state field" in result.detail
+    assert "retry" in result.detail and "workspace UI" in result.detail
+    assert "Fix DATABRICKS_HTTP_PATH" not in result.detail
+    assert "CAN_VIEW/CAN_USE" not in result.detail
+    assert f"{DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR}=true" in result.detail
     mock_connect.assert_not_called()
 
 
@@ -1384,6 +1393,87 @@ def test_check_credentials_refusal_detail_never_names_the_host_or_path(
     assert _FAKE_PAT not in result.detail
 
 
+@pytest.mark.parametrize("total_chars", [300, 1_200])
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_refusal_presents_the_warehouse_id_bounded_and_quoted(
+    mock_connect, databricks_env, total_chars
+):
+    # Review finding 2: the warehouse id is the last DATABRICKS_HTTP_PATH segment - operator
+    # configuration on its way to the MCP client. _WAREHOUSE_ID_RE admits only [A-Za-z0-9] but
+    # has no length bound, so the id goes through the same redact -> present chain as every
+    # other identifier (bounded at 1,000 characters, repr-quoted) instead of raw.
+    long_id = "a" * total_chars
+    databricks_env.load_config.return_value = _pat_config(
+        http_path=f"/sql/1.0/warehouses/{long_id}"
+    )
+    get = _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+
+    result = check_credentials()
+
+    assert result.ok is False
+    assert present_remote_text(long_id) in result.detail
+    if total_chars > 1_000:
+        assert f"' ... [truncated; {total_chars} chars total]" in result.detail
+        assert long_id[:1_001] not in result.detail
+    else:
+        assert f"'{long_id}'" in result.detail
+    get.assert_called_once_with(long_id)
+    mock_connect.assert_not_called()
+
+
+@pytest.mark.parametrize("total_chars", [300, 1_200])
+def test_guard_sentences_present_a_hostile_warehouse_id_on_one_line(total_chars):
+    # The regex never admits a control character, so this pins the helpers themselves: were a
+    # future allowlist to widen, the id would still arrive bounded, quoted and escaped.
+    hostile = _hostile_text(total_chars)
+    facts = _WarehouseFacts(state="STOPPED", cluster_size="X-Small", is_serverless=True)
+
+    for sentence in (_not_running_sentence(hostile, facts), _state_unreadable_sentence(hostile)):
+        assert len(sentence.splitlines()) == 1
+        assert "\x1b" not in sentence and "\r" not in sentence
+        assert present_remote_text(hostile) in sentence
+        if total_chars > 1_000:
+            assert f"' ... [truncated; {total_chars} chars total]" in sentence
+            assert hostile[:1_001] not in sentence
+
+
+def test_state_unreadable_sentence_without_an_id_embeds_the_unobserved_caveat_once():
+    # Review finding 4: the helper takes only the (optional) id - None means the lookup itself
+    # failed, so there is no id to name and the existing diagnostic sentence leads.
+    sentence = _state_unreadable_sentence(None)
+
+    assert sentence.startswith(_UNOBSERVED_WAREHOUSE_CAVEAT)
+    assert sentence.count("could not be observed") == 1
+    assert "fail closed" in sentence
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_check_credentials_opens_a_session_on_a_lower_case_running_state(
+    mock_connect, databricks_env
+):
+    # DECISIONS.md #20 casing rule: the state text is stripped and upper-cased before the
+    # compare on both engines (Snowflake pins the same rule). The SDK's State enum is
+    # upper-case by construction, so this only matters for a non-SDK value; the stored
+    # facts.state stays as returned, which is what the refusal texts present.
+    _stub_warehouse(
+        databricks_env,
+        MagicMock(
+            state=MagicMock(value=" running "),
+            cluster_size="X-Small",
+            enable_serverless_compute=True,
+        ),
+    )
+    _ok_connection(mock_connect)
+
+    result = check_credentials()
+
+    assert result.ok is True
+    mock_connect.assert_called_once_with()
+    facts = _lookup_warehouse(databricks_env.load_config.return_value)
+    assert facts is not None and facts.state == " running "
+    assert _warehouse_is_running(facts) is True
+
+
 @patch("cost_guard_mcp.engines.databricks.sql.connect")
 @patch("cost_guard_mcp.engines.databricks._connect")
 def test_explain_estimate_returns_no_figures_without_connecting_when_the_warehouse_is_stopped(
@@ -1451,7 +1541,11 @@ def test_explain_estimate_fails_closed_when_the_state_field_is_missing(
 
     mock_connect.assert_not_called()
     assert len(estimate.caveats) == 1
+    assert "'abc123'" in estimate.caveats[0]
     assert "reports no state" in estimate.caveats[0]
+    assert "answered without a state field" in estimate.caveats[0]
+    assert "Fix DATABRICKS_HTTP_PATH" not in estimate.caveats[0]
+    assert "CAN_VIEW/CAN_USE" not in estimate.caveats[0]
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
@@ -1562,6 +1656,26 @@ def test_explain_estimate_guard_caveat_presents_the_state_bounded_and_quoted(
         assert f"' ... [truncated; {total_chars} chars total]" in caveat
     else:
         assert f"{hostile!r}," in caveat
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_explain_estimate_guard_caveat_presents_the_warehouse_id_bounded_and_quoted(
+    mock_connect, databricks_env
+):
+    # Review finding 2, estimate path: same presentation as the check_credentials refusal.
+    long_id = "b" * 1_200
+    databricks_env.load_config.return_value = _pat_config(
+        http_path=f"/sql/1.0/warehouses/{long_id}"
+    )
+    _stub_warehouse(databricks_env, _warehouse_response(state=State.STOPPED))
+
+    estimate = _explain_with(mock_connect)
+
+    mock_connect.assert_not_called()
+    (caveat,) = estimate.caveats
+    assert present_remote_text(long_id) in caveat
+    assert "' ... [truncated; 1200 chars total]" in caveat
+    assert long_id[:1_001] not in caveat
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
