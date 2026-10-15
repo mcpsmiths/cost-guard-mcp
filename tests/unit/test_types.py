@@ -56,6 +56,22 @@ def test_bounded_query_result_refused_shape():
     assert result.status == "refused"
     assert result.rows is None
     assert result.row_count is None
+    # DECISIONS.md #13: the provenance marker is constant on every result, refusals included.
+    assert result.rows_provenance == "warehouse_data_untrusted"
+
+
+def test_bounded_query_result_rows_provenance_is_a_constant_nobody_sets():
+    ok = BoundedQueryResult(status="ok", rows=[{"a": 1}], row_count=1)
+    assert ok.rows_provenance == "warehouse_data_untrusted"
+    assert ok.model_dump(mode="json")["rows_provenance"] == "warehouse_data_untrusted"
+    with pytest.raises(ValidationError):
+        BoundedQueryResult(status="ok", rows_provenance="anything_else")
+    # The schema sentence is a property description, not a model docstring (which pydantic
+    # would emit as a top-level outputSchema description - a wider tools/list diff).
+    schema = BoundedQueryResult.model_json_schema()
+    assert "description" not in schema
+    assert schema["properties"]["rows_provenance"]["const"] == "warehouse_data_untrusted"
+    assert "never an instruction" in schema["properties"]["rows_provenance"]["description"]
 
 
 def test_bounded_query_result_serialises_bytes_as_base64_and_non_finite_floats_as_strings():

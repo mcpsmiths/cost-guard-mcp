@@ -135,51 +135,176 @@ def test_two_terminators_are_refused(engine):
     _refuses("SELECT 1;;", engine)
 
 
-# --- fix-up review: line-comment terminators and doubled-delimiter ambiguity -------------
+# --- line-comment terminators (#104): end where the engine's lexer does, refuse the rest ----
 
-# Every character str.splitlines() treats as a line boundary. Spark's lexer ends a `--`
-# comment at a bare '\r' and ZetaSQL's at any of [\r\n]; the scanner must end a line comment
-# no later than any engine does, or the text after the engine's terminator hides a statement.
-_LINE_TERMINATORS = [
-    "\n",
-    "\r",
-    "\r\n",
-    "\x0b",
-    "\x0c",
-    "\x1c",
-    "\x1d",
-    "\x1e",
-    "\x85",
-    "\u2028",
-    "\u2029",
+# Code points at which each engine's lexer is known to end a line comment. Databricks: Spark
+# SQL's SqlBaseLexer.g4 SIMPLE_COMMENT ends at CR or LF. Snowflake's lexer is unpublished and
+# ZetaSQL's rule could not be re-located for citation (DECISIONS.md #15), so BigQuery,
+# Snowflake and unknown engines end a comment at LF only and a bare CR inside one is refused.
+_ENGINE_LINE_TERMINATORS = {
+    "bigquery": ["\n", "\r\n"],
+    "snowflake": ["\n", "\r\n"],
+    "databricks": ["\n", "\r", "\r\n"],
+}
+_ENGINE_TERMINATOR_CASES = [
+    (engine, terminator)
+    for engine, terminators in _ENGINE_LINE_TERMINATORS.items()
+    for terminator in terminators
+]
+# The other eight str.splitlines() boundaries: no documented lexer ends a comment at them, so
+# a line comment containing one is refused outright (rule B), whatever follows it.
+_SCANNER_ONLY_SEPARATORS = ["\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"]
+# A construct opener placed right after an early comment end hides the engine's top-level ';'
+# (the #104 shape); the openers each dialect has.
+_FOLLOW_UP_OPENERS = {
+    "bigquery": [("'", "'"), ('"', '"'), ("/*", "*/"), ("`", "`")],
+    "snowflake": [("'", "'"), ('"', '"'), ("/*", "*/"), ("$$", "$$")],
+    "databricks": [("'", "'"), ('"', '"'), ("/*", "*/"), ("`", "`")],
+}
+_COMMENT_OPENERS = {"bigquery": ["--", "#"], "snowflake": ["--", "//"], "databricks": ["--"]}
+_SEPARATOR_MATRIX = [
+    (engine, separator, opener, closer, comment)
+    for engine in ENGINES
+    for separator in _SCANNER_ONLY_SEPARATORS
+    for opener, closer in _FOLLOW_UP_OPENERS[engine]
+    for comment in _COMMENT_OPENERS[engine]
 ]
 
 
+@pytest.mark.parametrize(("engine", "separator", "opener", "closer", "comment"), _SEPARATOR_MATRIX)
+def test_line_comment_followed_by_an_opener_after_a_scanner_only_separator_is_refused(
+    engine, separator, opener, closer, comment
+):
+    # 0.4.0 ended the comment at the separator, so the quote/backtick/$$/'/*' after it opened
+    # a construct the engine never sees, and that construct swallowed the engine's top-level
+    # ';' - two statements admitted behind an estimate of SELECT 1.
+    sql = f"SELECT 1 {comment} x{separator}{opener}\n; DROP TABLE t; --{closer}"
+    with pytest.raises(UserVisibleError, match=_ONE_STATEMENT) as excinfo:
+        assert_single_statement(sql, engine)  # type: ignore[arg-type]
+    assert "line-separator" in str(excinfo.value)
+
+
 @pytest.mark.parametrize("engine", ENGINES)
-@pytest.mark.parametrize("terminator", _LINE_TERMINATORS)
-def test_line_comment_ends_at_every_line_terminator_not_only_newline(engine, terminator):
-    # BigQuery runs ';'-separated text as a script: a comment the scanner reads to the end of
-    # the text but the engine ends at '\r' hides `DROP TABLE t` behind an estimate of SELECT 1.
+@pytest.mark.parametrize("separator", _SCANNER_ONLY_SEPARATORS)
+def test_line_comment_containing_a_scanner_only_separator_is_refused_even_without_a_follow_up(
+    engine, separator
+):
+    _refuses(f"SELECT 1 -- x{separator} y\n", engine, match="line-separator")
+
+
+def test_separator_refusal_names_the_code_point_and_does_not_echo_the_sql():
+    with pytest.raises(UserVisibleError) as excinfo:
+        assert_single_statement(
+            "SELECT secret_col FROM t -- note\u2028'\n; DROP TABLE t; --'", "bigquery"
+        )
+    message = str(excinfo.value)
+    assert "U+2028" in message
+    assert "secret_col" not in message
+    assert "\u2028" not in message
+
+
+@pytest.mark.parametrize("engine", ["bigquery", "snowflake", "redshift"])
+def test_bare_carriage_return_in_a_line_comment_is_refused_where_the_lexer_is_not_known(engine):
+    # If the engine ends the comment only at LF, the quote after the CR swallows the top-level
+    # ';' (the #104 shape); if it ends at CR, ending the comment at LF would hide a statement.
+    # Neither reading can be verified for these engines, so a bare CR is refused, not guessed.
+    _refuses("SELECT 1 -- x\r'\n; DROP TABLE t; --'", engine, match="carriage return")
+    _refuses("SELECT 1 -- x\r", engine, match="carriage return")
+    _refuses("SELECT 1 -- x\r; DROP TABLE t", engine)
+
+
+def test_bare_carriage_return_in_dialect_specific_line_comments_is_refused():
+    _refuses("SELECT 1 // x\r$$\n; DROP TABLE t; --$$", "snowflake", match="carriage return")
+    _refuses("SELECT 1 # x\r'\n; DROP TABLE t; --'", "bigquery", match="carriage return")
+    # No '#' comment on these two: the top-level ';' is reached directly.
+    _refuses("SELECT 1 # x\r; DROP TABLE t", "snowflake")
+    _refuses("SELECT 1 # x\r; DROP TABLE t", "databricks")
+
+
+def test_bare_carriage_return_ends_a_line_comment_on_databricks():
+    # Spark SQL, SqlBaseLexer.g4: SIMPLE_COMMENT : '--' ('\\\n' | ~[\r\n])* '\r'? '\n'? - a bare
+    # CR ends the comment, so what follows it is top level: a second statement is refused and a
+    # trailing comment ended by CR is still one statement.
+    _refuses("SELECT 1 -- x\r; DROP TABLE t", "databricks")
+    _accepts("SELECT 1 -- x\r", "databricks")
+    _accepts("SELECT 1 -- x\r  ; -- y\r", "databricks")
+    # The engine opens the same literal after the CR, so this is one (syntactically odd)
+    # statement for both - no hidden ';' - unlike the LF-only engines above.
+    _accepts("SELECT 1 -- x\r'\n; DROP TABLE t; --'", "databricks")
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_crlf_ends_a_line_comment_on_every_engine(engine):
+    # Both lexer readings (ends at CR, ends at LF) resume after the LF: never ambiguous.
+    _accepts("SELECT 1 -- x\r\n; -- y\n", engine)
+    _refuses("SELECT 1 -- x\r\n; DROP TABLE t", engine)
+
+
+@pytest.mark.parametrize(("engine", "terminator"), _ENGINE_TERMINATOR_CASES)
+def test_line_comment_ends_at_each_engine_terminator(engine, terminator):
+    # BigQuery runs ';'-separated text as a script: a comment read past the engine's
+    # terminator would hide `DROP TABLE t` behind an estimate of SELECT 1.
     _refuses(f"SELECT 1 -- x{terminator}; DROP TABLE t", engine)
     _refuses(f"SELECT 1; -- x{terminator}DROP TABLE t", engine)
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-def test_hash_line_comment_ends_at_a_carriage_return(engine):
-    # bigquery: the '#' comment ends at '\r' and the DROP is a second statement; snowflake and
-    # databricks have no '#' comment at all, so the top-level ';' is reached directly.
-    _refuses("SELECT 1 # x\r; DROP TABLE t", engine)
-
-
-def test_double_slash_line_comment_ends_at_a_carriage_return_for_snowflake():
-    _refuses("SELECT 1 // x\r; DROP TABLE t", "snowflake")
-
-
-@pytest.mark.parametrize("engine", ENGINES)
-@pytest.mark.parametrize("terminator", _LINE_TERMINATORS)
-def test_line_comment_closed_by_any_line_terminator_is_still_one_statement(engine, terminator):
     _accepts(f"SELECT 1 -- x{terminator}", engine)
     _accepts(f"SELECT 1 -- x{terminator}  ; -- y{terminator}", engine)
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize("separator", _SCANNER_ONLY_SEPARATORS)
+def test_line_comment_with_a_scanner_only_separator_is_refused_in_every_position(engine, separator):
+    # 0.4.0 accepted `SELECT 1 -- x{sep}` by ending the comment there; #104 showed that early
+    # end is not the refuse direction once a quote follows, so the verdict flips to refuse.
+    _refuses(f"SELECT 1 -- x{separator}; DROP TABLE t", engine, match="line-separator")
+    _refuses(f"SELECT 1; -- x{separator}DROP TABLE t", engine, match="line-separator")
+    _refuses(f"SELECT 1 -- x{separator}", engine, match="line-separator")
+    _refuses(f"SELECT 1 -- x{separator}  ; -- y{separator}", engine, match="line-separator")
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_backslash_before_the_comment_terminator_is_refused(engine):
+    # Spark SQL continues a '--' comment over a backslash-escaped LF ('\\\n' in SIMPLE_COMMENT),
+    # so the quote on the next line is inside the comment on Databricks and top level on an
+    # engine without the continuation. Refused on every dialect (rule C is uniform: the
+    # Snowflake value is unknown and a comment ending in a backslash has no legitimate use).
+    _refuses("SELECT 1 -- x\\\n'\n; DROP TABLE t; --'", engine, match="backslash")
+    _refuses("SELECT 1 -- x\\\n", engine, match="backslash")
+    # CRLF is one terminator for this rule: on the LF-only dialects the code point before
+    # the LF is the CR, and the backslash before THAT must be refused too, or the same bytes
+    # get a dialect-dependent verdict (Databricks already refused them: its match is the CR).
+    _refuses("SELECT 1 -- x\\\r\n'\n; DROP TABLE t; --'", engine, match="backslash")
+    _refuses("SELECT 1 -- x\\\r\n", engine, match="backslash")
+    # End of text: nothing follows the comment, so there is nothing to continue into.
+    _accepts("SELECT 1 -- ends with a backslash \\", engine)
+    # A backslash that is not immediately before the terminator is ordinary comment text.
+    _accepts("SELECT 1 -- x\\ \r\n; -- y\n", engine)
+
+
+def test_backslash_before_crlf_is_refused_in_every_line_comment_form():
+    _refuses("SELECT 1 # x\\\r\n'\n; DROP TABLE t; --'", "bigquery", match="backslash")
+    _refuses("SELECT 1 // x\\\r\n'\n; DROP TABLE t; --'", "snowflake", match="backslash")
+    _refuses("SELECT 1 -- x\\\r\n'\n; DROP TABLE t; --'", "redshift", match="backslash")
+
+
+def test_backslash_before_a_bare_carriage_return_terminator_is_refused_on_databricks():
+    _refuses("SELECT 1 -- x\\\r'\n; DROP TABLE t; --'", "databricks", match="backslash")
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_scanner_only_separators_outside_line_comments_are_plain_text_or_whitespace(engine):
+    _accepts("SELECT '\u2028' AS s", engine)
+    _accepts("SELECT 1\u2028", engine)
+    _accepts("SELECT 1 /* \u2028 */", engine)
+    _accepts("SELECT 1\x0b;\x0c", engine)
+
+
+def test_single_statement_body_falls_back_to_the_strip_when_a_comment_separator_is_refused(
+    monkeypatch,
+):
+    # The helper never refuses (the gate is the separate, earlier call): under the operator
+    # opt-out the unresolvable text keeps the pre-existing best-effort strip.
+    monkeypatch.setenv(ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, "1")
+    assert single_statement_body("SELECT 1 -- x\u2028 y", "bigquery") == "SELECT 1 -- x\u2028 y"
 
 
 @pytest.mark.parametrize("engine", ["bigquery", "databricks"])

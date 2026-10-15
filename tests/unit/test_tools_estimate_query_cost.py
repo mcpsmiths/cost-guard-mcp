@@ -93,6 +93,24 @@ def test_estimate_query_cost_refuses_multi_statement_text_before_any_engine_call
     mock_databricks.explain_estimate.assert_not_called()
 
 
+@pytest.mark.parametrize("engine", ["bigquery", "snowflake", "databricks"])
+@patch("cost_guard_mcp.tools.estimate_query_cost.databricks_engine")
+@patch("cost_guard_mcp.tools.estimate_query_cost.snowflake_engine")
+@patch("cost_guard_mcp.tools.estimate_query_cost.bigquery_engine")
+def test_estimate_query_cost_refuses_a_write_statement_before_any_engine_call(
+    mock_bigquery, mock_snowflake, mock_databricks, engine
+):
+    # DECISIONS.md #13: the read gate runs right after the single-statement gate, before the
+    # dry run / EXPLAIN, and names the operator opt-out.
+    with pytest.raises(UserVisibleError, match="only read statements") as excinfo:
+        estimate_query_cost(engine, "DELETE FROM big_t WHERE TRUE")  # type: ignore[arg-type]
+
+    assert "COST_GUARD_ALLOW_WRITE_STATEMENTS=1" in str(excinfo.value)
+    mock_bigquery.dry_run.assert_not_called()
+    mock_snowflake.explain_estimate.assert_not_called()
+    mock_databricks.explain_estimate.assert_not_called()
+
+
 # --- DECISIONS.md #20: the warehouse-wake flag is threaded to the warehouse engines only -------
 
 

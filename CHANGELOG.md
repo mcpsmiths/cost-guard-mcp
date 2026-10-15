@@ -8,6 +8,16 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ### Security
 
+- **Breaking: read statements only by default.** `estimate_query_cost` and `run_query_bounded`
+  refuse any statement whose first keyword is not `SELECT`, `WITH` (followed by `SELECT`/`VALUES`;
+  CTEs nested more than 16 levels deep are refused too, so the walk stays bounded on
+  model-controlled text), `VALUES`, `SHOW`, `DESCRIBE`, `DESC` or `EXPLAIN`, before any estimate or
+  execution (`DECISIONS.md` #13; #93). Opt-out: `COST_GUARD_ALLOW_WRITE_STATEMENTS=1` (exactly). With
+  `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1` every statement must be a read, so BigQuery scripts now
+  need both opt-outs. `run_query_bounded` results carry the constant
+  `rows_provenance: warehouse_data_untrusted` (additive `outputSchema` change, the intended
+  `tools/list` diff) and both tool descriptions changed. The authorisation boundary remains the
+  deployed credential's grants (read-only recommended; SECURITY.md, README).
 - **Read-only tools no longer wake a warehouse by default** (`check_credentials`,
   `estimate_query_cost`; `DECISIONS.md` #20; #91, #92). Databricks: the configured SQL
   warehouse's state is read through the Warehouses API first; unless it is `RUNNING` - also
@@ -30,8 +40,33 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ### Added
 
+- `COST_GUARD_ALLOW_WRITE_STATEMENTS`, documented in `server.json`, `.mcp.json.example` and the README
+  (Setup, Known limitations, the Codex env block).
 - `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START` and `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME`,
   documented in `server.json`, `.mcp.json.example` and the README (Setup, Known limitations).
+
+### Fixed
+
+- Single-statement scanner: a line comment followed by a quote, backtick, `$$` or `/*` right
+  after U+000B, U+000C, U+001C, U+001D, U+001E, U+0085, U+2028 or U+2029 made the scanner end
+  the comment early, open a construct the engine never sees and swallow the engine's top-level
+  `;`, admitting two-statement text. Line comments now end where each dialect's lexer does (CR or
+  LF on Databricks; LF on BigQuery and Snowflake, where a bare CR inside a comment is refused as
+  ambiguous), and any of those eight code points inside a line comment, or a backslash before its
+  terminator, is refused (`DECISIONS.md` #15; #104).
+- BigQuery `run_query_bounded`: the result-polling RPCs inside `query_job.result()` inherited the
+  library's 600 s default retry, so a Google-side outage that began after job submission pinned
+  the worker thread and one in-flight slot for ~10 min instead of surfacing within the documented
+  bound; they now carry the same 30 s retry bound as every other BigQuery call, and exhausted
+  polling retries issue the same bounded best-effort job cancel the 120 s watchdog does
+  (`DECISIONS.md` #14; #103).
+- `run_query_bounded`: a result cell nested roughly 250 or more levels deep (BigQuery JSON,
+  Snowflake OBJECT/ARRAY) tripped the MCP SDK's serialiser after the billed execution, so the
+  host received a protocol error or `Error executing tool run_query_bounded` and the result was
+  lost; nested values are now capped at 64 levels with the placeholder
+  `<nested value omitted: deeper than 64 levels>` and a `hint` naming the affected cell count -
+  `hint` can therefore be set on an `ok` result; `status` remains the refusal discriminator
+  (`DECISIONS.md` #17; #105).
 
 ## [0.4.0] - 2026-10-14
 

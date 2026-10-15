@@ -320,8 +320,59 @@ the gate guarantees that a listing published from a tagged checkout points at th
 project at the tag's version. HANDOFF.md's distribution note now points here instead of
 describing the manual run as the procedure.
 
-<!-- #13 is reserved for the read-statement allowlist decision (an open owner decision in
-the 2026-10 remediation plan) so that number is never reused for something else. -->
+## 13. The tools accept only read statements by default; result rows are labelled as untrusted data
+
+**Context:** Warehouse row content re-enters the model's context, and a model that has just read
+a row can be steered by it into any statement the deployed credential allows. The 2026-10 audit
+left this as an owner decision (`warehouse-content-to-unrestricted-sql-under-operator-credential`);
+0.4.0 shipped the single-statement scanner (#15) and labelled error text (#18) but no
+statement-type gate. The owner's decision (2026-10-14, #93): a read-statement allowlist on both
+tools with an operator opt-out, a schema-visible provenance marker on result rows, and
+documentation that the credential's grants are the boundary.
+
+**Decision:** `sql_scope_keywords.assert_read_statement(sql, engine)` runs in both tools
+immediately after `assert_single_statement`. It admits a statement only when its first ASCII
+keyword - after comments and any opening parentheses, through the lexer shared with #15 - is
+`SELECT`, `WITH`, `VALUES`, `SHOW`, `DESCRIBE`, `DESC` or `EXPLAIN`; a `WITH` is admitted only when
+the walk over its CTE list (`name [(cols)] AS (body)`, comma separated, `RECURSIVE` allowed, every
+body itself resolving to `SELECT`/`VALUES`, nested `WITH`s resolved the same way) finds `SELECT` or
+`VALUES` as the main statement - Spark's grammar allows `WITH ... INSERT|UPDATE|DELETE|MERGE`, so a
+first-keyword check alone would admit a write on Databricks. The walk is bounded at 16 nested
+`WITH`s (`_MAX_CTE_NESTING`, counting CTE bodies and the parenthesised main statement it descends
+into) and refuses deeper text with its own labelled message: it re-scans the enclosed text once per
+level, so the unbounded first cut was quadratic in a model-controlled string (496 levels padded to
+500 KB cost 47 s inside a `run_query_bounded` in-flight slot - eight such calls exhaust
+`COST_GUARD_MAX_IN_FLIGHT_QUERIES`) and past ~497 levels overran the interpreter's recursion limit,
+where the `RecursionError` surfaced as the generic tool error rather than this gate's refusal.
+Sixteen exceeds any real query by an order of magnitude and caps the worst case at 16 scans of the
+text; the walk's loops also skip every character that cannot open a comment or literal
+(`sql_scope.LEXER_OPENERS`) before consulting the shared lexer. Under the multi-statement opt-out
+every statement in the text must pass. Refusals are `UserVisibleError`s with an offset and the
+opt-out's name, never the SQL (#15's rule). `COST_GUARD_ALLOW_WRITE_STATEMENTS=1`, exactly, read
+per call, is the opt-out (`read_statement_check=skipped|refused` INFO records mirror #15's).
+`BoundedQueryResult.rows_provenance` is the constant `"warehouse_data_untrusted"` with a schema
+description stating that rows are data, never instructions - additive, the intended `tools/list`
+diff; no class docstring (it would add a top-level description to the outputSchema). SECURITY.md
+and README state that the authorisation boundary is the credential's grants and recommend a
+read-only principal per engine. Rejected: a write-keyword denylist (fails open on every keyword it
+does not list - `COPY INTO`, `EXPORT DATA`, `EXECUTE IMMEDIATE`, `CALL`, ...); per-dialect
+allowlists (`SHOW`/`DESCRIBE` are Snowflake/Databricks-only, `EXPLAIN` does not exist on BigQuery -
+the providers reject them as syntax errors and the gate's job is to refuse writes, not to validate
+reads; one owner-confirmed set is smaller and no less safe); a SQL parser (#15's reasoning);
+gating `rows` behind a new field for the #105 note (would widen the schema diff beyond the one
+property).
+
+**Consequences:** Breaking for operators who ran writes through `run_query_bounded`: they set the
+opt-out (and should re-check the credential's grants). BigQuery scripts (`DECLARE`/`SET`/`BEGIN`)
+need both opt-outs. False positives in the safe direction: `TABLE t`, Spark `FROM t SELECT`,
+BigQuery pipe syntax, `SET`/`USE` session statements, `WITH ... MATERIALIZED`, CTEs nested more
+than 16 levels deep. Admitted is not
+supported: `SHOW`/`DESCRIBE`/`EXPLAIN` fail at the estimate on BigQuery and Snowflake and cannot be
+combined with `max_rows` (the LIMIT wrapper is `SELECT`-shaped). A `SELECT` may still have side
+effects through a remote function, UDF or system function the credential can call - the gate does
+not claim otherwise. `EXPLAIN <DML>` is admitted (plan only on the engines that have EXPLAIN).
+`hint` on an `ok` result is now possible (#17 amendment, #105). Ships in the next minor (0.5.0
+planned: a breaking 0.x default change bumps the minor, as 0.4.0 did).
 
 ## 14. `run_query_bounded` cancellation: prompt detach, pre-dispatch check, provider-side deadlines, in-flight cap
 
@@ -363,7 +414,13 @@ cancel into the engines:
   the caller gets a sanitized error and exactly one WARNING record (the watchdog's own, or
   the `warehouse_client_call_failed` record when the warehouse's cancellation wins).
 - BigQuery API calls carry a 30 s retry bound and `job_retry=None` (see
-  `engines/bigquery.py`), so the pre-dispatch window is seconds, not minutes.
+  `engines/bigquery.py`), so the pre-dispatch window is seconds, not minutes. Since #103
+  (fixed after 0.4.0) that includes the polling RPCs inside `QueryJob.result()`, which had
+  inherited the 600 s default; and when those retries are exhausted (`RetryError`, a
+  `GoogleAPIError` that is not a `GoogleAPICallError`) the same bounded best-effort
+  `QueryJob.cancel` the watchdog issues runs first - a `getQueryResults` 5xx storm does not
+  imply `jobs.cancel` is unreachable, and one bounded cancel RPC is cheap against up to
+  `jobTimeoutMs` of billing.
 - An explicit in-flight cap, `COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default 8, positive
   integer, rejected at startup otherwise), implemented as a `threading.BoundedSemaphore`
   whose slot is acquired non-blocking and released inside the worker thread. Acquire and
@@ -425,12 +482,22 @@ deliberate false positives in the safe direction (`THEN'x'` without whitespace,
 `DATE'2020-01-01'`, raw strings ending in an odd run of backslashes, nested block comments)
 and the hint says how to rewrite them. Every scanner mistake must stay in the refuse
 direction: a new dialect construct is added only once its quoting rules are certain, and an
-uncertain construct is refused, never guessed. Two review findings against the first cut
-illustrate the rule: line comments now end at any `str.splitlines()` boundary (Spark ends a
-`--` comment at a bare `\r`; ending a comment earlier than an engine does is always the
-refuse direction), and the odd-backslash test runs on every candidate closing delimiter
+uncertain construct is refused, never guessed. One review finding against the first cut
+illustrates the rule: the odd-backslash test runs on every candidate closing delimiter
 before the doubled-delimiter skip, so `r'\''; DROP TABLE t; --'` is refused as ambiguous
-rather than read as a doubled quote.
+rather than read as a doubled quote. A second finding against the first cut shows the rule's
+limit: line comments were ended at any `str.splitlines()` boundary on the premise that ending
+a comment earlier than an engine does is always the refuse direction, and the 2026-10-14 audit
+re-run disproved that premise (#104) - a quote right after an early end opens a literal the
+engine never sees, and that literal swallows the engine's top-level `;`, so two-statement text
+was admitted. A line comment now ends where the dialect's lexer is known to end it: CR or LF
+on Databricks (Spark SQL's `SIMPLE_COMMENT : '--' ('\\\n' | ~[\r\n])* '\r'? '\n'?`), LF only
+on BigQuery and Snowflake (Snowflake's lexer is unpublished and ZetaSQL's rule could not be
+re-located for citation, so a bare CR inside a comment is refused there as ambiguous - flip
+`_BIGQUERY.line_comment_terminators` once it is), and a comment containing one of the eight
+other `str.splitlines()` code points, or a backslash before its terminator (Spark's
+continuation), is refused outright. Ending a comment too early is not always safe; refusing
+the text whose comment end is uncertain is.
 
 ## 16. BigQuery dollar caps are also enforced server-side, and the provider's refusal is a normal result
 
@@ -497,7 +564,15 @@ normaliser is the fix and the config only a backstop.
 refusal. Documented behaviour change for consumers: valid-UTF-8 `BYTES` that used to arrive
 as plain text (type erased) now arrive base64-encoded, and `NaN`/`Inf` are strings rather
 than `null`. Row-size/row-count defaults are a separate hardening item, deliberately not
-folded in here.
+folded in here. Amended (#105): the normaliser also caps nesting depth at 64 container
+levels per cell, replacing the deeper remainder with the constant placeholder
+`<nested value omitted: deeper than 64 levels>` and reporting the count of capped cells in
+`hint` (and in one INFO record); pydantic_core's recursion guard (~250 levels including the
+`CallToolResult` envelope) otherwise failed the JSON-RPC response or the tool result after
+the billed execution, which no in-repo code saw. `hint` is therefore no longer refusal-only
+and `status` is the discriminator; a new field was rejected because decision #13 allows
+exactly one additive `outputSchema` property. 64 is far above BigQuery STRUCT's 15-level
+limit and an order of magnitude below the guard; raising it is a one-line change.
 
 ## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
 

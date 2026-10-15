@@ -12,10 +12,13 @@ only the literal/comment forms it is sure a dialect has (and only for that diale
 refuses outright whenever two plausible readings of the text could disagree about where a
 literal or comment ends - an identifier glued to a quote (a prefix in some dialects), a
 backslash right before the closing delimiter of a raw/hex literal or quoted identifier, a
-``/*`` inside a block comment, or any unterminated construct. No SQL parser dependency: the
-text is model-controlled input and a parser's error path is itself an attack surface.
+``/*`` inside a block comment, a line comment containing a code point only some lexers end a
+comment at (or ending in a backslash), or any unterminated construct. No SQL parser
+dependency: the text is model-controlled input and a parser's error path is itself an attack
+surface.
 """
 
+import functools
 import logging
 import os
 import re
@@ -33,11 +36,31 @@ ALLOW_MULTI_STATEMENT_SQL_ENV_VAR = "COST_GUARD_ALLOW_MULTI_STATEMENT_SQL"
 
 _CONTRACT = "estimate_query_cost/run_query_bounded accept exactly one SQL statement"
 
-# Every character str.splitlines() treats as a line boundary - a superset of each dialect's
-# line-comment terminators (Spark's lexer ends a '--' comment at a bare '\r', ZetaSQL's at
-# any of [\r\n]). Ending a comment earlier than an engine does only exposes more text to the
-# scanner (refuse direction); ending it later would hide a second statement behind it.
-_LINE_TERMINATOR_RE = re.compile("[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+# Where a line comment ends, per dialect (#104). Spark SQL (Databricks), SqlBaseLexer.g4:
+#   SIMPLE_COMMENT : '--' ('\\\n' | ~[\r\n])* '\r'? '\n'? -> channel(HIDDEN);
+# so CR or LF ends it and a backslash immediately before LF continues it. Snowflake's lexer is
+# unpublished, and ZetaSQL's (BigQuery) single-line-comment rule could not be re-located for
+# citation when this was written (the 0.4.0 review recorded it as [\r\n]), so both are read as
+# LF-terminated and a bare CR inside a comment is refused (_Dialect.line_comment_terminators;
+# flip BigQuery to "\r\n" once the rule is cited). The eight other str.splitlines() boundaries
+# end a comment in no documented lexer. 0.4.0 ended comments at all ten code points on the
+# premise that ending early is always the refuse direction; #104 disproved it: a quote right
+# after an early end opens a literal the engine never sees, and that literal swallows the
+# engine's top-level ';'. Rules, applied in _line_comment_end:
+#   A. a comment ends at the first code point of the dialect's terminator set;
+#   B. a comment containing one of the eight scanner-only separators, or a bare CR on a
+#      dialect whose set is LF-only, is refused - the two readings of where it ends disagree;
+#   C. a backslash immediately before the terminator is refused (Spark continues the comment);
+#      CRLF counts as one terminator here, so the verdict on "\\\r\n" does not depend on
+#      whether the dialect's set holds the CR or only the LF.
+_SCANNER_ONLY_LINE_SEPARATORS = "\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
+_AMBIGUOUS_LINE_SEPARATOR_RE = re.compile(f"[{_SCANNER_ONLY_LINE_SEPARATORS}]")
+_BARE_CARRIAGE_RETURN_RE = re.compile("\r(?!\n)")
+
+
+@functools.cache
+def _terminator_re(terminators: str) -> re.Pattern[str]:
+    return re.compile(f"[{terminators}]")
 
 
 @dataclass(frozen=True)
@@ -54,6 +77,9 @@ class _Dialect:
     raw_prefixes: frozenset[str]  # no escape processing: closes at the next delimiter
     cooked_prefixes: frozenset[str]  # backslash escapes, like an unprefixed string
     hex_prefixes: frozenset[str]  # X'..' - no escapes, single quotes only
+    # Code points at which this dialect's lexer ends a line comment: "\r\n" when CR and LF
+    # each end it (Spark SQL), "\n" when only LF is known to - a bare CR is then refused.
+    line_comment_terminators: str
 
 
 _BIGQUERY = _Dialect(
@@ -66,6 +92,7 @@ _BIGQUERY = _Dialect(
     raw_prefixes=frozenset({"r", "rb", "br"}),
     cooked_prefixes=frozenset({"b"}),
     hex_prefixes=frozenset(),
+    line_comment_terminators="\n",
 )
 _SNOWFLAKE = _Dialect(
     double_quote_is_escaped_string=False,
@@ -77,6 +104,7 @@ _SNOWFLAKE = _Dialect(
     raw_prefixes=frozenset(),
     cooked_prefixes=frozenset(),
     hex_prefixes=frozenset(),
+    line_comment_terminators="\n",
 )
 _DATABRICKS = _Dialect(
     double_quote_is_escaped_string=True,
@@ -88,6 +116,7 @@ _DATABRICKS = _Dialect(
     raw_prefixes=frozenset({"r"}),
     cooked_prefixes=frozenset(),
     hex_prefixes=frozenset({"x"}),
+    line_comment_terminators="\r\n",
 )
 # An engine this module does not know gets only the constructs all three share. Nothing
 # executes for such an engine anyway (the tools' own dispatch rejects it right after), so
@@ -102,6 +131,7 @@ _FALLBACK = _Dialect(
     raw_prefixes=frozenset(),
     cooked_prefixes=frozenset(),
     hex_prefixes=frozenset(),
+    line_comment_terminators="\n",
 )
 _DIALECTS: dict[str, _Dialect] = {
     "bigquery": _BIGQUERY,
@@ -128,9 +158,38 @@ def _prefix_before(sql: str, index: int) -> str:
     return sql[start:index]
 
 
-def _line_comment_end(sql: str, index: int) -> int:
-    terminator = _LINE_TERMINATOR_RE.search(sql, index)
-    return len(sql) if terminator is None else terminator.end()
+def _line_comment_end(sql: str, index: int, dialect: _Dialect) -> int:
+    """End (exclusive) of the line comment opening at ``index`` - rules A-C above."""
+    terminator = _terminator_re(dialect.line_comment_terminators).search(sql, index)
+    end = len(sql) if terminator is None else terminator.end()
+    separator = _AMBIGUOUS_LINE_SEPARATOR_RE.search(sql, index, end)
+    if separator is not None:
+        raise _refuse(
+            "a line comment contains a Unicode line-separator character "
+            f"(U+{ord(separator.group()):04X}) that some lexers treat as the end of the "
+            "comment and others do not - remove it",
+            separator.start(),
+        )
+    if "\r" not in dialect.line_comment_terminators:
+        bare_cr = _BARE_CARRIAGE_RETURN_RE.search(sql, index, end)
+        if bare_cr is not None:
+            raise _refuse(
+                "a line comment contains a bare carriage return (U+000D not followed by a line "
+                "feed) that some lexers treat as the end of the comment and others do not - "
+                "remove it or end the line with LF",
+                bare_cr.start(),
+            )
+    if terminator is not None:
+        before = terminator.start() - 1
+        if terminator.group() == "\n" and before > index and sql[before] == "\r":
+            before -= 1  # the LF of a CRLF: the pair is the terminator
+        if before > index and sql[before] == "\\":
+            raise _refuse(
+                "a backslash at the end of a line comment continues the comment in Spark SQL - "
+                "remove it",
+                before,
+            )
+    return end
 
 
 def _block_comment_end(sql: str, index: int) -> int:
@@ -230,15 +289,9 @@ def _scan(sql: str, dialect: _Dialect) -> int:
     statement_end = 0
     while index < len(sql):
         ch = sql[index]
-        if (
-            sql.startswith("--", index)
-            or (dialect.hash_line_comments and ch == "#")
-            or (dialect.double_slash_line_comments and sql.startswith("//", index))
-        ):
-            index = _line_comment_end(sql, index)
-            continue
-        if sql.startswith("/*", index):
-            index = _block_comment_end(sql, index)
+        comment = comment_end(sql, index, dialect)
+        if comment is not None:
+            index = comment
             continue
         if ch.isspace():
             index += 1
@@ -255,26 +308,62 @@ def _scan(sql: str, dialect: _Dialect) -> int:
             terminator_seen = True
             index += 1
             continue
-        if ch in "'\"":
-            index = statement_end = _quoted_end(sql, index, dialect)
-            continue
-        if ch == "`" and dialect.backtick_identifiers:
-            index = statement_end = _unescaped_literal_end(sql, index + 1, "`", "quoted identifier")
-            continue
-        if dialect.dollar_strings and sql.startswith("$$", index):
-            if _prefix_before(sql, index):
-                raise _refuse(
-                    "'$$' directly attached to an identifier is ambiguous ($ is an identifier "
-                    "character) - put whitespace before it",
-                    index,
-                )
-            index = statement_end = _unescaped_literal_end(
-                sql, index + 2, "$$", "dollar-quoted string"
-            )
+        literal = literal_end(sql, index, dialect)
+        if literal is not None:
+            index = statement_end = literal
             continue
         index += 1
         statement_end = index
     return statement_end
+
+
+def dialect_for(engine: str) -> _Dialect:
+    """The dialect table for ``engine``; the shared-constructs fallback for an unknown one."""
+    return _DIALECTS.get(engine, _FALLBACK)
+
+
+# Every character at which comment_end or literal_end can return non-None on any dialect
+# ("--", "#", "//", "/*"; ' " ` and $$; a prefixed literal still opens at its quote). Loops
+# over model-controlled text test membership here first and skip everything else without
+# consulting the lexer; test_sql_scope pins the invariant against both functions.
+LEXER_OPENERS = frozenset("-#/'\"`$")
+
+
+def comment_end(sql: str, index: int, dialect: _Dialect) -> int | None:
+    """End (exclusive) of the comment opening at ``index``, or None when none opens there.
+
+    Shared with ``sql_scope_keywords`` so both gates end comments at the same place. Raises
+    this module's refusals (unterminated or nested block comment, the #104 line-comment
+    shapes)."""
+    if (
+        sql.startswith("--", index)
+        or (dialect.hash_line_comments and sql[index] == "#")
+        or (dialect.double_slash_line_comments and sql.startswith("//", index))
+    ):
+        return _line_comment_end(sql, index, dialect)
+    if sql.startswith("/*", index):
+        return _block_comment_end(sql, index)
+    return None
+
+
+def literal_end(sql: str, index: int, dialect: _Dialect) -> int | None:
+    """End (exclusive) of the quoted construct opening at ``index`` - string literal, quoted
+    identifier, backtick identifier or dollar-quoted string, per dialect - or None when none
+    opens there. Raises this module's refusals for unterminated or ambiguous shapes."""
+    ch = sql[index]
+    if ch in "'\"":
+        return _quoted_end(sql, index, dialect)
+    if ch == "`" and dialect.backtick_identifiers:
+        return _unescaped_literal_end(sql, index + 1, "`", "quoted identifier")
+    if dialect.dollar_strings and sql.startswith("$$", index):
+        if _prefix_before(sql, index):
+            raise _refuse(
+                "'$$' directly attached to an identifier is ambiguous ($ is an identifier "
+                "character) - put whitespace before it",
+                index,
+            )
+        return _unescaped_literal_end(sql, index + 2, "$$", "dollar-quoted string")
+    return None
 
 
 def single_statement_body(sql: str, engine: Engine) -> str:

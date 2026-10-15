@@ -495,6 +495,37 @@ def test_every_env_var_read_in_src_is_documented_in_both_manifests():
     )
 
 
+def test_write_statement_opt_out_documents_its_scope():
+    # DECISIONS.md #13: the read-statement gate's opt-out must say what it admits, which tools
+    # it covers, how it interacts with the multi-statement opt-out and where the real
+    # authorisation boundary is - in server.json, README (Setup + Known limitations).
+    entries = {e["name"]: e for e in _server_json()["packages"][0]["environmentVariables"]}
+    entry = entries["COST_GUARD_ALLOW_WRITE_STATEMENTS"]
+    assert entry["isRequired"] is False and entry["isSecret"] is False
+    for needle in (
+        "Set to 1",
+        "exactly",
+        "SELECT",
+        "WITH",
+        "estimate_query_cost",
+        "run_query_bounded",
+        "COST_GUARD_ALLOW_MULTI_STATEMENT_SQL",
+        "credential",
+    ):
+        assert needle in entry["description"], needle
+    readme = README_PATH.read_text(encoding="utf-8")
+    limitations = readme.split("## Known limitations", 1)[1]
+    bullet = next(
+        line
+        for line in limitations.splitlines()
+        if line.startswith("- ") and "COST_GUARD_ALLOW_WRITE_STATEMENTS=1" in line
+    )
+    assert "max_rows" in bullet
+    setup = readme.split("### Read-only statements", 1)[1].split("###", 1)[0]
+    assert "exactly" in setup
+    assert "COST_GUARD_ALLOW_WRITE_STATEMENTS" in setup
+
+
 # --- plan-review amendment A14: credential files must never be committable -----------------
 
 

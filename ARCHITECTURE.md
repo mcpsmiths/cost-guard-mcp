@@ -32,8 +32,11 @@ MCP client (Claude Desktop, Claude Code, Cursor, ...)
 | `types.py` | Shared Pydantic models: `AccuracyTier`, `CostEstimate`, `EngineCapabilities`, `RefusalReason`, `BoundedQueryResult`. Every tool response is one of these. |
 | `errors.py` | `sanitize_exceptions` — wraps every warehouse-client call so no raw exception (which may embed credentials) escapes to a log or tool response. |
 | `config.py` | Per-engine env-var loading and validation, run at call time (not import time). |
+| `sql_scope.py` | Fail-closed single-statement scanner (`assert_single_statement`, `single_statement_body`) and the dialect-aware lexer helpers (`comment_end`, `literal_end`, `dialect_for`) both gates share. `DECISIONS.md` #15. |
+| `sql_scope_keywords.py` | Read-statement gate (`assert_read_statement`): first-keyword allowlist plus the `WITH` CTE walk; opt-out `COST_GUARD_ALLOW_WRITE_STATEMENTS=1`. `DECISIONS.md` #13. |
 | `engines/bigquery.py` | `is_capacity_billed`, `dry_run`, `execute_bounded` — thin wrapper over `google-cloud-bigquery` + `google-cloud-bigquery-reservation`. |
 | `engines/snowflake.py` | `_connect`, `explain_estimate`, `execute_bounded` — thin wrapper over `snowflake-connector-python`. |
+| `engines/databricks.py` | `explain_estimate`, `execute_bounded`, `check_credentials` — thin wrapper over `databricks-sql-connector` and the `databricks-sdk` Warehouses API. |
 | `pricing/bigquery_pricing.py` | On-demand `$/TiB` constant. |
 | `pricing/snowflake_pricing.py` | Gen1 warehouse credit-rate table + `$/credit` by edition. |
 | `tools/*.py` | Business logic for each of the 3 MCP tools — pure functions, independently testable, imported (not duplicated) by `server.py`'s tool-registration wrappers. |

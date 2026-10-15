@@ -16,6 +16,7 @@
         "DATABRICKS_HTTP_PATH": "/sql/1.0/warehouses/your-warehouse-id",
         "DATABRICKS_TOKEN": "your-personal-access-token",
         "COST_GUARD_ALLOW_MULTI_STATEMENT_SQL": "0",
+        "COST_GUARD_ALLOW_WRITE_STATEMENTS": "0",
         "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START": "false",
         "COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME": "false",
         "COST_GUARD_MAX_IN_FLIGHT_QUERIES": "8"
