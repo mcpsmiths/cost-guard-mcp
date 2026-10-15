@@ -366,7 +366,10 @@ checks the package record. `server.json` is verified, never rewritten in the job
 drift is a refusal, not something a `jq` sync papers over. The publish step is idempotent
 for the version the tag names: if the registry already serves that exact version (a lost
 success response, or a re-publish dispatched for an already-published tag) it reports so
-and the read-back check decides whether the served entry is right.
+and the read-back check decides - it compares the package record (`registryType`,
+`identifier`, both version fields) and requires status `active`, nothing more; an entry that
+differs in description or repository fields is not detected, which is acceptable because
+every entry is produced from a tagged `server.json` the gate verified.
 
 Preconditions, answered read-only on 2026-10-15:
 - *Does `github-oidc` grant `io.github.mcpsmiths/*` to a workflow in an org-owned

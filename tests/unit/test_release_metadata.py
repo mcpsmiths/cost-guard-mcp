@@ -202,7 +202,10 @@ def _run_step_script(
     script: str, *, cwd: Path, env: dict[str, str], scratch: Path
 ) -> subprocess.CompletedProcess[str]:
     # GitHub Actions writes a `run:` block to a file and executes it with
-    # `bash --noprofile --norc -eo pipefail {0}`; mirror that exactly.
+    # `bash --noprofile --norc -eo pipefail {0}` when a step declares `shell: bash`; with no
+    # `shell:` (none of this repository's workflows sets one) the runner uses `bash -e {0}`,
+    # i.e. the same `-e` without pipefail. The stricter form is used here; every pipeline in
+    # the gated steps exits the same way under both (checked 2026-10-15).
     script_path = scratch / "step.sh"
     script_path.write_text(script, encoding="utf-8")
     return subprocess.run(  # noqa: S603 - the script is the repository's own workflow text
