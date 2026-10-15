@@ -13,6 +13,7 @@ from cost_guard_mcp.engines.bigquery import (
 from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.result_bounds import (
     DEFAULT_MAX_ROWS,
+    LARGE_MAX_ROWS_WARNING_THRESHOLD,
     MAX_RESULT_BYTES,
     row_cap_hint,
     size_cap_hint,
@@ -96,6 +97,18 @@ def run_query_bounded(
     if max_bytes_billed is not None and not 1 <= max_bytes_billed <= _INT64_MAX:
         raise UserVisibleError(
             f"max_bytes_billed must be between 1 and {_INT64_MAX} bytes (got {max_bytes_billed})."
+        )
+    # Honoured, but said out loud: the 8 MiB cap bounds the serialised rows, not the Python
+    # objects behind them (~25x the JSON size for narrow rows) nor the normalise + trim pass
+    # over them, both of which happen after the billed execution and outside any watchdog
+    # (DECISIONS.md #21). The default (1000) is far below this, so anything above is explicit.
+    if max_rows > LARGE_MAX_ROWS_WARNING_THRESHOLD:
+        logger.warning(
+            "engine=%s run_query_bounded explicit max_rows=%s exceeds %s: narrow rows at this "
+            "count can hold hundreds of MB and cost seconds of CPU after the billed execution",
+            engine,
+            max_rows,
+            LARGE_MAX_ROWS_WARNING_THRESHOLD,
         )
 
     # Whether the engine may enclose the text in `SELECT * FROM (...) AS cost_guard_row_cap

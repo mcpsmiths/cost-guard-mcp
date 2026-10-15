@@ -106,8 +106,46 @@ def test_approx_row_size_under_estimates_control_character_text_by_up_to_six_tim
     row = {"s": "\x1f" * 1000}
     estimate = approx_row_size(row)
     exact = row_json_bytes(_json_safe_rows([row])[0])
-    assert estimate == 1002
+    # 1000 estimated text bytes + the braces, the key's and the value's quotes and the colon.
+    assert estimate == 1000 + 2 + 3 + 2 + 1
     assert exact >= 6 * 1000
+
+
+def test_approx_row_size_is_exact_for_narrow_rows_of_json_primitives():
+    # The reviewer's case: a {"a": 1} row was estimated at 3 bytes against 7 exact, so the
+    # engine-side stop let ~2.8M narrow rows through under an explicit large max_rows. The
+    # framing JSON always renders - braces, key quotes, colons, commas, value quotes - is
+    # counted now, so the estimate is exact for rows of bare JSON primitives.
+    for row in ({"a": 1}, {"a": 1, "b": True, "c": None, "d": -0.5}, {}, {"k": "v"}):
+        assert approx_row_size(row) == row_json_bytes(row)
+    assert approx_row_size({"a": 1}) == 7
+
+
+def test_collect_rows_estimate_counts_one_inter_row_comma_and_stays_a_lower_bound(monkeypatch):
+    # With the cap patched to 80 bytes: each {"a": 1} row is 7 bytes plus its inter-row comma,
+    # so the running estimate crosses 80 on the 11th row (88); the exact list form of those 11
+    # rows is 89 bytes, so the tool's exact measurement refuses too (lower bound intact), and
+    # the stop lands within one row of the exact crossing instead of ~2.7x past it.
+    from cost_guard_mcp import result_bounds
+
+    monkeypatch.setattr(result_bounds, "MAX_RESULT_BYTES", 80)
+    rows_iter, seen = _counting([{"a": index % 10} for index in range(1000)])
+    rows, row_cap_hit = collect_rows(rows_iter, max_rows=None)
+    assert len(rows) == len(seen) == 11
+    assert row_cap_hit is True
+    exact = trim_rows_to_byte_cap(rows, cap=80).total_bytes
+    assert exact == 89
+    assert exact > 80
+    # One row fewer and the estimate (80) would not have stopped, while the exact size (81)
+    # is already over: the estimate never exceeds the exact size, it may only trail it.
+    assert trim_rows_to_byte_cap(rows[:10], cap=80).total_bytes == 81
+
+
+def test_collect_rows_framing_estimate_is_a_lower_bound_over_the_type_table():
+    # What collect_rows accumulates (per-row estimate + one comma per row) never exceeds the
+    # exact compact list form the tool measures, for every cell type the normaliser produces.
+    estimate = sum(approx_row_size(row) for row in _TYPE_TABLE) + len(_TYPE_TABLE)
+    assert estimate <= trim_rows_to_byte_cap(_json_safe_rows(_TYPE_TABLE)).total_bytes
 
 
 def test_approx_row_size_stops_descending_where_the_normaliser_truncates():

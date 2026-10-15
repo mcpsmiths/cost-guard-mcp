@@ -15,12 +15,16 @@ Two measurements live here, with one relationship between them:
 - ``approx_row_size`` is a STRICT LOWER BOUND on that exact measurement, computed by the
   engines on connector-native rows as they arrive (``collect_rows``). It is an under-estimate
   guard: it lets an engine stop fetching once the exact measurement is guaranteed to exceed the
-  cap, never earlier. Because it under-estimates, an engine may fetch more than the cap - up to
-  about six times it in the worst case (text made of control characters, which JSON renders as
-  six bytes each; 4/3 for binary; the constant placeholder for over-deep nests) - never less
-  than what the exact measurement will refuse. ``tests/unit/test_result_bounds.py`` pins the
-  bound over the normaliser's whole type table; a new branch in ``_json_safe_value`` must
-  extend that table.
+  cap, never earlier. It counts the framing JSON always renders (braces, brackets, key and
+  string quotes, colons, commas), so for rows of bare primitives it is exact and the stop lands
+  within one row of the cap; where it under-estimates, an engine may fetch more than the cap -
+  up to about six times it in the worst case (text made of control characters, which JSON
+  renders as six bytes each; 4/3 for binary; the constant placeholder for over-deep nests) -
+  never less than what the exact measurement will refuse. ``tests/unit/test_result_bounds.py``
+  pins the bound over the normaliser's whole type table; a new branch in ``_json_safe_value``
+  must extend that table. Serialised bytes are not process memory: the Python objects behind
+  narrow rows weigh ~25x their JSON size (DECISIONS.md #21), which is why the tool logs a
+  WARNING above ``LARGE_MAX_ROWS_WARNING_THRESHOLD``.
 
 Neither the estimate nor ``collect_rows`` decides anything the caller sees. ``collect_rows``
 reports a hit whenever it stopped before the result was exhausted - the ``max_rows + 1``
@@ -42,6 +46,10 @@ from typing import Any
 # Applied by the tool when the caller omits max_rows (#94): an unbounded fetch is never the
 # default. An explicit value up to the int64 bound in tools/run_query_bounded.py raises it.
 DEFAULT_MAX_ROWS = 1000
+# Above this explicit max_rows the tool logs one WARNING: the byte cap still holds, but the
+# Python objects behind that many narrow rows (~25x their JSON size) and the normalise + trim
+# pass over them cost memory and CPU after the billed execution, outside any watchdog.
+LARGE_MAX_ROWS_WARNING_THRESHOLD = 100_000
 # The exact cap on the compact-JSON size of the normalised rows list, in UTF-8 bytes. No
 # opt-out: a model cannot usefully consume more per call, and splitting the query is the remedy.
 MAX_RESULT_BYTES = 8 * 1024 * 1024
@@ -57,37 +65,64 @@ FETCH_PAGE_SIZE = 500
 # deep nest would be over-estimated against that placeholder.
 MAX_CELL_NESTING_DEPTH = 64
 
+# What compact JSON always renders around a value, counted so the lower bound is tight for
+# narrow rows: the two braces of an object or brackets of an array, the two quotes of a string.
+_CONTAINER_FRAMING_BYTES = 2
+_QUOTE_BYTES = 2
+
 
 def approx_row_size(row: Mapping[Any, object]) -> int:
     """A strict lower bound on ``row_json_bytes`` of the normalised form of ``row``.
 
-    Per value: ``str`` -> its length (quotes, escapes and multibyte encoding only add bytes;
-    the normaliser's backslashreplace only grows text); ``bytes``-like -> its length (base64 is
-    4/3 of it, plus quotes); a container -> the sum over its items plus one byte per item (the
-    colon or the comma; brackets and key quotes are not counted), keys estimated by the same
-    per-type rule as values (``str(b"\\x00")`` is ``b'\\x00'``, seven characters, where the
-    normalised key is four characters of base64 - so never ``len(str(key))`` for bytes); a
-    container ``MAX_CELL_NESTING_DEPTH`` levels below the cell -> 0 (the placeholder that
-    replaces it only adds bytes); everything else -> ``len(str(value))``, which is what the
-    normaliser or ``default=str`` renders, quoted (``nan`` -> ``"nan"``; ``True`` -> ``true``
-    and ``None`` -> ``null``, four bytes each).
+    Counts the framing the compact form always renders - the braces, every key's quotes and
+    colon, the comma between neighbours - plus, per value: ``None``/``bool``/``int``/``float``
+    -> ``len(str(value))``, rendered bare (``True`` -> ``true``, ``None`` -> ``null``; a
+    non-finite float becomes a quoted ``"nan"``, longer still); ``str`` -> its length plus the
+    quotes (escapes and multibyte encoding only add bytes; the normaliser's backslashreplace
+    only grows text); ``bytes``-like -> its length plus the quotes (base64 is 4/3 of it); a
+    container -> its brackets plus the sum over its items and separators, keys estimated by
+    the same per-type rule and always quoted (``str(b"\\x00")`` is ``b'\\x00'``, seven
+    characters, where the normalised key is four characters of base64 - so never
+    ``len(str(key))`` for bytes); a container ``MAX_CELL_NESTING_DEPTH`` levels below the cell
+    -> the quotes of the placeholder string that replaces it; everything else ->
+    ``len(str(value))`` plus the quotes, which is what the normaliser or ``default=str``
+    renders. Exact for rows of bare primitives (``{"a": 1}`` -> 7); ~1/6 of the exact size for
+    text made of control characters.
     """
-    return sum(_approx_size(key, 0) + _approx_size(cell, 0) for key, cell in row.items()) + len(row)
+    members = sum(_approx_key_size(key, 0) + _approx_size(cell, 0) for key, cell in row.items())
+    return _CONTAINER_FRAMING_BYTES + members + _object_separator_bytes(len(row))
 
 
 def _approx_size(value: object, depth: int) -> int:
+    if value is None or isinstance(value, bool | int | float):
+        return len(str(value))
     if isinstance(value, str | bytes | bytearray | memoryview):
-        return len(value)
+        return len(value) + _QUOTE_BYTES
     if isinstance(value, dict | list | tuple | set | frozenset):
         if depth >= MAX_CELL_NESTING_DEPTH:
-            return 0
+            return _QUOTE_BYTES
         if isinstance(value, dict):
-            return sum(
-                _approx_size(key, depth) + _approx_size(item, depth + 1)
+            members = sum(
+                _approx_key_size(key, depth) + _approx_size(item, depth + 1)
                 for key, item in value.items()
-            ) + len(value)
-        return sum(_approx_size(item, depth + 1) for item in value) + len(value)
-    return len(str(value))
+            )
+            return _CONTAINER_FRAMING_BYTES + members + _object_separator_bytes(len(value))
+        items = sum(_approx_size(item, depth + 1) for item in value)
+        return _CONTAINER_FRAMING_BYTES + items + max(0, len(value) - 1)
+    return len(str(value)) + _QUOTE_BYTES
+
+
+def _approx_key_size(key: object, depth: int) -> int:
+    # Every key is rendered as a quoted string: the normaliser stringifies the ones that would
+    # render bare as values, so those gain the quotes here; the rest are already counted quoted.
+    if key is None or isinstance(key, bool | int | float):
+        return len(str(key)) + _QUOTE_BYTES
+    return _approx_size(key, depth)
+
+
+def _object_separator_bytes(member_count: int) -> int:
+    # One colon per member plus one comma between neighbours.
+    return max(0, 2 * member_count - 1)
 
 
 def collect_rows(
@@ -97,11 +132,13 @@ def collect_rows(
 
     Returns ``(rows, stopped_early)``. The ``max_rows + 1``-th row (the sentinel the LIMIT
     wrap asks for) is detected before the size estimate and dropped: the caller gets exactly
-    ``max_rows`` rows and ``True``. When the running estimate crosses ``MAX_RESULT_BYTES`` the
-    rows so far (the last one pushed it over) and ``True`` come back - the tool's exact
-    measurement will then exceed the cap too (the estimate is a lower bound), so this stop never
-    produces an ``ok``. ``False`` means the iterator was exhausted. The iterator's page size is
-    irrelevant here: both checks run per row.
+    ``max_rows`` rows and ``True``. When the running estimate - each row's lower bound plus the
+    one comma that separates it from its neighbour in the list form (the list's brackets stay
+    uncounted, so the total is still a strict lower bound on what ``trim_rows_to_byte_cap``
+    measures) - crosses ``MAX_RESULT_BYTES``, the rows so far (the last one pushed it over) and
+    ``True`` come back - the tool's exact measurement will then exceed the cap too, so this stop
+    never produces an ``ok``. ``False`` means the iterator was exhausted. The iterator's page
+    size is irrelevant here: both checks run per row.
     """
     collected: list[dict[str, object]] = []
     estimate = 0
@@ -109,7 +146,7 @@ def collect_rows(
         collected.append(dict(row))
         if max_rows is not None and len(collected) > max_rows:
             return collected[:max_rows], True
-        estimate += approx_row_size(collected[-1])
+        estimate += approx_row_size(collected[-1]) + 1
         if estimate > MAX_RESULT_BYTES:
             return collected, True
     return collected, False

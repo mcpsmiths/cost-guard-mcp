@@ -12,7 +12,12 @@ from pydantic_core import PydanticSerializationError
 
 from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
 from cost_guard_mcp.errors import UserVisibleError, as_tool_error
-from cost_guard_mcp.result_bounds import DEFAULT_MAX_ROWS, MAX_RESULT_BYTES, trim_rows_to_byte_cap
+from cost_guard_mcp.result_bounds import (
+    DEFAULT_MAX_ROWS,
+    LARGE_MAX_ROWS_WARNING_THRESHOLD,
+    MAX_RESULT_BYTES,
+    trim_rows_to_byte_cap,
+)
 from cost_guard_mcp.sql_scope import ALLOW_MULTI_STATEMENT_SQL_ENV_VAR
 from cost_guard_mcp.sql_scope_keywords import ALLOW_WRITE_STATEMENTS_ENV_VAR
 from cost_guard_mcp.tools.run_query_bounded import _format_usd, _json_safe_rows, run_query_bounded
@@ -857,6 +862,43 @@ def test_explicit_max_rows_is_honoured_unchanged(mock_estimate, mock_execute, ma
     run_query_bounded("bigquery", "SELECT 1", max_rows=max_rows)
 
     assert mock_execute.call_args.kwargs["max_rows"] == max_rows
+
+
+@pytest.mark.parametrize(
+    ("max_rows", "expect_warning"),
+    [
+        (None, False),
+        (LARGE_MAX_ROWS_WARNING_THRESHOLD, False),
+        (LARGE_MAX_ROWS_WARNING_THRESHOLD + 1, True),
+    ],
+    ids=["default", "at_threshold", "above_threshold"],
+)
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_explicit_max_rows_above_the_threshold_logs_one_warning(
+    mock_estimate, mock_execute, max_rows, expect_warning, caplog
+):
+    # The byte cap is still exact and honoured, but for narrow rows the Python objects behind
+    # an explicit max_rows in the millions cost far more memory and post-billing CPU than the
+    # serialised bytes suggest (DECISIONS.md #21). The operator gets one WARNING, counts only.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([], 0, False)
+
+    with caplog.at_level(logging.WARNING, logger=_RUN_QUERY_BOUNDED_LOGGER_NAME):
+        result = run_query_bounded("bigquery", "SELECT 1", max_rows=max_rows)
+
+    assert result.status == "ok"
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    if expect_warning:
+        assert warnings == [
+            (
+                f"engine=bigquery run_query_bounded explicit max_rows={max_rows} exceeds "
+                f"{LARGE_MAX_ROWS_WARNING_THRESHOLD}: narrow rows at this count can hold hundreds "
+                "of MB and cost seconds of CPU after the billed execution"
+            )
+        ]
+    else:
+        assert warnings == []
 
 
 @pytest.mark.parametrize(

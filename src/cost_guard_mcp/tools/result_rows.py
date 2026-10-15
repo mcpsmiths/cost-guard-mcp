@@ -114,13 +114,18 @@ def _normalise_rows(rows: list[dict]) -> _NormalisedRows:
     row_cap_exceeded and result_size_exceeded): every value placed in BoundedQueryResult.rows -
     column names included - is JSON-serialisable, UTF-8-encodable and nested no deeper than the
     SDK's serialiser can take, with a count of the cells that had to be capped. The size cap
-    (#94) is measured on this function's output, so what is measured is what is sent."""
-    normalised = [
-        {_json_safe_text(str(key)): _normalise_cell(item) for key, item in row.items()}
-        for row in rows
-    ]
-    safe_rows = [{key: safe for key, (safe, _) in row.items()} for row in normalised]
-    depth_capped_cells = sum(capped for row in normalised for _, capped in row.values())
+    (#94) is measured on this function's output, so what is measured is what is sent. One pass
+    with a running count: an intermediate list of (value, capped) pairs would be a second full
+    copy of the result, held after the billed execution."""
+    safe_rows: list[dict] = []
+    depth_capped_cells = 0
+    for row in rows:
+        safe_row: dict = {}
+        for key, item in row.items():
+            safe, capped = _normalise_cell(item)
+            safe_row[_json_safe_text(str(key))] = safe
+            depth_capped_cells += capped
+        safe_rows.append(safe_row)
     return _NormalisedRows(rows=safe_rows, depth_capped_cells=depth_capped_cells)
 
 
