@@ -6,6 +6,7 @@ for Python's `logging` module when no handler is configured, and for `print(...,
 """
 
 import functools
+import importlib.metadata
 import os
 import re
 import threading
@@ -35,7 +36,28 @@ from cost_guard_mcp.types import (
     EngineCapabilities,
 )
 
-mcp = MCPServer("cost-guard-mcp")
+_DISTRIBUTION_NAME = "cost-guard-mcp"
+_UNKNOWN_VERSION = "0.0.0+unknown"
+
+
+def _installed_version() -> str:
+    """The installed distribution's version, for the initialize handshake's serverInfo.
+
+    Read from the dist-info the install wrote from pyproject.toml, so the version a client
+    sees can never disagree with the wheel it is running. The low-level SDK substitutes
+    nothing for an omitted version (serverInfo.version came back "" on every release up to
+    0.5.0), hence the explicit fallback for a source tree that was never installed: a value
+    that says it is unknown rather than an empty string or a guess.
+    """
+    try:
+        return importlib.metadata.version(_DISTRIBUTION_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return _UNKNOWN_VERSION
+
+
+SERVER_VERSION = _installed_version()
+
+mcp = MCPServer("cost-guard-mcp", version=SERVER_VERSION)
 
 # Registration shape matters beyond Python: the mcprush.com marketplace reads this
 # project's tool list statically from the repository (its "Read the tools again" control),
