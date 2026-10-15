@@ -14,11 +14,14 @@
 # Environment: `mcp-registry`, separate from `pypi` so an OIDC token minted here can never
 # satisfy PyPI's environment claim (decision #8's blast-radius split). Its deployment-branch
 # policy admits tags `v*` (the workflow_call path - evaluated against the caller's ref,
-# the pushed tag) and `main` (workflow_dispatch runs main's reviewed copy of this file; the
-# checkout below is pinned to the tag regardless). The registry's github-oidc grant for
-# io.github.mcpsmiths/* is repository-scoped, not ref-scoped, so the environment gate, the
-# tag-pinned checkout and the two verification steps are what keep the published entry
-# equal to the reviewed tag's server.json.
+# the pushed tag) and `main` (a workflow_dispatch is admitted only when dispatched from
+# main, so it runs main's reviewed copy of this file; a dispatch from any other ref is
+# refused before the first step; the checkout below is pinned to the tag regardless). The
+# registry's github-oidc grant for
+# io.github.mcpsmiths/* (the OIDC token's repository_owner claim; registry source
+# internal/api/handlers/v0/auth/github_oidc.go, buildPermissions) is repository-scoped, not
+# ref-scoped, so the environment gate, the tag-pinned checkout and the two verification
+# steps are what keep the published entry equal to the reviewed tag's server.json.
 name: mcp-registry-publish
 on:
   workflow_call:
@@ -43,6 +46,9 @@ permissions:
 jobs:
   publish-listing:
     runs-on: ubuntu-latest
+    # The designed worst case (PyPI poll + publish retries + read-back) is about 20 minutes;
+    # anything longer is a stalled connection, not progress.
+    timeout-minutes: 30
     environment: mcp-registry
     permissions:
       contents: read
@@ -118,7 +124,7 @@ jobs:
           version="${TAG#v}"
           echo "Waiting for PyPI ${identifier} ${version} with marker 'mcp-name: ${name}'"
           for i in $(seq 1 40); do
-            desc="$(curl -sf "https://pypi.org/pypi/${identifier}/${version}/json" | jq -r '.info.description' 2>/dev/null || true)"
+            desc="$(curl -sf --max-time 30 "https://pypi.org/pypi/${identifier}/${version}/json" | jq -r '.info.description' 2>/dev/null || true)"
             if printf '%s' "$desc" | grep -qF "mcp-name: ${name}"; then
               echo "Ownership marker present on PyPI ${identifier} ${version}"
               exit 0
@@ -130,17 +136,18 @@ jobs:
           exit 1
       # Pinned release, not `releases/latest`, and the archive is checked against a digest
       # recorded here in reviewed source. The 1.8.1 linux_amd64 digest was taken on
-      # 2026-10-15 from an independent download and its sigstore bundle verified with cosign
-      # against the registry's own release workflow identity
-      # (https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/v1.8.1,
-      # issuer token.actions.githubusercontent.com); DECISIONS.md #12 records it.
+      # 2026-10-15 from an independent download, and the archive's sigstore bundle verified with
+      # `cosign verify-blob --certificate-identity
+      # https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/v1.8.1
+      # --certificate-oidc-issuer https://token.actions.githubusercontent.com` (exact identity,
+      # not a pattern); DECISIONS.md #12 records it.
       - name: Install mcp-publisher (pinned, SHA256-verified)
         run: |
           version="1.8.1"
           archive="mcp-publisher_linux_amd64.tar.gz"
           expected_sha256="a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
           url="https://github.com/modelcontextprotocol/registry/releases/download/v${version}/${archive}"
-          curl --fail --location --proto '=https' --tlsv1.2 "$url" --output "$archive"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 "$url" --output "$archive"
           printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check --strict
           tar --extract --gzip --file "$archive" mcp-publisher
           chmod 0755 mcp-publisher
@@ -156,23 +163,37 @@ jobs:
         run: |
           echo "dry_run: login and validate succeeded for $(jq -r '.name' server.json) ${TAG#v}; nothing published."
           jq '{name, version, package: .packages[0] | {registryType, identifier, version}}' server.json
-      # The registry re-checks PyPI itself, on its own network path, and can still see a 404 for
-      # ~30 s after our poll above succeeded; retry only that known-transient error. Anything else
-      # (a duplicate version - versions are immutable on the registry - or a validation failure)
-      # fails immediately.
+      # The registry re-checks PyPI itself, on its own network path, and can lag our poll above
+      # by ~30 s. Retry only the errors its PyPI validator labels transient (registry source
+      # internal/validators/registries/pypi.go at v1.8.1): "version ... was not found (status:
+      # 404)" (release not yet visible), "Likely transient, retry later" (PyPI 429, 5xx, or an
+      # inconclusive package probe) and "failed to fetch package metadata from PyPI" (PyPI
+      # unreachable). Anything else fails at once - in particular a duplicate version ("invalid
+      # version: cannot publish duplicate version"; registry versions are immutable) and a
+      # validation failure - except that when the entry for this exact version already exists
+      # (a lost success response, or a re-publish dispatched for an already-published tag) the
+      # step reports it and lets the read-back step decide whether the served entry is right.
       - name: Publish server.json to the MCP Registry
         if: ${{ inputs.dry_run != true }}
         run: |
+          name="$(jq -r '.name' server.json)"
+          version="${TAG#v}"
+          encoded="$(jq -rn --arg s "$name" '$s | @uri')"
+          entry_url="https://registry.modelcontextprotocol.io/v0.1/servers/${encoded}/versions/${version}"
           for attempt in $(seq 1 5); do
             if output="$(./mcp-publisher publish 2>&1)"; then
               echo "$output"
               exit 0
             fi
             echo "$output"
-            if ! printf '%s' "$output" | grep -qF "was not found (status: 404)"; then
+            if ! printf '%s' "$output" | grep -qE 'was not found \(status: 404\)|Likely transient, retry later|failed to fetch package metadata from PyPI'; then
+              if curl -sf --max-time 30 "$entry_url" >/dev/null; then
+                echo "${name} ${version} is already published on the registry - the read-back step checks the served entry"
+                exit 0
+              fi
               exit 1
             fi
-            echo "Attempt ${attempt}/5: registry has not yet seen this PyPI release, waiting 30s..."
+            echo "Attempt ${attempt}/5: registry has not yet confirmed this PyPI release, waiting 30s..."
             sleep 30
           done
           echo "mcp-publisher publish still failing after 5 attempts"
@@ -185,13 +206,19 @@ jobs:
           name="$(jq -r '.name' server.json)"
           version="${TAG#v}"
           encoded="$(jq -rn --arg s "$name" '$s | @uri')"
+          body=""
           for i in $(seq 1 10); do
-            if body="$(curl -sf "https://registry.modelcontextprotocol.io/v0.1/servers/${encoded}/versions/${version}")"; then
+            if body="$(curl -sf --max-time 30 "https://registry.modelcontextprotocol.io/v0.1/servers/${encoded}/versions/${version}")"; then
               break
             fi
             echo "Attempt ${i}/10: entry not readable yet - sleeping 15s"
             sleep 15
           done
+          if [ -z "$body" ]; then
+            echo "Registry entry for ${name} ${version} was not readable after 10 attempts"
+            exit 1
+          fi
+          printf '%s' "$body" | jq '{name: (.server // .).name, version: (.server // .).version, package: (.server // .).packages[0], meta: ._meta}'
           printf '%s' "$body" | jq -e --arg v "$version" --arg id "$(jq -r '.packages[0].identifier' server.json)" \
-            '(.server // .) as $s | $s.version == $v and $s.packages[0].registryType == "pypi" and $s.packages[0].identifier == $id and $s.packages[0].version == $v'
-          printf '%s' "$body" | jq '{name: (.server // .).name, version: (.server // .).version, meta: ._meta}'
+            '(.server // .) as $s | $s.version == $v and $s.packages[0].registryType == "pypi" and $s.packages[0].identifier == $id and $s.packages[0].version == $v' >/dev/null
+          echo "Registry serves ${name} ${version} with package record pypi/$(jq -r '.packages[0].identifier' server.json)/${version}"

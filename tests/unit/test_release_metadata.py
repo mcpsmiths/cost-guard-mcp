@@ -781,15 +781,28 @@ def test_release_workflow_publishes_the_listing_after_pypi_with_minimal_permissi
 def test_registry_workflow_job_is_environment_gated_and_oidc_only():
     # Decision #8's blast-radius split, applied to the second publisher: its own environment
     # (never `pypi`), exactly contents: read + id-token: write, and no stored registry token.
-    text = _registry_workflow_text()
     job = _registry_job()
     stripped = [line.strip() for line in job]
     assert "environment: mcp-registry" in stripped
     assert "environment: pypi" not in stripped
     assert sorted(_granted_permissions(job)) == ["contents: read", "id-token: write"]
-    assert "login github-oidc" in text
-    assert "login github --token" not in text
-    assert "secrets." not in text
+    # Pin the step, not the file: the header comment also quotes the login command, so a
+    # whole-text substring check would pass with the step deleted.
+    login_step = _named_step(job, "Log in to the MCP Registry (GitHub OIDC)")
+    assert [line.strip() for line in login_step if line.strip().startswith("run:")] == [
+        "run: ./mcp-publisher login github-oidc"
+    ]
+    code = "\n".join(line for line in job if line.strip() and not line.strip().startswith("#"))
+    assert re.findall(r"mcp-publisher login (\S+)", code) == ["github-oidc"]
+    # No `secrets` context in any syntax (`secrets.X`, `secrets['X']`, `toJSON(secrets)`), and
+    # the caller passes none (`secrets: inherit`): the job needs no stored credential at all.
+    assert not re.search(r"\bsecrets\b", code)
+    caller = _job_block(RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8"), "registry-publish")
+    assert not any(line.strip().startswith("secrets:") for line in caller)
+    assert any(line.strip().startswith("timeout-minutes:") for line in job), (
+        "publish-listing has no timeout-minutes: a stalled connection would hold the runner "
+        "and the registry token for GitHub's six-hour default"
+    )
 
 
 def test_registry_workflow_checks_out_the_tag_without_credentials():
@@ -917,3 +930,81 @@ def test_registry_workflow_refuses_an_off_main_tag_and_a_checkout_of_another_tag
 
     admitted = _run_step_script(script, cwd=runner, env={**env, "TAG": "v1.0.0"}, scratch=tmp_path)
     assert admitted.returncode == 0, admitted.stdout + admitted.stderr
+
+
+_REGISTRY_TRANSIENT_ERRORS = [
+    # internal/validators/registries/pypi.go at registry v1.8.1, the four shapes it labels
+    # transient (release not yet visible; PyPI 429; PyPI 5xx; inconclusive package probe) plus
+    # the PyPI-unreachable wrap.
+    (
+        "PyPI package 'cost-guard-mcp' exists, but version '9.9.9' was not found (status: 404). "
+        "A newly published release can take a moment to appear on PyPI."
+    ),
+    (
+        "PyPI rate-limited the metadata request for package 'cost-guard-mcp' (status: 429). "
+        "Likely transient, retry later"
+    ),
+    (
+        "PyPI upstream error fetching metadata for package 'cost-guard-mcp' (status: 503). "
+        "Likely transient, retry later"
+    ),
+    (
+        "PyPI could not confirm package 'cost-guard-mcp' version '9.9.9' (version status: 404, "
+        "package check inconclusive). Likely transient, retry later"
+    ),
+    "failed to fetch package metadata from PyPI: dial tcp: i/o timeout",
+]
+_REGISTRY_FINAL_ERRORS = [
+    "invalid version: cannot publish duplicate version",  # internal/database/database.go
+    (
+        "PyPI package 'cost-guard-mcp' ownership validation failed. The server name "
+        "'io.github.mcpsmiths/cost-guard-mcp' must appear as 'mcp-name: ...' in the package README"
+    ),
+    "PyPI package 'someone-elses-package' not found (status: 404)",
+    "registry validation failed for package 0 (pypi): version string must be unique",
+]
+
+
+def _publish_retry_pattern() -> str:
+    script = _registry_step_script("Publish server.json to the MCP Registry")
+    match = re.search(r"grep -qE '([^']+)'", script)
+    assert match, "publish step has no `grep -qE '<pattern>'` transient-error filter"
+    return match.group(1)
+
+
+def test_registry_publish_retries_only_the_registrys_transient_pypi_errors():
+    # The retry loop exists to absorb the registry's own PyPI lag; it must match every shape
+    # the registry labels transient and none of the final errors - a duplicate version above
+    # all, since registry versions are immutable and a retry there would only waste minutes.
+    pattern = re.compile(_publish_retry_pattern())
+    for message in _REGISTRY_TRANSIENT_ERRORS:
+        assert pattern.search(message), (
+            f"transient registry error would not be retried: {message!r}"
+        )
+    for message in _REGISTRY_FINAL_ERRORS:
+        assert not pattern.search(message), f"final registry error would be retried: {message!r}"
+
+
+@pytest.mark.parametrize(
+    ("tag", "expected_exit"),
+    [
+        pytest.param("v1.2.3", 0, id="release_tag"),
+        pytest.param("v10.0.12", 0, id="multi_digit"),
+        pytest.param("1.2.3", 1, id="missing_v"),
+        pytest.param("v1.2", 1, id="two_components"),
+        pytest.param("v1.2.3-rc1", 1, id="prerelease_not_a_release_tag"),
+        pytest.param("v1.2.3; echo pwned", 1, id="shell_metacharacters"),
+        pytest.param("refs/tags/v1.2.3", 1, id="fully_qualified_ref"),
+        pytest.param("", 1, id="empty"),
+    ],
+)
+def test_registry_tag_input_validation(tmp_path, tag, expected_exit):
+    # The input is operator-typed on the workflow_dispatch path and flows into the checkout
+    # ref, git rev-parse, the PyPI URL and the registry URL; this step is its only guard.
+    completed = _run_step_script(
+        _registry_step_script("Validate the tag input"),
+        cwd=tmp_path,
+        env={"PATH": os.environ["PATH"], "TAG": tag},
+        scratch=tmp_path,
+    )
+    assert completed.returncode == expected_exit, completed.stdout + completed.stderr
