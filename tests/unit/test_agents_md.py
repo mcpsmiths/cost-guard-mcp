@@ -57,5 +57,11 @@ def test_agents_md_overview_counts_and_names_every_registered_tool():
     assert sorted(decorated) == registered  # the static count is the served tool set
 
     phrase = _overview_tools_phrase()
-    assert _NUMBER_WORDS[phrase.group(1)] == len(decorated), phrase.group(0)
+    count_word = phrase.group(1)
+    counted = _NUMBER_WORDS.get(count_word)
+    assert counted is not None, (
+        f"AGENTS.md says {count_word!r} tools; spell the count as a word, one of "
+        f"{', '.join(_NUMBER_WORDS)} (in: {phrase.group(0)})"
+    )
+    assert counted == len(decorated), phrase.group(0)
     assert sorted(re.findall(r"`(\w+)`", phrase.group(2))) == registered, phrase.group(0)
