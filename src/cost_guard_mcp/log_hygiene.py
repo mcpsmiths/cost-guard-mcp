@@ -110,8 +110,11 @@ class RedactingLogFilter(logging.Filter):
 
 def configure_log_hygiene() -> None:
     """Pin the third-party loggers to WARNING and add the redacting filter to every root
-    handler. Idempotent; call once from ``server.main()`` after the SDK has installed its
-    handler (it does so when ``MCPServer`` is constructed, at import) and before ``mcp.run()``.
+    handler. Idempotent; ``server.py`` calls it at module scope directly after constructing
+    ``MCPServer`` - the SDK installs its handler in that constructor, and no library record can
+    be emitted before a tool body runs - so every launch path that imports the module (the
+    console script, ``mcp run``/``mcp dev``, a host importing ``server.mcp``, in-process
+    ``Client(mcp)`` tests) is covered, not only ``main()``.
 
     ``logging.getLogger(name)`` returns the same singleton the library itself holds, whether
     or not the library has been imported yet, so the pins do not depend on import order.

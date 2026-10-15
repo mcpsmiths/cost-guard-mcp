@@ -10,9 +10,10 @@ both after each test so nothing here leaks into the rest of the session.
 """
 
 import io
+import json
 import logging
+import subprocess
 import sys
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -333,15 +334,41 @@ def test_redacting_filter_withholds_the_whole_record_when_the_traceback_cannot_b
     assert record.stack_info is None
 
 
-def test_main_configures_log_hygiene_before_running_the_server():
-    from cost_guard_mcp import server
+_IMPORT_PROBE = """
+import json
+import logging
 
-    order = MagicMock()
-    with (
-        patch.object(server, "configure_log_hygiene", order.hygiene),
-        patch.object(server, "_bootstrap_opentelemetry", order.otel),
-        patch.object(server, "mcp", order.mcp),
-    ):
-        server.main()
+import cost_guard_mcp.server  # noqa: F401 - the import is the act under test
 
-    assert [call[0] for call in order.mock_calls] == ["hygiene", "otel", "mcp.run"]
+from cost_guard_mcp.log_hygiene import THIRD_PARTY_LOGGERS, RedactingLogFilter
+
+root = logging.getLogger()
+print(json.dumps({
+    "levels": {name: logging.getLogger(name).level for name in THIRD_PARTY_LOGGERS},
+    "project_level": logging.getLogger("cost_guard_mcp").level,
+    "root_handlers": [
+        [type(handler).__name__, sum(isinstance(f, RedactingLogFilter) for f in handler.filters)]
+        for handler in root.handlers
+    ],
+}))
+"""
+
+
+def test_importing_server_pins_the_loggers_and_filters_the_sdk_root_handler():
+    # Importing the module - not calling main() - must be enough: `mcp run
+    # cost_guard_mcp.server:mcp`, a host importing `server.mcp`, and in-process Client(mcp)
+    # tests never go through main(). A fresh interpreter, because this process's root handlers
+    # are pytest's, not the one the SDK's basicConfig installs.
+    completed = subprocess.run(  # noqa: S603 - fixed argv, this file's own probe text
+        [sys.executable, "-c", _IMPORT_PROBE],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+    )
+    state = json.loads(completed.stdout)
+
+    assert state["levels"] == {name: logging.WARNING for name in THIRD_PARTY_LOGGERS}
+    assert state["project_level"] == logging.NOTSET
+    # The SDK's one stderr StreamHandler, carrying exactly one redacting filter.
+    assert state["root_handlers"] == [["StreamHandler", 1]]
