@@ -75,6 +75,48 @@ def test_refuses_fail_closed_when_cost_cap_requested_but_estimate_unavailable(mo
 
 
 @patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_no_dollar_estimate_hint_names_the_bigquery_shapes_only_for_bigquery(mock_estimate):
+    # The engine-agnostic sentence must not tell a Snowflake/Databricks caller about BigQuery
+    # dry runs; the BigQuery shapes and the max_bytes_billed remedy live in the BigQuery branch
+    # (#96 fix-up review).
+    mock_estimate.return_value = _estimate(cost=None)
+
+    snowflake = run_query_bounded("snowflake", "SELECT * FROM t", max_estimated_cost_usd=1.00)
+    bigquery = run_query_bounded("bigquery", "SELECT * FROM t", max_estimated_cost_usd=1.00)
+
+    assert snowflake.status == "refused" and bigquery.status == "refused"
+    assert snowflake.hint is not None and bigquery.hint is not None
+    assert "caveats say why" in snowflake.hint
+    assert "BigQuery" not in snowflake.hint and "LOWER_BOUND" not in snowflake.hint
+    assert "row-level security" in bigquery.hint and "LOWER_BOUND" in bigquery.hint
+    assert "max_bytes_billed" in bigquery.hint and "maximumBytesBilled" in bigquery.hint
+
+
+@pytest.mark.parametrize("engine", ["bigquery", "snowflake"])
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.snowflake_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_infinite_cost_cap_with_no_dollar_estimate_is_still_a_requested_cap_and_refuses(
+    mock_estimate, mock_snowflake_execute, mock_bigquery_execute, engine
+):
+    # +inf compares as "no dollar cap" against any dollar figure and derives no server-side
+    # byte cap (DECISIONS.md #16), but the parameter was given: with no dollar figure to compare
+    # the fail-closed branch refuses as for any other dollar cap (#5). Base already did this for
+    # a capacity-billed project; #96 widened the set of estimates without a dollar figure, and
+    # the #96 fix-up review found the README/#16 sentinel wording overstated - pinned here and
+    # documented in #22 (owner may still choose to make +inf skip this branch).
+    mock_estimate.return_value = _estimate(cost=None, bytes_=0)
+
+    result = run_query_bounded(engine, "SELECT * FROM t", max_estimated_cost_usd=float("inf"))
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.COST_CAP_EXCEEDED
+    assert result.executed is False
+    mock_snowflake_execute.assert_not_called()
+    mock_bigquery_execute.assert_not_called()
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
 def test_refuses_fail_closed_when_byte_cap_requested_but_estimate_unavailable(mock_estimate):
     mock_estimate.return_value = _estimate(bytes_=None)
     result = run_query_bounded("bigquery", "SELECT * FROM t", max_bytes_billed=1_000_000)

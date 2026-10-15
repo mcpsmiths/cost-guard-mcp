@@ -130,17 +130,24 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
     # references at least one table - now keeps the reported 0 bytes, is tagged HEURISTIC (the
     # hidden figure is no estimate of the bytes the query would read) and carries no dollar
     # figure, so the dollar gate refuses. A statement that references no table (SELECT 1)
-    # legitimately processes 0 bytes and is left alone.
+    # legitimately processes 0 bytes and is left alone. Accepted false positives, in the safe
+    # direction (DECISIONS.md #22): the two fields read here cannot tell the RLS shape from a
+    # 0-byte dry run that is genuinely free - an unfiltered COUNT(*) BigQuery answers from table
+    # metadata, an empty table, a partition filter that prunes every partition - so those are
+    # treated the same way (a dollar cap refuses; max_bytes_billed runs them), and the caveat
+    # states the shape and lists the known causes instead of asserting row-level security.
     if total_bytes_processed == 0 and query_job.referenced_tables:
         has_priceable_bytes = False
         tier = AccuracyTier.HEURISTIC
         caveats.append(
-            "BigQuery dry runs always report 0 bytes processed for tables protected by "
-            "row-level security, by design, to prevent a side-channel — this dry run reported "
-            "0 bytes on a statement that references a table, so the $0.00 it implies must not "
-            "be trusted as proof the query is free to run: no dollar figure is returned "
-            "(estimated_cost_usd is null) and a max_estimated_cost_usd cap refuses. "
-            f"{USE_BYTE_CAP_INSTEAD}"
+            "This dry run reported 0 bytes processed on a statement that references a table — "
+            "the shape BigQuery produces by design for tables protected by row-level security "
+            "(dry runs always report 0 bytes there, to prevent a side-channel), and also for "
+            "statements it answers from table metadata, such as an unfiltered COUNT(*), or over "
+            "no data (an empty table, a partition filter that prunes every partition) — so the "
+            "$0.00 it implies must not be trusted as proof the query is free to run: no dollar "
+            "figure is returned (estimated_cost_usd is null) and a max_estimated_cost_usd cap "
+            f"refuses. {USE_BYTE_CAP_INSTEAD}"
         )
 
     if references_remote_billing(sql):
@@ -157,11 +164,15 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
         caveats.append(
             "BigQuery did not report a location for this dry-run job, so the billing-model "
             "check used the US multi-region; a reservation assignment in another location "
-            "would not have been seen and this on-demand dollar figure would then be wrong."
+            "would not have been seen, and any on-demand dollar figure in this estimate rests "
+            "on that assumption."
         )
     capacity_billed: bool | None
     try:
-        capacity_billed = is_capacity_billed(client.project, location)
+        # Coerced: the function returns any(...) today, but the logged outcome and the pricing
+        # decision below must agree for whatever truthy/falsy value a patched or changed
+        # implementation returns, instead of a lookup failure failing the whole dry run.
+        capacity_billed = bool(is_capacity_billed(client.project, location))
     except SanitizedEngineError:
         capacity_billed = None
         caveats.append(
@@ -169,7 +180,12 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
             f"location {present_remote_text(location)}) - returning a byte estimate only, no "
             "dollar figure, to avoid reporting a possibly-wrong-billing-model dollar amount."
         )
-    outcome = {None: "check_failed", True: "capacity_billed", False: "on_demand"}[capacity_billed]
+    if capacity_billed is None:
+        outcome = "check_failed"
+    elif capacity_billed:
+        outcome = "capacity_billed"
+    else:
+        outcome = "on_demand"
     _log_billing_model_check(location, location_source, outcome)
     if capacity_billed:
         caveats.append(

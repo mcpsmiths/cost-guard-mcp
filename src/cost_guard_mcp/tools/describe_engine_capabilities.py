@@ -20,7 +20,9 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "(by design, to prevent a side-channel): 0 bytes on a statement that references "
                 "a table yields no dollar figure (HEURISTIC), so a max_estimated_cost_usd cap "
                 "refuses - bound such runs with max_bytes_billed, which BigQuery enforces "
-                "server-side as maximumBytesBilled."
+                "server-side as maximumBytesBilled. Genuinely free 0-byte dry runs share the "
+                "shape and the outcome: an unfiltered COUNT(*) answered from table metadata, an "
+                "empty table, a partition filter that prunes every partition."
             ),
             (
                 "Projects on BigQuery Editions/capacity billing get a byte estimate only, no "

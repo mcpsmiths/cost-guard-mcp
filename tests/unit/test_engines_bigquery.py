@@ -331,6 +331,69 @@ def test_dry_run_no_rls_caveat_when_zero_bytes_and_no_tables_referenced(
     assert not any("row-level security" in c.lower() for c in estimate.caveats)
 
 
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_zero_byte_aggregate_answered_from_metadata_is_treated_as_the_rls_shape(
+    mock_bq_module, _mock_capacity
+):
+    # Documented, accepted false positive (#96 fix-up review; DECISIONS.md #22): BigQuery
+    # answers an unfiltered COUNT(*) from table metadata, and a dry run over an empty table or
+    # a partition filter that prunes every partition also reports 0 bytes with the table in
+    # referencedTables. The two fields dry_run reads cannot tell these from a row-level-
+    # security-protected table, so they share the shape and the outcome - no dollar figure,
+    # HEURISTIC, a dollar cap refuses, max_bytes_billed runs them - and the caveat states the
+    # shape and lists the known causes instead of asserting row-level security.
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(
+        total_bytes_processed=0, accuracy="PRECISE", referenced_tables=[MagicMock()]
+    )
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT COUNT(*) FROM t")
+
+    assert estimate.accuracy_tier == AccuracyTier.HEURISTIC
+    assert estimate.estimated_bytes == 0
+    assert estimate.estimated_cost_usd is None
+    [caveat] = [c for c in estimate.caveats if "references a table" in c]
+    assert caveat.startswith("This dry run reported 0 bytes")
+    assert "row-level security" in caveat
+    assert "COUNT(*)" in caveat and "empty table" in caveat and "partition" in caveat
+    assert "must not be trusted" in caveat
+    assert "max_bytes_billed" in caveat and "maximumBytesBilled" in caveat
+
+
+@pytest.mark.parametrize(
+    ("capacity_result", "expected_outcome", "expect_dollar_figure"),
+    [(1, "capacity_billed", False), (0, "on_demand", True)],
+    ids=["truthy_non_bool", "falsy_non_bool"],
+)
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed")
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_coerces_a_non_bool_billing_model_result(
+    mock_bq_module, mock_capacity, capacity_result, expected_outcome, expect_dollar_figure, caplog
+):
+    # is_capacity_billed returns any(...) today, a bool. A patched or changed implementation
+    # returning a truthy/falsy non-bool must degrade to the matching outcome (and the pricing
+    # decision must agree with the logged outcome), not fail the whole dry run with a KeyError
+    # (#96 fix-up review).
+    mock_capacity.return_value = capacity_result
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(total_bytes_processed=500, accuracy="PRECISE")
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    with caplog.at_level(logging.INFO, logger=_ENGINE_LOGGER_NAME):
+        estimate = dry_run("SELECT * FROM t")
+
+    assert (estimate.estimated_cost_usd is not None) is expect_dollar_figure
+    assert any("capacity" in c.lower() for c in estimate.caveats) is not expect_dollar_figure
+    [record] = [r for r in caplog.records if "billing_model_check" in r.message]
+    assert f"outcome={expected_outcome}" in record.message
+
+
 # --- #96: the billing-model check is made for the dry-run job's own location ----------------
 
 
@@ -389,6 +452,28 @@ def test_dry_run_falls_back_to_us_only_when_the_job_reports_no_location(
     [record] = [r for r in caplog.records if "billing_model_check" in r.message]
     assert "location='US'" in record.message
     assert "location_source=fallback" in record.message
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=True)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_dry_run_fallback_caveat_does_not_presume_a_dollar_figure(mock_bq_module, _mock_capacity):
+    # The fallback caveat is appended before the billing-model check and whatever its outcome,
+    # so it must read correctly next to "no dollar figure" (capacity-billed here, and likewise
+    # a failed check, the RLS shape or LOWER_BOUND) - #96 fix-up review.
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = _mock_query_job(
+        total_bytes_processed=500, accuracy="PRECISE", location=None
+    )
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    estimate = dry_run("SELECT * FROM t")
+
+    assert estimate.estimated_cost_usd is None
+    [caveat] = [c for c in estimate.caveats if "did not report a location" in c]
+    assert "would then be wrong" not in caveat
+    assert "any on-demand dollar figure" in caveat and "rests on that assumption" in caveat
 
 
 @patch("cost_guard_mcp.engines.bigquery.bigquery_reservation_v1")
