@@ -34,8 +34,9 @@ stringification) the tool still refuses rather than returning a silently truncat
 
 The wire response the MCP SDK builds from these rows is larger than the measurement: it
 renders the rows twice - compact in ``structuredContent`` and ``indent=2`` in a text block that
-is JSON-string-escaped again inside the JSON-RPC frame - so the frame is roughly 2x to 3.5x
-``total_bytes`` (narrow rows are the worst case).
+is JSON-string-escaped again inside the JSON-RPC frame - so the frame is 2x to 4x
+``total_bytes`` (measured 2.0x on ~8 KB rows and 3.8x on narrow seven-column rows; one-column
+integer rows approach 5x), i.e. an 8 MiB result leaves the process as roughly 17-32 MiB.
 """
 
 import json

@@ -1028,8 +1028,9 @@ cap. The `tools/list` diff is exactly: `+ "result_size_exceeded"` in
 `["status", "executed"]`, and the description text; the inputSchema and the other three tools are
 byte-identical. The wire response is not the measured size: the SDK renders the rows twice -
 compact in `structuredContent` and `indent=2` in a text block that is JSON-string-escaped again in
-the frame - so the frame is 2x-3.5x `total_bytes` (narrow rows are the worst case; an 8 MiB result
-leaves the process as ~20-28 MiB). The bounds above are in serialised bytes: what an engine holds
+the frame - so the frame is 2x-4x `total_bytes` (measured 2.0x on ~8 KB rows, 3.8x on narrow
+seven-column rows; one-column integer rows approach 5x): an 8 MiB result leaves the process as
+roughly 17-32 MiB. The bounds above are in serialised bytes: what an engine holds
 before the stop fires is at most ~6x the cap in JSON terms (the control-character worst case) plus
 one driver page (BigQuery REST pages <= ~10 MB and `maxResults=500`; Snowflake lazily downloaded
 chunks; Databricks `FetchResults(max_rows=500, max_bytes=100 MB)`). Process memory is another
