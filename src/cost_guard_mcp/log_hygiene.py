@@ -46,10 +46,14 @@ THIRD_PARTY_LOGGERS: Final[tuple[str, ...]] = (
     # HTTP stack under google-auth/requests and databricks-sql: connection and retry lines
     # that quote the URL.
     "urllib3",
-    # HTTP stack under the mcp SDK and databricks-sdk: logs every request line
-    # ("HTTP Request: GET https://...") at INFO, URL query string included.
+    # Not pulled in by this project's dependencies: the mcp SDK (2.3.0) depends on httpx2,
+    # whose request line ("HTTP Request: GET https://...") logs under the logger name
+    # "httpx2" (httpx2/_client.py), and databricks-sdk uses requests over urllib3. Kept as a
+    # guard for a future transitive dependency that brings httpx in: pinning a logger no
+    # library writes to costs nothing. Whether to add "httpx2"/"httpcore2" is the owner's call.
     "httpx",
-    # httpx's transport: connection-level trace lines.
+    # httpx's transport (connection-level trace lines); same standing as httpx - a guard, not a
+    # current dependency (the SDK's transport logs under "httpcore2.*").
     "httpcore",
 )
 
