@@ -45,6 +45,16 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 - `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START` and `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME`,
   documented in `server.json`, `.mcp.json.example` and the README (Setup, Known limitations).
 
+### Changed
+
+- Release process: the MCP Registry listing `io.github.mcpsmiths/cost-guard-mcp` is published by
+  `release.yml` from the tagged commit, after PyPI has the version, through the new `mcp-registry`
+  environment and GitHub OIDC with a pinned, SHA256-verified `mcp-publisher` (reusable workflow
+  `mcp-registry-publish.yml`; its `workflow_dispatch` dry run proves the registry grant without
+  publishing, and its re-publish path replaces the personal-token procedure). `DECISIONS.md` #12
+  is decided; the hosted release controls - the `v*` tag ruleset, the environment deployment
+  policies and the PyPI publisher binding - are recorded under #10 (#98, #99). No runtime change.
+
 ### Fixed
 
 - Single-statement scanner: a line comment followed by a quote, backtick, `$$` or `/*` right

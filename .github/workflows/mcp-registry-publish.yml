@@ -1,0 +1,225 @@
+# .github/workflows/mcp-registry-publish.yml
+#
+# Publishes server.json to the official MCP Registry (registry.modelcontextprotocol.io)
+# as io.github.mcpsmiths/cost-guard-mcp, from the tagged release commit, through GitHub
+# OIDC - no stored token. DECISIONS.md #12: the listing is produced by the same chain
+# that gates PyPI (tag -> release.yml -> environment), after PyPI has the version.
+#
+# Called by release.yml (job `registry-publish`, needs: publish) with the pushed tag. The
+# workflow_dispatch path re-publishes a tag's server.json (the break-glass path; it
+# replaces the personal-token procedure) or, with dry_run - the default - stops after
+# `mcp-publisher login github-oidc` and `validate`, so the registry's namespace grant can
+# be proven for this repository without publishing anything.
+#
+# Environment: `mcp-registry`, separate from `pypi` so an OIDC token minted here can never
+# satisfy PyPI's environment claim (decision #8's blast-radius split). Its deployment-branch
+# policy admits tags `v*` (the workflow_call path - evaluated against the caller's ref,
+# the pushed tag) and `main` (a workflow_dispatch is admitted only when dispatched from
+# main, so it runs main's copy of this file; a dispatch from any other ref is
+# refused before the first step; the checkout below is pinned to the tag regardless). The
+# registry's github-oidc grant for
+# io.github.mcpsmiths/* (the OIDC token's repository_owner claim; registry source
+# internal/api/handlers/v0/auth/github_oidc.go, buildPermissions) is repository-scoped, not
+# ref-scoped, so the environment gate, the tag-pinned checkout and the two verification
+# steps are what keep the published entry equal to the reviewed tag's server.json.
+name: mcp-registry-publish
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z) whose server.json is published
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag (vX.Y.Z) whose server.json is (re-)published
+        required: true
+        type: string
+      dry_run:
+        description: Stop after login and validate; publish nothing
+        required: false
+        type: boolean
+        default: true
+permissions:
+  contents: read
+jobs:
+  publish-listing:
+    runs-on: ubuntu-latest
+    # The designed worst case (PyPI poll + publish retries + read-back) is about 20 minutes;
+    # anything longer is a stalled connection, not progress.
+    timeout-minutes: 30
+    environment: mcp-registry
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - name: Validate the tag input
+        run: |
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag input '$TAG' is not a vX.Y.Z release tag"
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # Never a caller-chosen ref: the input names a tag and only that tag is checked out.
+          ref: refs/tags/${{ inputs.tag }}
+          # Full history for the ancestry check below (origin/main's commits, not just the tag's).
+          fetch-depth: 0
+          # Nothing here pushes, and a listing publish must not hold a repository token.
+          persist-credentials: false
+      # Fails closed unless HEAD is the commit behind refs/tags/<tag> and that commit is merged
+      # history on main - the same ancestry gate release.yml's build job applies, with the same
+      # fully qualified refs/remotes/origin/main comparison (a tag literally named `origin/main`
+      # must not shadow the remote-tracking ref; tests/unit/test_release_metadata.py).
+      - name: Verify the checkout is the release tag on main
+        run: |
+          if [ "$(git rev-parse 'HEAD^{commit}')" != "$(git rev-parse "refs/tags/${TAG}^{commit}")" ]; then
+            echo "HEAD is not the commit tagged $TAG - refusing to publish"
+            exit 1
+          fi
+          git fetch --no-tags origin main
+          MAIN_REF=refs/remotes/origin/main
+          if ! git rev-parse --verify --quiet "$MAIN_REF^{commit}" >/dev/null; then
+            echo "$MAIN_REF is not available after fetch - refusing to release"
+            exit 1
+          fi
+          TAGGED_COMMIT="$(git rev-parse 'HEAD^{commit}')"
+          if ! git merge-base --is-ancestor "$TAGGED_COMMIT" "$MAIN_REF"; then
+            echo "Tag $TAG at $TAGGED_COMMIT is not an ancestor of origin/main - release tags must point at reviewed, merged history"
+            exit 1
+          fi
+      # The release gate, verbatim except for where the tag comes from (the input, not the push
+      # ref); tests/unit/test_release_metadata.py holds the two texts in lockstep. server.json is
+      # NOT rewritten here: its version fields are reviewed source, and a mismatch is a refusal,
+      # not something to paper over with a jq sync.
+      - name: Verify tag matches pyproject.toml and server.json (top level and package record)
+        run: |
+          TAG_VERSION="${TAG#v}"
+          PYPROJECT_VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          PYPROJECT_NAME=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['name'])")
+          SERVER_JSON_VERSION=$(python3 -c "import json; print(json.load(open('server.json'))['version'])")
+          PACKAGE_VERSION=$(python3 -c "import json; print(json.load(open('server.json'))['packages'][0]['version'])")
+          PACKAGE_IDENTIFIER=$(python3 -c "import json; print(json.load(open('server.json'))['packages'][0]['identifier'])")
+          PACKAGE_REGISTRY=$(python3 -c "import json; print(json.load(open('server.json'))['packages'][0]['registryType'])")
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ] || [ "$TAG_VERSION" != "$SERVER_JSON_VERSION" ] || [ "$TAG_VERSION" != "$PACKAGE_VERSION" ]; then
+            echo "Version mismatch: tag=$TAG_VERSION pyproject.toml=$PYPROJECT_VERSION server.json=$SERVER_JSON_VERSION server.json packages[0]=$PACKAGE_VERSION"
+            exit 1
+          fi
+          if [ "$PACKAGE_REGISTRY" != "pypi" ] || [ "$PACKAGE_IDENTIFIER" != "$PYPROJECT_NAME" ]; then
+            echo "Package record mismatch: server.json packages[0] is $PACKAGE_REGISTRY/$PACKAGE_IDENTIFIER, expected pypi/$PYPROJECT_NAME"
+            exit 1
+          fi
+      # The registry verifies PyPI ownership at publish time by finding `mcp-name: <name>` in the
+      # PyPI description (README.md:3 carries the marker; test_readme_carries_the_registry_
+      # ownership_marker pins it). Poll until the just-published release serves it, so a CDN lag
+      # cannot fail the publish. Name and identifier come from the server.json the gate above
+      # just verified, so the poll and the published entry can never name different things.
+      - name: Wait for PyPI to serve the release with the ownership marker
+        run: |
+          name="$(jq -r '.name' server.json)"
+          identifier="$(jq -r '.packages[0].identifier' server.json)"
+          version="${TAG#v}"
+          echo "Waiting for PyPI ${identifier} ${version} with marker 'mcp-name: ${name}'"
+          for i in $(seq 1 40); do
+            desc="$(curl -sf --max-time 30 "https://pypi.org/pypi/${identifier}/${version}/json" | jq -r '.info.description' 2>/dev/null || true)"
+            if printf '%s' "$desc" | grep -qF "mcp-name: ${name}"; then
+              echo "Ownership marker present on PyPI ${identifier} ${version}"
+              exit 0
+            fi
+            echo "Attempt ${i}/40: not yet - sleeping 20s"
+            sleep 20
+          done
+          echo "PyPI ${identifier} ${version} with the ownership marker was not found in time"
+          exit 1
+      # Pinned release, not `releases/latest`, and the archive is checked against a digest
+      # recorded here in reviewed source. The 1.8.1 linux_amd64 digest was taken on
+      # 2026-10-15 from an independent download, and the archive's sigstore bundle verified with
+      # `cosign verify-blob --certificate-identity
+      # https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/v1.8.1
+      # --certificate-oidc-issuer https://token.actions.githubusercontent.com` (exact identity,
+      # not a pattern); DECISIONS.md #12 records it.
+      - name: Install mcp-publisher (pinned, SHA256-verified)
+        run: |
+          version="1.8.1"
+          archive="mcp-publisher_linux_amd64.tar.gz"
+          expected_sha256="a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc"
+          url="https://github.com/modelcontextprotocol/registry/releases/download/v${version}/${archive}"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 120 "$url" --output "$archive"
+          printf '%s  %s\n' "$expected_sha256" "$archive" | sha256sum --check --strict
+          tar --extract --gzip --file "$archive" mcp-publisher
+          chmod 0755 mcp-publisher
+          ./mcp-publisher --version
+      # Exchanges this job's OIDC token for a registry token scoped to the repository owner's
+      # namespace (io.github.mcpsmiths/*). Nothing is stored; the token lives for this job.
+      - name: Log in to the MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+      - name: Validate server.json
+        run: ./mcp-publisher validate server.json
+      - name: Dry run - report what would be published
+        if: ${{ inputs.dry_run == true }}
+        run: |
+          echo "dry_run: login and validate succeeded for $(jq -r '.name' server.json) ${TAG#v}; nothing published."
+          jq '{name, version, package: .packages[0] | {registryType, identifier, version}}' server.json
+      # The registry re-checks PyPI itself, on its own network path, and can lag our poll above
+      # by ~30 s. Retry only the errors its PyPI validator labels transient (registry source
+      # internal/validators/registries/pypi.go at v1.8.1): "version ... was not found (status:
+      # 404)" (release not yet visible), "Likely transient, retry later" (PyPI 429, 5xx, or an
+      # inconclusive package probe) and "failed to fetch package metadata from PyPI" (PyPI
+      # unreachable). Anything else fails at once - in particular a duplicate version ("invalid
+      # version: cannot publish duplicate version"; registry versions are immutable) and a
+      # validation failure - except that when the entry for this exact version already exists
+      # (a lost success response, or a re-publish dispatched for an already-published tag) the
+      # step reports it and lets the read-back step decide whether the served entry is right.
+      - name: Publish server.json to the MCP Registry
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          name="$(jq -r '.name' server.json)"
+          version="${TAG#v}"
+          encoded="$(jq -rn --arg s "$name" '$s | @uri')"
+          entry_url="https://registry.modelcontextprotocol.io/v0.1/servers/${encoded}/versions/${version}"
+          for attempt in $(seq 1 5); do
+            if output="$(./mcp-publisher publish 2>&1)"; then
+              echo "$output"
+              exit 0
+            fi
+            echo "$output"
+            if ! printf '%s' "$output" | grep -qE 'was not found \(status: 404\)|Likely transient, retry later|failed to fetch package metadata from PyPI'; then
+              if curl -sf --max-time 30 "$entry_url" >/dev/null; then
+                echo "${name} ${version} is already published on the registry - the read-back step checks the served entry"
+                exit 0
+              fi
+              exit 1
+            fi
+            echo "Attempt ${attempt}/5: registry has not yet confirmed this PyPI release, waiting 30s..."
+            sleep 30
+          done
+          echo "mcp-publisher publish still failing after 5 attempts"
+          exit 1
+      # Read back the entry the registry now serves for this version and check that it names
+      # this PyPI project at the tag's version - the fields a registry consumer installs from -
+      # and that its status is active (a deprecated or deleted entry at this version is a failure).
+      - name: Confirm the published entry
+        if: ${{ inputs.dry_run != true }}
+        run: |
+          name="$(jq -r '.name' server.json)"
+          version="${TAG#v}"
+          encoded="$(jq -rn --arg s "$name" '$s | @uri')"
+          body=""
+          for i in $(seq 1 10); do
+            if body="$(curl -sf --max-time 30 "https://registry.modelcontextprotocol.io/v0.1/servers/${encoded}/versions/${version}")"; then
+              break
+            fi
+            echo "Attempt ${i}/10: entry not readable yet - sleeping 15s"
+            sleep 15
+          done
+          if [ -z "$body" ]; then
+            echo "Registry entry for ${name} ${version} was not readable after 10 attempts"
+            exit 1
+          fi
+          printf '%s' "$body" | jq '{name: (.server // .).name, version: (.server // .).version, package: (.server // .).packages[0], meta: ._meta}'
+          printf '%s' "$body" | jq -e --arg v "$version" --arg id "$(jq -r '.packages[0].identifier' server.json)" \
+            '(.server // .) as $s | $s.version == $v and $s.packages[0].registryType == "pypi" and $s.packages[0].identifier == $id and $s.packages[0].version == $v and ._meta["io.modelcontextprotocol.registry/official"].status == "active"' >/dev/null
+          echo "Registry serves ${name} ${version} (status active) with package record pypi/$(jq -r '.packages[0].identifier' server.json)/${version}"

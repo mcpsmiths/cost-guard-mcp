@@ -51,6 +51,27 @@ required check; failures here don't block PRs, but a real one shouldn't be ignor
 `DECISIONS.md` for why real credentials live in a public repo's CI secrets and what
 scopes them down.
 
+### Releasing
+
+A release is a `v*` tag on reviewed `main` history (`DECISIONS.md` #10). In order:
+
+1. Release PR: bump `pyproject.toml`, both `server.json` version fields and `uv.lock`; move
+   the `CHANGELOG.md` `[Unreleased]` block into `changelog/vX.Y.Z.md` and add the index entry;
+   `tests/unit/test_release_metadata.py` must be green (it pins the version triple, the
+   manifests and both release workflows).
+2. Live gates (owner, real credentials): `gh workflow run integration.yml --ref main` against
+   the merge commit, both jobs green, before tagging (`live-integration` admits `main` only).
+3. Tag the merge commit (`git tag -a vX.Y.Z -m vX.Y.Z <sha> && git push origin vX.Y.Z`). Never
+   push a test `v*` tag: any such push starts the release. `release.yml` then runs `build`
+   (ancestry + version gates) -> `publish` (PyPI, environment `pypi`) -> `github-release` and
+   `registry-publish` (MCP Registry listing, environment `mcp-registry`; `DECISIONS.md` #12).
+4. If `registry-publish` fails, PyPI and the GitHub Release are untouched; fix the cause, then
+   re-publish the same tag with
+   `gh workflow run mcp-registry-publish.yml --ref main -f tag=vX.Y.Z -f dry_run=false`. The
+   same command with `dry_run=true` (the default) stops after the registry login and
+   `validate` without publishing - run it once with the previous tag after any change to the
+   workflow or the `mcp-registry` environment, before the next release tag.
+
 ## Package manager
 
 Use `uv` only. Never `pip install` directly into this project — dependencies go in
