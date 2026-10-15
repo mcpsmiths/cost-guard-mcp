@@ -114,7 +114,7 @@ Whatever MCP client/host you use (Claude Desktop, etc.) spawns this server as it
 uvx cost-guard-mcp
 ```
 
-Also published on the [official MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.mcpsmiths/cost-guard-mcp) as `io.github.mcpsmiths/cost-guard-mcp`.
+Also published on the [official MCP Registry](https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.mcpsmiths/cost-guard-mcp) as `io.github.mcpsmiths/cost-guard-mcp`; the listing is published by `release.yml` from each tagged release, after PyPI has the version (`DECISIONS.md` #12).
 
 For local development instead:
 
@@ -325,7 +325,7 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
   than this estimate. Live-verified 2026-09-18 against a real trial account: its default
   warehouse (`COMPUTE_WH`) is genuinely Gen2 on AWS, and the detection applied the Gen2 rate;
   the `SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution are pinned
-  by `tests/integration/test_snowflake_live.py` (a release gate for 0.4.0). The same row's
+  by `tests/integration/test_snowflake_live.py` (run before each release since 0.4.0). The same row's
   `state` and `auto_resume` columns drive the warehouse-state guard described below.
 - Snowflake's edition is operator configuration (`SNOWFLAKE_EDITION`, default `standard`),
   because the server cannot observe it without ORGADMIN; the per-call `edition` argument can

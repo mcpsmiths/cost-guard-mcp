@@ -211,10 +211,12 @@ audit.
    rejects. `tests/unit/test_release_metadata.py` pins the step's text and runs its script
    against a fixture repository holding an annotated tag off `main`.
 
-`live-integration` (decision #9) deliberately stays unprotected: its triggers are
-`schedule` and `workflow_dispatch`, which run the default branch's own workflow under a
+`live-integration` (decision #9) does not need the policy for its own safety: its triggers
+are `schedule` and `workflow_dispatch`, which run the default branch's own workflow under a
 write-access actor; `release.yml`'s trigger is a tag push by any write principal at any
-commit, which is why `pypi` needs the policy and `live-integration` does not.
+commit, which is why `pypi` needs the policy. Since 2026-10-15 `live-integration` carries a
+`main`-only deployment-branch policy anyway, as free hardening (#98): a `workflow_dispatch`
+from any other ref is refused before the first step.
 
 **Consequences:** A release requires the tagged commit to be merged history on `main` -
 which the PR gate already made true of every release to date, so no release procedure
@@ -224,6 +226,27 @@ row); step 4 alone cannot be the control, because the pusher controls `release.y
 tagged commit, but it turns an unmerged tag into a loud, early failure and records the
 intent in source. Never push a test `v*` tag to try it - any such push starts the release
 workflow.
+
+**Applied (hosted), recorded 2026-10-15 (#98):** read back with `gh api` on 2026-10-15.
+1. Tag ruleset `release-tags` (id 25072354), target `tag`, pattern `refs/tags/v*`,
+   enforcement active, rules: creation, update, deletion and non-fast-forward. Bypass
+   actor: the **Organization admin** role - the deviation from "Repository admin only"
+   above. In an organisation-owned repository the ruleset bypass list is expressed through
+   organisation roles, teams and Apps, not a repository role; the org's only owner is the
+   release maintainer, so the bypass set is the same person the decision names. The 0.4.0
+   tag push logged that bypass, as expected.
+2. `pypi` environment: custom deployment-branch policies with the single tag pattern `v*`
+   and no branch entry; no required reviewers (the write-principal inventory found only
+   the maintainer plus the two bots, neither of which can dispatch or deploy).
+3. PyPI's Trusted Publisher row for `cost-guard-mcp` names workflow `release.yml` and
+   environment `pypi`; the 0.4.0 distributions' PEP 740 provenance (served at
+   `https://pypi.org/integrity/cost-guard-mcp/0.4.0/<file>/provenance`) records that
+   environment in the publisher claim, which is the binding step 3 asked for.
+4. `tests/unit/test_release_metadata.py` pins the in-repo gate (see above) and, since
+   decision #12 landed, the identical gate in `mcp-registry-publish.yml`.
+
+Also applied 2026-10-15: the `mcp-registry` environment (decision #12) with the tag
+pattern `v*` plus `main`, and the `live-integration` `main`-only policy noted above.
 
 ## 11. Build inputs are pinned by reviewed source: `hatchling==1.32.4` and uv 0.12.23
 
@@ -261,11 +284,14 @@ coupling, not a flake. The update path is a quarterly `chore(deps)` that bumps h
 Locking with uv 0.12.23 moved `uv.lock` to lock-file revision 5 (no package, version or hash
 changed); the locally installed uv 0.10.7 reads it unchanged.
 
-## 12. (Proposed) The MCP Registry listing is published from the tagged release, not from a personal host
+## 12. The MCP Registry listing is published from the tagged release, not from a personal host
 
-**Status:** Proposed. The in-repo gate and its tests below are applied; the publishing
-channel itself awaits the maintainer's decision, which depends on a registry fact that has
-to be confirmed first (see Decision, proposed part).
+**Status:** Decided 2026-10-15 (#99), after the 0.4.0 release shipped with the in-repo
+gate below but still a manual listing. The channel is the recommended default: a
+`registry-publish` job in `release.yml` calling the reusable workflow
+`.github/workflows/mcp-registry-publish.yml`. The first listing it publishes is the next
+tag; until then the live listing's latest entry is 0.3.2 (0.3.1, 0.3.3 and 0.4.0 were
+never published to the registry by the manual procedure).
 
 **Context:** Three install channels are advertised: PyPI (`uvx cost-guard-mcp`), the GitHub
 Release, and the official MCP Registry listing `io.github.mcpsmiths/cost-guard-mcp` (live
@@ -291,34 +317,76 @@ control), pins the README marker, and requires every `SNOWFLAKE_`/`DATABRICKS_`/
 `environmentVariables` (and, except for the alternative-credential variables, in
 `.mcp.json.example`), so no operator knob ships undocumented in the listing.
 
-**Decision (proposed - maintainer to finalise):**
-- Recommended: a `registry-publish` job in `release.yml` with `needs: publish`,
-  `environment: mcp-registry` (a new environment, separate from `pypi`, so its OIDC token
-  cannot satisfy PyPI's environment claim - decision #8's blast-radius split, kept),
-  `permissions: {contents: read, id-token: write}`; steps: check out the tag, download a
-  pinned `mcp-publisher` release and verify its sha256, `mcp-publisher login github-oidc`,
-  `mcp-publisher publish` from the checked-out `server.json`. Precondition to confirm first,
-  read-only: that `github-oidc` grants `io.github.mcpsmiths/*` to a workflow in this
-  org-owned repository - the project's own notes record that device-flow granted only
-  `io.github.<user>/*` for this name and that a classic PAT with `read:org` was needed. If
-  it does not, fall back to a dedicated `read:org` classic PAT stored only in the
-  `mcp-registry` environment: still bound to the tagged checkout and environment gating.
-- Alternative: keep manual publishing with a written runbook plus the gate above. Weaker: a
-  personal token, no CI identity, no guarantee that PyPI has the version first.
-- Either way: the commit published is the tagged commit `release.yml` verified; ordering is
-  after PyPI has the version (`needs: publish`); rollback is to publish a corrected version
-  and deprecate the bad one (whether the registry lets a version be overwritten, and its
-  deprecate/delete path, is to be recorded here from the registry docs when deciding);
-  break-glass is a manual `mcp-publisher login github --token <read:org PAT>` from a clean
-  checkout of the tag, documented as the exception, never the routine.
+**Decision (2026-10-15):** `release.yml` gains `registry-publish` (`needs: publish`,
+`permissions: {contents: read, id-token: write}`) which calls
+`mcp-registry-publish.yml`; that workflow's one job runs under the new `mcp-registry`
+environment (separate from `pypi`, so its OIDC token cannot satisfy PyPI's environment
+claim - decision #8's blast-radius split, kept), checks out exactly `refs/tags/<tag>`
+without persisting credentials, refuses a checkout that is not the tagged commit or whose
+commit is not an ancestor of `refs/remotes/origin/main` (the same ancestry gate as decision
+#10's, including the `origin/main`-named-tag case), runs the release version gate verbatim
+against the tag's `pyproject.toml` and `server.json` (`tests/unit/test_release_metadata.py`
+holds the two texts in lockstep), waits until PyPI serves the version with the `mcp-name`
+ownership marker, installs `mcp-publisher` 1.8.1 as a pinned release whose SHA256 is recorded
+in the workflow, authenticates with `mcp-publisher login github-oidc`, validates and
+publishes the checked-out `server.json`, then reads the entry back from the registry API and
+checks the package record. `server.json` is verified, never rewritten in the job: a version
+drift is a refusal, not something a `jq` sync papers over.
 
-**Consequences:** With the recommended default the listing gains a verifiable publisher
-identity and is always produced from the reviewed, tagged commit after PyPI has the version;
-it requires creating the `mcp-registry` GitHub Environment with a `v*` tag deployment
-policy like `pypi`'s (decision #10). Until the decision lands, the manual path remains, but
-the gate guarantees that a listing published from a tagged checkout points at this PyPI
-project at the tag's version. HANDOFF.md's distribution note now points here instead of
-describing the manual run as the procedure.
+Preconditions, answered read-only on 2026-10-15:
+- *Does `github-oidc` grant `io.github.mcpsmiths/*` to a workflow in an org-owned
+  repository?* Yes, in production, in this organisation: `mcpsmiths/tracehub-mcp`'s release
+  run 38609621720 (2026-10-14) published `io.github.mcpsmiths/tracehub-mcp` 0.13.0 through
+  exactly this login from its own reusable workflow. The registry grants the OIDC token's
+  repository-owner namespace; the user-auth rule that only an organisation *Owner* may
+  publish under an org namespace applies to device-flow and PAT logins, which is what the
+  project's earlier notes about `io.github.<user>/*` and `read:org` recorded. For this
+  repository the acceptance test is a `workflow_dispatch` of `mcp-registry-publish.yml`
+  with `tag: v0.4.0`, `dry_run: true`: it must reach `login github-oidc` and `validate`
+  and publish nothing, before the first tag that exercises the job.
+- *Live listing:* `GET /v0.1/servers?search=io.github.mcpsmiths/cost-guard-mcp` lists
+  0.1.0, 0.1.1, 0.2.0, 0.3.0 and 0.3.2; `isLatest` is 0.3.2 (not 0.3.3 as the issue
+  assumed), status `active`, `packages[0]` = `pypi` / `cost-guard-mcp` / `0.3.2`, transport
+  stdio - a stale but correct pointer at this PyPI project.
+- *Validation and overwrite:* the registry verifies PyPI ownership at publish time by the
+  `mcp-name: <name>` string in the PyPI description (README.md:3) and checks that the
+  version exists on PyPI, on its own network path (a fresh upload can still 404 there for
+  about 30 s after PyPI's JSON API serves it - the publish step retries only that error).
+  A version string must be unique and is immutable once published, so nothing is ever
+  overwritten: a wrong entry is corrected by publishing a new version. Lifecycle is a status
+  (`active`, `deprecated`, `deleted`, with an optional message) set with `mcp-publisher
+  status` or `PATCH /v0.1/servers/{name}/versions/{version}/status`, requiring publish or
+  edit permission on the namespace; `deleted` hides the entry from default listings but it
+  stays retrievable with `include_deleted=true`, and metadata is never purged.
+- *Publisher binary:* `mcp-publisher_linux_amd64.tar.gz` of release v1.8.1 (the latest,
+  2026-08-06) was downloaded independently on 2026-10-15; its SHA256 matches the pin in the
+  workflow and the one tracehub-mcp has used in production, and its sigstore bundle verified
+  with `cosign verify-blob` against the certificate identity
+  `https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/v1.8.1`
+  (issuer `https://token.actions.githubusercontent.com`). Moving the pin means repeating
+  that verification and changing both the version and the digest in one reviewed diff.
+
+Break-glass and rollback: a manual re-publish is `workflow_dispatch` of
+`mcp-registry-publish.yml` from `main` with the tag and `dry_run: false` - still CI
+identity, the environment gate and the tag-pinned checkout; the personal-token procedure
+(`mcp-publisher login github --token <read:org PAT>` from a personal host) is retired. A bad
+entry is deprecated or deleted by status and superseded by the next version; it cannot be
+edited in place.
+
+Rejected: keeping manual publishing with a written runbook. Weaker on every axis the
+decision cares about - a personal token, no CI identity, no guarantee that PyPI has the
+version first, and no record that the published `server.json` was the tagged one - and it is
+how 0.3.1, 0.3.3 and 0.4.0 came to be missing from the listing.
+
+**Consequences:** The listing gains a verifiable publisher identity and is always produced
+from the reviewed, tagged commit after PyPI has the version; a failing registry job leaves
+PyPI and the GitHub Release untouched (it runs after `publish`, in parallel with
+`github-release`, and holds no `contents: write`), and is repaired by the dispatch path once
+the cause is fixed. The hosted part - the `mcp-registry` environment with the `v*` tag and
+`main` deployment-branch policies - was applied on 2026-10-15 (recorded under decision
+#10). HANDOFF.md's distribution note points here instead of describing the manual run as the
+procedure; the README's registry sentence names `release.yml` as the publisher.
+
 
 ## 13. The tools accept only read statements by default; result rows are labelled as untrusted data
 
