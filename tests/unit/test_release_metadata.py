@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -632,6 +633,14 @@ def test_server_json_versions_match_pyproject():
     project_version = _pyproject()["project"]["version"]
     assert server_json["version"] == project_version
     assert server_json["packages"][0]["version"] == project_version
+
+
+def test_installed_distribution_version_matches_pyproject():
+    # server.SERVER_VERSION (the initialize handshake's serverInfo.version) is read from the
+    # installed dist-info, so it reports whatever the last `uv sync` wrote. CI syncs fresh and
+    # keeps this true; a stale local venv after a version bump fails here, loudly, instead of
+    # the handshake silently disagreeing with the release being cut.
+    assert importlib.metadata.version("cost-guard-mcp") == _pyproject()["project"]["version"]
 
 
 def test_server_json_package_points_at_this_pypi_project():
