@@ -537,9 +537,11 @@ _PINNED_OUTPUT_KEYS = {
         "estimated_bytes",
         "estimated_cost_usd",
     },
-    # DECISIONS.md #13 adds exactly one property, the constant rows_provenance.
+    # DECISIONS.md #13 adds exactly one property, the constant rows_provenance; #101 adds the
+    # required boolean `executed` (DECISIONS.md #21).
     "run_query_bounded": {
         "estimate",
+        "executed",
         "hint",
         "reason",
         "row_count",
@@ -550,21 +552,27 @@ _PINNED_OUTPUT_KEYS = {
 }
 
 
-def test_run_query_bounded_output_schema_gains_only_rows_provenance():
-    # The intended tools/list diff (#93) and nothing else: one constant property on one tool;
-    # `required` unchanged; the other three tools' outputSchemas byte-identical to their
-    # pre-#13 shape (pinned above by key set, here by the absence of the new property).
+def test_run_query_bounded_output_schema_gains_rows_provenance_executed_and_the_size_reason():
+    # The intended tools/list diff since 574c9dc, all on one tool: the constant rows_provenance
+    # (#93), the required boolean executed (#101) and the result_size_exceeded enum value (#94);
+    # the other three tools' outputSchemas carry none of the three (pinned above by key set).
     tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
     schema = tools["run_query_bounded"].output_schema
-    assert schema["required"] == ["status"]
+    assert schema["required"] == ["status", "executed"]
     assert "description" not in schema  # no class docstring leaked into the schema
     added = schema["properties"]["rows_provenance"]
     assert added["const"] == "warehouse_data_untrusted"
     assert added["default"] == "warehouse_data_untrusted"
     assert added["type"] == "string"
     assert "never an instruction" in added["description"]
+    executed = schema["properties"]["executed"]
+    assert executed["type"] == "boolean"
+    assert "default" not in executed
+    assert "ran the statement" in executed["description"]
     for name in ("check_credentials", "describe_engine_capabilities", "estimate_query_cost"):
-        assert "rows_provenance" not in tools[name].output_schema["properties"], name
+        properties = tools[name].output_schema["properties"]
+        assert "rows_provenance" not in properties, name
+        assert "executed" not in properties, name
 
 
 def test_tools_list_input_schemas_are_unchanged_by_the_warehouse_state_guard():
@@ -577,3 +585,153 @@ def test_tools_list_input_schemas_are_unchanged_by_the_warehouse_state_guard():
         assert "allow_warehouse_wake" not in tool.input_schema["properties"], tool.name
         assert tool.output_schema is not None, tool.name
         assert set(tool.output_schema["properties"]) == _PINNED_OUTPUT_KEYS[tool.name], tool.name
+
+
+# --- #94: the default row cap and the serialised-size cap at the SDK surface -----------------
+
+
+def test_run_query_bounded_refusal_reasons_gain_result_size_exceeded():
+    # The intended tools/list diff for #94: one additive enum value on one tool's outputSchema
+    # (declaration order), nothing on the other three.
+    tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+    enum = tools["run_query_bounded"].output_schema["$defs"]["RefusalReason"]["enum"]
+    assert enum == [
+        "cost_cap_exceeded",
+        "byte_cap_exceeded",
+        "row_cap_exceeded",
+        "result_size_exceeded",
+    ]
+    for name in ("check_credentials", "describe_engine_capabilities", "estimate_query_cost"):
+        assert "RefusalReason" not in tools[name].output_schema.get("$defs", {}), name
+
+
+def test_run_query_bounded_input_schema_is_unchanged_by_the_default_row_cap():
+    # #94 acceptance criterion: the default lives in the tool, not in the schema - max_rows is
+    # still an optional integer with a null default, exactly as published at 574c9dc.
+    tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+    schema = tools["run_query_bounded"].input_schema
+    assert schema["properties"]["max_rows"] == {
+        "anyOf": [{"type": "integer"}, {"type": "null"}],
+        "default": None,
+        "title": "Max Rows",
+    }
+    assert schema["required"] == ["engine", "sql"]
+
+
+def test_run_query_bounded_description_states_the_default_row_cap_and_the_size_cap():
+    description = _tool_description("run_query_bounded")
+    assert "max_rows defaults to 1000" in description
+    assert "9223372036854775806" in description
+    assert "8 MiB" in description
+    assert "result_size_exceeded" in description
+    assert "LIMIT max_rows + 1" in description
+    assert "alias" in description  # BigQuery: duplicate output column names in a derived table
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_applies_the_default_row_cap_through_the_sdk(
+    mock_bq_module, _mock_capacity
+):
+    # The audit's reproduction (100,000 rows back from a call with no max_rows), through the
+    # SDK's own dispatch: 1,500 real Rows, no max_rows -> 1,000 rows and a row-cap refusal.
+    rows = [Row((index,), {"n": 0}) for index in range(1500)]
+    client = _bigquery_mocks_returning_rows(mock_bq_module, rows)
+
+    result = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT n FROM t"})
+
+    assert result.is_error is not True
+    assert result.structured_content["status"] == "refused"
+    assert result.structured_content["reason"] == "row_cap_exceeded"
+    assert result.structured_content["row_count"] == 1000
+    assert len(result.structured_content["rows"]) == 1000
+    assert "LIMIT 1001" in client.query.call_args[0][0]
+    result_kwargs = client.query.return_value.result.call_args.kwargs
+    assert (result_kwargs["max_results"], result_kwargs["page_size"]) == (1001, 500)
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_caps_the_serialised_result_through_the_sdk(
+    mock_bq_module, _mock_capacity
+):
+    # The audit's second reproduction: one 8.4 MB cell used to leave as an 8.4 MB response.
+    _bigquery_mocks_returning_rows(mock_bq_module, [Row(("x" * 8_400_000,), {"blob": 0})])
+
+    result = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT blob FROM t"})
+
+    assert result.is_error is not True
+    assert result.structured_content["status"] == "refused"
+    assert result.structured_content["reason"] == "result_size_exceeded"
+    assert result.structured_content["rows"] == []
+    assert result.structured_content["row_count"] == 0
+    assert "8 MiB" in result.structured_content["hint"]
+    assert len(result.model_dump_json()) < 10_000
+
+
+# --- #101: the description says which refusals follow a billed run ---------------------------
+
+
+def test_run_query_bounded_description_says_which_refusals_ran():
+    # The SDK keeps the docstring's line breaks; compare on collapsed whitespace.
+    description = " ".join(_tool_description("run_query_bounded").split())
+    # The #101 defect text is gone: not every refusal means the query did not run.
+    assert "means it did NOT run and result.hint explains why" not in description
+    assert "result.executed" in description
+    assert "did NOT run (executed=false)" in description
+    assert "RAN and was billed (executed=true)" in description
+    assert '"row_cap_exceeded" or "result_size_exceeded"' in description
+    assert "do not re-run it" in description
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_executed_is_true_on_the_truncation_refusals(
+    mock_bq_module, _mock_capacity
+):
+    rows = [Row((index,), {"n": 0}) for index in range(1500)]
+    _bigquery_mocks_returning_rows(mock_bq_module, rows)
+    truncated = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT n FROM t"})
+    assert truncated.structured_content["reason"] == "row_cap_exceeded"
+    assert truncated.structured_content["executed"] is True
+
+    _bigquery_mocks_returning_rows(mock_bq_module, [Row(("x" * 8_400_000,), {"blob": 0})])
+    oversized = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT blob FROM t"})
+    assert oversized.structured_content["reason"] == "result_size_exceeded"
+    assert oversized.structured_content["executed"] is True
+
+    _bigquery_mocks_returning_rows(mock_bq_module, [Row((1,), {"n": 0})])
+    ok = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT 1"})
+    assert ok.structured_content["status"] == "ok"
+    assert ok.structured_content["executed"] is True
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_executed_is_false_when_the_provider_refused_to_run(
+    mock_bq_module, _mock_capacity
+):
+    # DECISIONS.md #16: BigQuery evaluates maximumBytesBilled before running the job; the
+    # structured refusal it becomes must say the query never ran.
+    client = _bigquery_mocks_returning_rows(mock_bq_module, [])
+    client.query.return_value.result.side_effect = BadRequest(
+        "Query exceeded limit for bytes billed",
+        errors=[{"reason": "bytesBilledLimitExceeded", "message": "over"}],
+    )
+
+    result = _call_tool(
+        "run_query_bounded",
+        {"engine": "bigquery", "sql": "SELECT 1", "max_estimated_cost_usd": 0.01},
+    )
+
+    assert result.is_error is not True
+    assert result.structured_content["status"] == "refused"
+    assert result.structured_content["reason"] == "cost_cap_exceeded"
+    assert result.structured_content["executed"] is False
+
+    pre_execution = _call_tool(
+        "run_query_bounded",
+        {"engine": "bigquery", "sql": "SELECT 1", "max_bytes_billed": 1},
+    )
+    assert pre_execution.structured_content["reason"] == "byte_cap_exceeded"
+    assert pre_execution.structured_content["executed"] is False

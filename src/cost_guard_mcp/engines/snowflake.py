@@ -22,6 +22,7 @@ from cost_guard_mcp.errors import (
 )
 from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
 from cost_guard_mcp.pricing.snowflake_pricing import credits_per_hour, usd_per_credit
+from cost_guard_mcp.result_bounds import collect_rows, iter_fetchmany
 from cost_guard_mcp.sql_scope import single_statement_body
 from cost_guard_mcp.types import (
     AccuracyTier,
@@ -1052,14 +1053,22 @@ def _cancel_query(conn: "snowflake.connector.SnowflakeConnection", query_id: str
 
 @sanitize_exceptions("snowflake")
 def execute_bounded(
-    sql: str, warehouse: str | None, max_rows: int | None
+    sql: str, warehouse: str | None, max_rows: int | None, *, wrap_in_limit: bool = True
 ) -> tuple[list[dict], int, bool]:
+    """Execute `sql` with a row bound and a wall-clock cap covering submission, poll and fetch.
+
+    `wrap_in_limit` (#94): the tool passes whether the text is one SELECT/WITH/VALUES statement
+    and so valid inside `SELECT * FROM (...) LIMIT max_rows + 1`; anything else runs unwrapped
+    and is capped by the paged fetch alone (result_bounds.collect_rows: the sentinel row or the
+    running size estimate). The returned bool is True whenever that fetch stopped before the
+    result was exhausted.
+    """
     # The session deadline matches this function's own watchdog bound, so the warehouse-side
     # query dies on its own even if this process is gone before _cancel_query can run.
     conn = _connect(statement_timeout_seconds=_MAX_EXECUTION_WAIT_SECONDS)
     try:
         wrapped_sql = sql
-        if max_rows is not None:
+        if max_rows is not None and wrap_in_limit:
             # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
             # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
             # untrusted input reaching a query built from a different source. The trailing
@@ -1075,6 +1084,10 @@ def execute_bounded(
             # request as statement_params {'MULTI_STATEMENT_COUNT': 1} - the billable path
             # gets the same server-side single-statement pin as EXPLAIN above.
             cur.execute_async(wrapped_sql, num_statements=_SINGLE_STATEMENT_COUNT)
+            # One wall-clock budget for everything after submission. The poll loop below
+            # counts nominal sleeps (and ignores each status call's latency), so the fetch
+            # phase takes what is left from this monotonic deadline, not from that counter.
+            deadline = time.monotonic() + _MAX_EXECUTION_WAIT_SECONDS
             query_id = cur.sfqid
             if query_id is None:
                 raise SanitizedEngineError("execute_async did not return a query id")
@@ -1106,11 +1119,35 @@ def execute_bounded(
 
             conn.get_query_status_throw_if_error(query_id)
             cur.get_results_from_sfqid(query_id)
-            rows = cur.fetchall()
 
-        row_cap_hit = max_rows is not None and len(rows) > max_rows
-        if row_cap_hit:
-            rows = rows[:max_rows]
+            def _check_fetch_deadline(fetched: int) -> None:
+                # Only before a page request that follows a full page (#94): the connector
+                # issues the RESULT_SCAN lazily inside the first fetchmany, so the first page
+                # is never pre-empted, and a short page means the result is exhausted (fetchmany
+                # loops fetchone until `size` rows or None), so the probe after it is never a
+                # download and a complete result already in hand is never discarded. No
+                # _cancel_query: the query is done, only its download overran; each chunk
+                # download is bounded by the connector's own network timeout.
+                if time.monotonic() < deadline:
+                    return
+                presented_query_id = present_remote_text(str(query_id))
+                logger.warning(
+                    "engine=snowflake execute_bounded result fetch exceeded %ss after %s rows, "
+                    "query_id=%s",
+                    _MAX_EXECUTION_WAIT_SECONDS,
+                    fetched,
+                    presented_query_id,
+                )
+                raise TimeoutError(
+                    f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s while fetching its result "
+                    f"after {fetched} rows (query_id={presented_query_id})."
+                )
+
+            # fetchall used to materialise the whole result here (#94): page it and stop at
+            # the sentinel row or the size estimate instead; DictCursor rows are dicts.
+            rows, row_cap_hit = collect_rows(
+                iter_fetchmany(cur.fetchmany, between_pages=_check_fetch_deadline), max_rows
+            )
 
         return rows, len(rows), row_cap_hit
     finally:

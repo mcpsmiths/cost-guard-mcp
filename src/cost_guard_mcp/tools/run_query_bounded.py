@@ -1,11 +1,6 @@
-import base64
-import datetime
 import logging
 import math
-import uuid
 from collections.abc import Callable
-from dataclasses import dataclass
-from decimal import Decimal
 
 from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines import databricks as databricks_engine
@@ -16,9 +11,18 @@ from cost_guard_mcp.engines.bigquery import (
     cost_cap_to_max_bytes_billed,
 )
 from cost_guard_mcp.errors import UserVisibleError
+from cost_guard_mcp.result_bounds import (
+    DEFAULT_MAX_ROWS,
+    LARGE_MAX_ROWS_WARNING_THRESHOLD,
+    MAX_RESULT_BYTES,
+    row_cap_hint,
+    size_cap_hint,
+    trim_rows_to_byte_cap,
+)
 from cost_guard_mcp.sql_scope import assert_single_statement
-from cost_guard_mcp.sql_scope_keywords import assert_read_statement
+from cost_guard_mcp.sql_scope_keywords import assert_read_statement, is_single_query_statement
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
+from cost_guard_mcp.tools.result_rows import _MAX_CELL_NESTING_DEPTH, _depth_note, _normalise_rows
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
 
 logger = logging.getLogger(__name__)
@@ -40,143 +44,6 @@ def _format_usd(amount: float) -> str:
     if is_rounded_to_zero or abs(amount) >= _FIXED_POINT_USD_LIMIT:
         return f"{amount:.6g}"
     return fixed
-
-
-# Cell types pydantic serialises natively in JSON mode (Decimal -> str, datetime/date/time ->
-# ISO 8601, timedelta -> ISO 8601 duration, UUID -> str); passed through untouched.
-_PYDANTIC_NATIVE_CELL_TYPES = (
-    Decimal,
-    datetime.datetime,
-    datetime.date,
-    datetime.time,
-    datetime.timedelta,
-    uuid.UUID,
-)
-
-
-def _json_safe_text(text: str) -> str:
-    """Return `text` as UTF-8-encodable text, never raising.
-
-    A Python str is not automatically UTF-8: surrogateescape decoding of non-UTF-8 source
-    bytes (which BigQuery can hand back in a STRING cell) leaves lone surrogates such as
-    \\udcff in it, and pydantic_core serialises str through a strict UTF-8 encoder, so one
-    such cell raised PydanticSerializationError inside the SDK's result conversion - after
-    the billed execution and after the success record. backslashreplace turns the surrogate
-    into its six visible characters (\\udcff): honest about what came back, lossless for
-    forensics, and never raising. The fast path is one encode of the all-valid common case.
-    """
-    try:
-        text.encode("utf-8")
-    except UnicodeEncodeError:
-        return text.encode("utf-8", "backslashreplace").decode("utf-8")
-    return text
-
-
-# pydantic_core's serialiser has a fixed recursion guard (~250 levels, counting the
-# CallToolResult/structuredContent/rows/row envelope) and raises "Circular reference detected
-# (depth exceeded)" AFTER the billed execution (issue #105); 64 keeps the whole result an order
-# of magnitude below it while far exceeding any real JSON/STRUCT depth (BigQuery STRUCTs stop
-# at 15). A container at this depth is replaced by the placeholder and counted into `hint`.
-_MAX_CELL_NESTING_DEPTH = 64
-_NESTING_DEPTH_PLACEHOLDER = f"<nested value omitted: deeper than {_MAX_CELL_NESTING_DEPTH} levels>"
-
-
-@dataclass
-class _NormalisationTally:
-    """Per-cell accumulator of what the normaliser had to replace - created afresh for every
-    cell by _normalise_cell, never shared, so counts never leak between cells or calls."""
-
-    depth_capped_containers: int = 0
-
-
-@dataclass(frozen=True)
-class _NormalisedRows:
-    rows: list[dict]
-    depth_capped_cells: int
-
-
-def _json_safe_value(value: object, depth: int, tally: _NormalisationTally) -> object:
-    """Normalise one connector-native cell so the mcp SDK can always serialise it.
-
-    Runs AFTER the billed query has executed, so it must never raise and must cover every
-    engine's native row values: bytes-like cells (BigQuery BYTES, Snowflake/Databricks
-    BINARY) become base64 text instead of tripping pydantic's default utf8 bytes mode;
-    NaN/Inf become explicit strings instead of JSON null; str cells (and every text this
-    function produces from a non-str value) pass through _json_safe_text so a lone surrogate
-    cannot trip pydantic's strict UTF-8 str encoder; driver-specific types pydantic does not
-    know (BigQuery INTERVAL -> dateutil relativedelta) are stringified instead of raising
-    "Unable to serialize unknown type"; a container nested _MAX_CELL_NESTING_DEPTH levels
-    below the cell (`depth` counts container levels from 0 at the cell itself) becomes the
-    constant placeholder so pydantic_core's recursion guard is never reached. Returns new
-    objects, never mutates its input.
-    """
-    if value is None or isinstance(value, bool | int):
-        return value
-    if isinstance(value, str):
-        return _json_safe_text(value)
-    if isinstance(value, float):
-        return value if math.isfinite(value) else str(value)
-    if isinstance(value, bytes | bytearray | memoryview):
-        return base64.b64encode(bytes(value)).decode("ascii")
-    if isinstance(value, dict | list | tuple | set | frozenset):
-        if depth >= _MAX_CELL_NESTING_DEPTH:
-            tally.depth_capped_containers += 1
-            return _json_safe_text(_NESTING_DEPTH_PLACEHOLDER)
-        if isinstance(value, dict):
-            return {
-                _json_safe_text(str(_json_safe_value(key, depth, tally))): _json_safe_value(
-                    item, depth + 1, tally
-                )
-                for key, item in value.items()
-            }
-        return [_json_safe_value(item, depth + 1, tally) for item in value]
-    if isinstance(value, _PYDANTIC_NATIVE_CELL_TYPES):
-        return value
-    return _json_safe_text(str(value))
-
-
-def _normalise_rows(rows: list[dict]) -> _NormalisedRows:
-    """The one choke point for all three engines and both return paths (ok and
-    row_cap_exceeded): every value placed in BoundedQueryResult.rows - column names
-    included - is JSON-serialisable, UTF-8-encodable and nested no deeper than the SDK's
-    serialiser can take, with a count of the cells that had to be capped."""
-    normalised = [
-        {_json_safe_text(str(key)): _normalise_cell(item) for key, item in row.items()}
-        for row in rows
-    ]
-    safe_rows = [{key: safe for key, (safe, _) in row.items()} for row in normalised]
-    depth_capped_cells = sum(capped for row in normalised for _, capped in row.values())
-    return _NormalisedRows(rows=safe_rows, depth_capped_cells=depth_capped_cells)
-
-
-def _normalise_cell(value: object) -> tuple[object, bool]:
-    """One cell normalised, and whether anything inside it was depth-capped. The count the
-    caller reports is of cells, as hint, README and the log field say: a cell with two
-    over-deep branches is one cell to re-project, not two."""
-    tally = _NormalisationTally()
-    return _json_safe_value(value, 0, tally), tally.depth_capped_containers > 0
-
-
-def _json_safe_rows(rows: list[dict]) -> list[dict]:
-    return _normalise_rows(rows).rows
-
-
-def _depth_note(engine: Engine, depth_capped_cells: int) -> str | None:
-    """The row-level caveat for capped cells, carried in `hint` (None when nothing was
-    capped, so every existing caller's output is byte-identical). Logs counts only."""
-    if depth_capped_cells == 0:
-        return None
-    logger.info(
-        "engine=%s run_query_bounded depth_capped_cells=%s max_depth=%s",
-        engine,
-        depth_capped_cells,
-        _MAX_CELL_NESTING_DEPTH,
-    )
-    return (
-        f"{depth_capped_cells} result cell(s) nested deeper than {_MAX_CELL_NESTING_DEPTH} "
-        f"levels were replaced by the placeholder {_NESTING_DEPTH_PLACEHOLDER!r}; project a "
-        "shallower path (a struct field, JSON_EXTRACT / GET_PATH) to read them."
-    )
 
 
 def run_query_bounded(
@@ -205,12 +72,19 @@ def run_query_bounded(
     if max_estimated_cost_usd is not None and math.isnan(max_estimated_cost_usd):
         raise UserVisibleError("max_estimated_cost_usd must be a finite number, not NaN.")
 
+    # #94: omitting max_rows used to mean no row bound at all (the audit's reproduction fetched
+    # 100,000 rows). The documented default is applied here, before the validation, so the
+    # effective value is what gets validated and dispatched; an explicit value is honoured
+    # unchanged, and a larger one (up to the bound below) is the opt-out. Not logged: it is
+    # the documented behaviour, not an event. The inputSchema keeps `max_rows: int | None`.
+    if max_rows is None:
+        max_rows = DEFAULT_MAX_ROWS
     # Validate the remaining bounds before any estimate or execution: max_rows below 1
     # used to reach the provider as `LIMIT 0` / `LIMIT -1` and then be reported as a
     # row-cap refusal after the billed run; a byte cap outside int64 cannot be attached
     # to a BigQuery job and would surface as an opaque provider error instead.
     # The wrapper dispatches LIMIT max_rows + 1, so that literal must fit int64 too.
-    if max_rows is not None and not 1 <= max_rows <= _INT64_MAX - 1:
+    if not 1 <= max_rows <= _INT64_MAX - 1:
         # The upper bound mirrors max_bytes_billed: a LIMIT literal above int64 is dispatched
         # after the estimate ran and only fails at the provider (delta verification).
         raise UserVisibleError(f"max_rows must be between 1 and {_INT64_MAX - 1} (got {max_rows}).")
@@ -218,6 +92,25 @@ def run_query_bounded(
         raise UserVisibleError(
             f"max_bytes_billed must be between 1 and {_INT64_MAX} bytes (got {max_bytes_billed})."
         )
+    # Honoured, but said out loud: the 8 MiB cap bounds the serialised rows, not the Python
+    # objects behind them (~25x the JSON size for narrow rows) nor the normalise + trim pass
+    # over them, both of which happen after the billed execution and outside any watchdog
+    # (DECISIONS.md #21). The default (1000) is far below this, so anything above is explicit.
+    if max_rows > LARGE_MAX_ROWS_WARNING_THRESHOLD:
+        logger.warning(
+            "engine=%s run_query_bounded explicit max_rows=%s exceeds %s: narrow rows at this "
+            "count can hold hundreds of MB and cost seconds of CPU after the billed execution",
+            engine,
+            max_rows,
+            LARGE_MAX_ROWS_WARNING_THRESHOLD,
+        )
+
+    # Whether the engine may enclose the text in `SELECT * FROM (...) AS cost_guard_row_cap
+    # LIMIT max_rows + 1`: only a single SELECT/WITH/VALUES statement is valid as a derived
+    # table. SHOW/DESCRIBE/EXPLAIN, opt-out scripts and WITH ... INSERT run unwrapped and are
+    # capped by the engine's paged fetch instead. Decided once here, with the gates' own lexer,
+    # and passed down so the three engines cannot drift on the rule.
+    wrap_in_limit = is_single_query_statement(sql, engine)
 
     # warehouse_size/edition must reach the cap-check estimate below, not just
     # estimate_query_cost's own public tool - otherwise the cost cap here would always be
@@ -241,6 +134,7 @@ def run_query_bounded(
             )
             return BoundedQueryResult(
                 status="refused",
+                executed=False,
                 reason=RefusalReason.COST_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
@@ -260,6 +154,7 @@ def run_query_bounded(
             )
             return BoundedQueryResult(
                 status="refused",
+                executed=False,
                 reason=RefusalReason.COST_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
@@ -279,6 +174,7 @@ def run_query_bounded(
             )
             return BoundedQueryResult(
                 status="refused",
+                executed=False,
                 reason=RefusalReason.BYTE_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
@@ -297,6 +193,7 @@ def run_query_bounded(
             )
             return BoundedQueryResult(
                 status="refused",
+                executed=False,
                 reason=RefusalReason.BYTE_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
@@ -338,15 +235,18 @@ def run_query_bounded(
     try:
         if engine == "bigquery":
             rows, row_count, row_cap_hit = bigquery_engine.execute_bounded(
-                sql, max_bytes_billed=effective_max_bytes_billed, max_rows=max_rows
+                sql,
+                max_bytes_billed=effective_max_bytes_billed,
+                max_rows=max_rows,
+                wrap_in_limit=wrap_in_limit,
             )
         elif engine == "snowflake":
             rows, row_count, row_cap_hit = snowflake_engine.execute_bounded(
-                sql, warehouse=warehouse, max_rows=max_rows
+                sql, warehouse=warehouse, max_rows=max_rows, wrap_in_limit=wrap_in_limit
             )
         elif engine == "databricks":
             rows, row_count, row_cap_hit = databricks_engine.execute_bounded(
-                sql, warehouse=warehouse, max_rows=max_rows
+                sql, warehouse=warehouse, max_rows=max_rows, wrap_in_limit=wrap_in_limit
             )
         else:
             raise UserVisibleError(f"run_query_bounded: engine '{engine}' is not yet supported.")
@@ -375,8 +275,11 @@ def run_query_bounded(
             if byte_cap_derived_from_cost_cap and max_estimated_cost_usd is not None
             else f"your max_bytes_billed={max_bytes_billed}"
         )
+        # executed=False: BigQuery evaluates maximumBytesBilled before running the job, so the
+        # statement never ran even when a (failed) job id exists - DECISIONS.md #16.
         return BoundedQueryResult(
             status="refused",
+            executed=False,
             reason=reason,
             estimate=estimate,
             hint=(
@@ -396,9 +299,63 @@ def run_query_bounded(
     # Carried in the existing nullable `hint` (None when nothing was capped): a new field
     # would widen the published outputSchema beyond the one property decision #13 adds.
     # `status` is and was the refusal discriminator, never `hint`.
-    depth_note = _depth_note(engine, normalised.depth_capped_cells)
+    depth_note = _depth_note(normalised.depth_capped_cells)
+    if depth_note is not None:
+        logger.info(
+            "engine=%s run_query_bounded depth_capped_cells=%s max_depth=%s",
+            engine,
+            normalised.depth_capped_cells,
+            _MAX_CELL_NESTING_DEPTH,
+        )
+
+    # #94: the exact size measurement, on the normalised rows (what is measured is what is
+    # sent). Checked before the row cap: the row-cap hint says "showing the first N", which
+    # would be false once rows were dropped for size, so the size refusal wins and its hint
+    # names the row cap when that was reached too. The longest prefix of whole rows that fits
+    # is returned - zero rows when the first alone is over the cap.
+    trimmed = trim_rows_to_byte_cap(rows)
+    if trimmed.total_bytes > MAX_RESULT_BYTES:
+        logger.info(
+            "engine=%s run_query_bounded refused reason=%s result_bytes=%s max_result_bytes=%s "
+            "rows_returned=%s rows_fetched=%s row_cap_hit=%s",
+            engine,
+            RefusalReason.RESULT_SIZE_EXCEEDED.value,
+            trimmed.total_bytes,
+            MAX_RESULT_BYTES,
+            len(trimmed.rows),
+            row_count,
+            row_cap_hit,
+        )
+        return BoundedQueryResult(
+            status="refused",
+            executed=True,
+            reason=RefusalReason.RESULT_SIZE_EXCEEDED,
+            estimate=estimate,
+            hint=_with_depth_note(
+                size_cap_hint(
+                    trimmed, fetched_rows=row_count, row_cap_hit=row_cap_hit, max_rows=max_rows
+                ),
+                depth_note,
+            ),
+            rows=trimmed.rows,
+            row_count=len(trimmed.rows),
+        )
 
     if row_cap_hit:
+        if row_count < max_rows:
+            # The engine stopped on its size estimate, yet the exact measurement is under the
+            # cap: the estimator's lower bound was broken. Fail closed - a refusal with the
+            # rows fetched and an honest hint - and make the inconsistency visible.
+            logger.warning(
+                "engine=%s run_query_bounded fetch stopped early: rows_fetched=%s max_rows=%s "
+                "result_bytes=%s max_result_bytes=%s - the size estimate crossed the cap but "
+                "the exact measurement did not; refusing with the rows fetched",
+                engine,
+                row_count,
+                max_rows,
+                trimmed.total_bytes,
+                MAX_RESULT_BYTES,
+            )
         logger.info(
             "engine=%s run_query_bounded refused reason=%s max_rows=%s row_count=%s",
             engine,
@@ -406,19 +363,25 @@ def run_query_bounded(
             max_rows,
             row_count,
         )
-        row_cap_hint = (
-            f"Query returned more than max_rows={max_rows} rows; showing the first "
-            f"{row_count}. Add a LIMIT to your query or raise max_rows."
-        )
         return BoundedQueryResult(
             status="refused",
+            executed=True,
             reason=RefusalReason.ROW_CAP_EXCEEDED,
             estimate=estimate,
-            hint=row_cap_hint if depth_note is None else f"{row_cap_hint} {depth_note}",
+            hint=_with_depth_note(row_cap_hint(max_rows=max_rows, row_count=row_count), depth_note),
             rows=rows,
             row_count=row_count,
         )
 
     return BoundedQueryResult(
-        status="ok", estimate=estimate, rows=rows, row_count=row_count, hint=depth_note
+        status="ok",
+        executed=True,
+        estimate=estimate,
+        rows=rows,
+        row_count=row_count,
+        hint=depth_note,
     )
+
+
+def _with_depth_note(hint: str, depth_note: str | None) -> str:
+    return hint if depth_note is None else f"{hint} {depth_note}"

@@ -45,6 +45,13 @@ class RefusalReason(str, Enum):
     COST_CAP_EXCEEDED = "cost_cap_exceeded"
     BYTE_CAP_EXCEEDED = "byte_cap_exceeded"
     ROW_CAP_EXCEEDED = "row_cap_exceeded"
+    # #94: the normalised rows serialised over result_bounds.MAX_RESULT_BYTES; the result
+    # carries the longest prefix of whole rows that fits. Like ROW_CAP_EXCEEDED it follows a
+    # billed execution. A new value rather than ROW_CAP_EXCEEDED with a different hint because
+    # the remedies differ (raising max_rows cannot fix a size problem and would re-bill the
+    # query) and `reason` is the machine-readable field; a new value rather than a new `status`
+    # because every client discriminates on status: Literal["ok", "refused"] (DECISIONS.md #21).
+    RESULT_SIZE_EXCEEDED = "result_size_exceeded"
 
 
 class BoundedQueryResult(BaseModel):
@@ -57,6 +64,19 @@ class BoundedQueryResult(BaseModel):
     model_config = ConfigDict(ser_json_bytes="base64", ser_json_inf_nan="strings")
 
     status: Literal["ok", "refused"]
+    # #101: "refused" no longer always means "did not run" - row_cap_exceeded and
+    # result_size_exceeded follow a billed execution and carry a truncated prefix of its rows.
+    # Required (no default), so a forgotten return path fails at construction instead of
+    # silently claiming either direction. Property-level description only (the schema text the
+    # model sees in tools/list), never a class docstring - DECISIONS.md #13's rule.
+    executed: bool = Field(
+        description=(
+            "True when the warehouse ran the statement (a billed execution happened), including "
+            "the refusals that return a truncated prefix of its rows - reason row_cap_exceeded "
+            "or result_size_exceeded; False when the query was refused before it was "
+            "submitted, or BigQuery refused to run it under the attached maximumBytesBilled."
+        ),
+    )
     reason: RefusalReason | None = None
     estimate: CostEstimate | None = None
     hint: str | None = None

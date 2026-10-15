@@ -33,13 +33,14 @@ MCP client (Claude Desktop, Claude Code, Cursor, ...)
 | `errors.py` | `sanitize_exceptions` — wraps every warehouse-client call so no raw exception (which may embed credentials) escapes to a log or tool response. |
 | `config.py` | Per-engine env-var loading and validation, run at call time (not import time). |
 | `sql_scope.py` | Fail-closed single-statement scanner (`assert_single_statement`, `single_statement_body`) and the dialect-aware lexer helpers (`comment_end`, `literal_end`, `dialect_for`) both gates share. `DECISIONS.md` #15. |
-| `sql_scope_keywords.py` | Read-statement gate (`assert_read_statement`): first-keyword allowlist plus the `WITH` CTE walk; opt-out `COST_GUARD_ALLOW_WRITE_STATEMENTS=1`. `DECISIONS.md` #13. |
+| `sql_scope_keywords.py` | Read-statement gate (`assert_read_statement`): first-keyword allowlist plus the `WITH` CTE walk; opt-out `COST_GUARD_ALLOW_WRITE_STATEMENTS=1`; `is_single_query_statement`, the LIMIT-wrap predicate. `DECISIONS.md` #13, #21. |
+| `result_bounds.py` | `run_query_bounded`'s result bounds: the default row cap, the 8 MiB serialised-size cap (exact measurement and prefix trim, tool side) and the engines' shared early stop (`collect_rows`, `iter_fetchmany`, the lower-bound size estimator). `DECISIONS.md` #21. |
 | `engines/bigquery.py` | `is_capacity_billed`, `dry_run`, `execute_bounded` — thin wrapper over `google-cloud-bigquery` + `google-cloud-bigquery-reservation`. |
 | `engines/snowflake.py` | `_connect`, `explain_estimate`, `execute_bounded` — thin wrapper over `snowflake-connector-python`. |
 | `engines/databricks.py` | `explain_estimate`, `execute_bounded`, `check_credentials` — thin wrapper over `databricks-sql-connector` and the `databricks-sdk` Warehouses API. |
 | `pricing/bigquery_pricing.py` | On-demand `$/TiB` constant. |
 | `pricing/snowflake_pricing.py` | Gen1 warehouse credit-rate table + `$/credit` by edition. |
-| `tools/*.py` | Business logic for each of the 3 MCP tools — pure functions, independently testable, imported (not duplicated) by `server.py`'s tool-registration wrappers. |
+| `tools/*.py` | Business logic for each of the 3 MCP tools — pure functions, independently testable, imported (not duplicated) by `server.py`'s tool-registration wrappers. `tools/result_rows.py` is `run_query_bounded`'s row normaliser (`DECISIONS.md` #17), split out for size. |
 
 ## Data flow: `run_query_bounded`
 
@@ -48,11 +49,14 @@ MCP client (Claude Desktop, Claude Code, Cursor, ...)
 2. If a cap was requested (`max_estimated_cost_usd` / `max_bytes_billed`) and the
    corresponding estimate field is `None`, refuse (fail-closed — see `DECISIONS.md`).
 3. If the estimate exceeds the cap, refuse with a `hint` and the estimate attached.
-4. Otherwise, execute via the engine's `execute_bounded`, which wraps the query in a
-   `LIMIT max_rows + 1` subquery so row-capping is enforced on the wire, not by fetching
-   everything and slicing in Python.
-5. If the wrapped fetch returned more than `max_rows`, refuse (even post-execution) and
-   return the truncated rows with a `row_cap_exceeded` reason.
+4. Otherwise, execute via the engine's `execute_bounded`. `max_rows` defaults to 1000; a
+   single `SELECT`/`WITH`/`VALUES` statement is wrapped in a `LIMIT max_rows + 1` subquery so
+   row-capping is enforced on the wire, other admitted statements run unwrapped. Every engine
+   fetches in pages (`result_bounds.collect_rows`) and stops at the `max_rows + 1` sentinel row
+   or once a lower-bound size estimate crosses the 8 MiB cap.
+5. If more than `max_rows` rows came back, or the normalised rows serialise over 8 MiB,
+   refuse post-execution (`row_cap_exceeded` / `result_size_exceeded`, `executed: true`) with
+   the truncated prefix attached; `executed` is `false` on every pre-execution refusal.
 
 ## The accuracy-tier contract
 

@@ -386,6 +386,18 @@ def single_statement_body(sql: str, engine: Engine) -> str:
     return sql[:end].strip()
 
 
+def is_single_statement(sql: str, engine: Engine) -> bool:
+    """True iff ``sql`` is exactly one statement for ``engine`` by the same scanner the gate
+    uses. Never raises and never logs: unresolvable or multi-statement text is simply False,
+    and the operator opt-out does not apply - this answers a shape question (may the engines
+    enclose the text in their LIMIT wrap?), it is not the gate (``assert_single_statement``).
+    """
+    try:
+        return _scan(sql, _DIALECTS.get(engine, _FALLBACK)) > 0
+    except UserVisibleError:
+        return False
+
+
 def assert_single_statement(sql: str, engine: Engine) -> None:
     """Raise UserVisibleError unless ``sql`` is exactly one statement for ``engine``.
 

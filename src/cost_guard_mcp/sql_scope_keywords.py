@@ -28,6 +28,7 @@ from cost_guard_mcp.sql_scope import (
     _Dialect,
     comment_end,
     dialect_for,
+    is_single_statement,
     literal_end,
 )
 from cost_guard_mcp.types import Engine
@@ -265,6 +266,25 @@ def _check_every_statement(sql: str, dialect: _Dialect) -> None:
         raise _refuse("found no SQL statement (empty, whitespace or comments only)", 0)
     for ordinal, (start, end) in enumerate(segments, 1):
         _check_statement(sql[start:end], start, ordinal if len(segments) > 1 else None, dialect)
+
+
+def is_single_query_statement(sql: str, engine: Engine) -> bool:
+    """True iff ``sql`` is one statement whose main keyword - resolved through any CTE list by
+    the same walk the read gate uses - is SELECT or VALUES: the shape that is valid as the
+    derived table of the engines' ``SELECT * FROM (...) AS cost_guard_row_cap LIMIT n`` wrap
+    (#94). SHOW/DESCRIBE/EXPLAIN, scripts, writes and ``WITH ... INSERT`` (Spark allows it, and
+    the write opt-out skips the gate) are not. Never raises and never logs: a shape the walk
+    refuses (unbalanced parentheses, a WITH nested past ``_MAX_CTE_NESTING``) is simply False.
+    """
+    if not is_single_statement(sql, engine):
+        return False
+    try:
+        keyword, _ = _resolve_query_keyword(
+            sql, dialect_for(engine), _Frame("the statement", 0, depth=1)
+        )
+    except UserVisibleError:
+        return False
+    return keyword in _QUERY_KEYWORDS
 
 
 def assert_read_statement(sql: str, engine: Engine) -> None:

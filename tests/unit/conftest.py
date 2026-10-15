@@ -126,6 +126,11 @@ class FakeSnowflakeCursor:
             return list(self.history_rows)
         return []
 
+    def fetchmany(self, size=None):
+        # execute_bounded pages its result with fetchmany (#94); this fake does not model
+        # result rows, so the paged fetch ends at the first (empty) page.
+        return []
+
 
 def fake_snowflake_connection(cursor):
     conn = MagicMock()

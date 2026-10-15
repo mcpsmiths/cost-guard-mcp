@@ -502,8 +502,14 @@ def test_execute_bounded_passes_timeout_to_result(mock_bq_module):
     # of that internal plumbing. retry=_API_RETRY (#103): result() threads it to every
     # polling RPC (done() -> jobs.get, _reload_query_results() -> jobs.getQueryResults, row
     # paging), which otherwise inherit DEFAULT_RETRY's 600 s deadline.
+    # #94: without max_rows the iterator is unbounded in rows (the size estimate stops it) but
+    # still paged, so no first-page download exceeds FETCH_PAGE_SIZE rows.
     mock_query_job.result.assert_called_once_with(
-        timeout=120, retry=bigquery_engine._API_RETRY, job_retry=None
+        timeout=120,
+        retry=bigquery_engine._API_RETRY,
+        job_retry=None,
+        max_results=None,
+        page_size=500,
     )
     assert mock_query_job.result.call_args.kwargs["retry"] is bigquery_engine._API_RETRY
 
@@ -986,3 +992,98 @@ def test_check_credentials_ok_detail_presents_project_and_service_account_as_rem
         assert escaped in result.detail
     assert "NOTE: cap waived" in result.detail  # content kept, line boundary removed
     assert "sa\\r\\n@fake.invalid" in result.detail
+
+
+# --- #94: bounded, paged row iteration ------------------------------------------------------
+
+
+def _bigquery_mocks_yielding(mock_bq_module, rows):
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter(rows)
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+    return mock_client, mock_query_job
+
+
+@pytest.mark.parametrize(
+    ("max_rows", "max_results", "page_size"),
+    [(5, 6, 6), (499, 500, 500), (2000, 2001, 500), (None, None, 500)],
+)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_bounds_the_row_iterator_with_max_results_and_page_size(
+    mock_bq_module, max_rows, max_results, page_size
+):
+    # max_results caps what the service hands back (max_rows + 1: the sentinel row is still
+    # needed to tell "exactly max_rows" from "more"); page_size bounds the very first
+    # jobs.getQueryResults download too, which otherwise pulls the API's default page before
+    # our code sees a row.
+    _, mock_query_job = _bigquery_mocks_yielding(mock_bq_module, [])
+
+    execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=max_rows)
+
+    kwargs = mock_query_job.result.call_args.kwargs
+    assert kwargs["max_results"] == max_results
+    assert kwargs["page_size"] == page_size
+    assert kwargs["timeout"] == 120
+    assert kwargs["retry"] is bigquery_engine._API_RETRY
+    assert kwargs["job_retry"] is None
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_runs_the_text_unwrapped_when_wrap_in_limit_is_false(mock_bq_module):
+    mock_client, mock_query_job = _bigquery_mocks_yielding(mock_bq_module, [{"a": 1}] * 7)
+
+    _rows, row_count, row_cap_hit = execute_bounded(
+        "EXPLAIN SELECT 1", max_bytes_billed=None, max_rows=5, wrap_in_limit=False
+    )
+
+    assert mock_client.query.call_args[0][0] == "EXPLAIN SELECT 1"
+    assert mock_query_job.result.call_args.kwargs["max_results"] == 6  # the API bound stays
+    assert (row_count, row_cap_hit) == (5, True)  # the paged consume still caps the rows
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_wraps_by_default_for_library_callers(mock_bq_module):
+    mock_client, _ = _bigquery_mocks_yielding(mock_bq_module, [])
+
+    execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=5)
+
+    assert mock_client.query.call_args[0][0].startswith("SELECT * FROM (SELECT 1)")
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_stops_consuming_rows_once_the_size_estimate_crosses_the_cap(
+    mock_bq_module,
+):
+    consumed = []
+
+    def rows():
+        for index in range(10_000):
+            consumed.append(index)
+            yield {"s": "x" * 1024}
+
+    _bigquery_mocks_yielding(mock_bq_module, rows())
+
+    returned, row_count, row_cap_hit = execute_bounded(
+        "SELECT s FROM t", max_bytes_billed=None, max_rows=None
+    )
+
+    # ~1 KB per row: the 8 MiB estimate trips after ~8,200 rows, long before 10,000.
+    assert 8_000 < len(consumed) < 8_500
+    assert len(consumed) == row_count == len(returned)
+    assert row_cap_hit is True
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_rows_are_plain_dicts_copied_from_the_iterator(mock_bq_module):
+    source = {"a": 1}
+    _bigquery_mocks_yielding(mock_bq_module, [source])
+
+    rows, _, _ = execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=None)
+
+    assert rows == [{"a": 1}]
+    assert rows[0] is not source

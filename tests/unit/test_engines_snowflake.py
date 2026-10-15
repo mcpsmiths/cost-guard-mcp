@@ -1,4 +1,5 @@
 import base64
+import itertools
 import json
 import logging
 from unittest.mock import MagicMock, patch
@@ -2136,7 +2137,7 @@ def test_check_credentials_closes_connection_even_on_failure(mock_connect):
 def test_execute_bounded_polls_until_done_then_fetches_results(mock_connect, _mock_sleep):
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = [{"a": 1}]
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([{"a": 1}])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.side_effect = [True, False]
@@ -2163,7 +2164,7 @@ def test_execute_bounded_pins_statement_count_to_one_on_execute_async(mock_conne
     # test_snowflake_dependency_contract.py).
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.return_value = False
@@ -2179,7 +2180,7 @@ def test_execute_bounded_pins_statement_count_to_one_on_execute_async(mock_conne
 def test_execute_bounded_pins_statement_count_on_limit_wrapped_text_too(mock_connect, _mock_sleep):
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.return_value = False
@@ -2209,7 +2210,7 @@ def test_execute_bounded_statement_count_rejection_propagates_and_closes_connect
         execute_bounded("SELECT 1; CREATE TABLE cg_probe(x INT)", warehouse=None, max_rows=None)
 
     mock_conn.get_query_status.assert_not_called()
-    mock_cursor.fetchall.assert_not_called()
+    mock_cursor.fetchmany.assert_not_called()
     mock_conn.close.assert_called_once()
 
 
@@ -2218,7 +2219,7 @@ def test_execute_bounded_statement_count_rejection_propagates_and_closes_connect
 def test_execute_bounded_pins_warehouse_before_execute_async(mock_connect, _mock_sleep):
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.return_value = False
@@ -2235,7 +2236,7 @@ def test_execute_bounded_pins_warehouse_before_execute_async(mock_connect, _mock
 def test_execute_bounded_still_applies_row_cap_after_async_wait(mock_connect, _mock_sleep):
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = [{"a": 1}, {"a": 2}, {"a": 3}]
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([{"a": 1}, {"a": 2}, {"a": 3}])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.return_value = False
@@ -2379,7 +2380,7 @@ def test_execute_bounded_raises_when_execute_async_returns_no_query_id(mock_conn
 def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect, _mock_sleep):
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.return_value = False
@@ -2398,7 +2399,7 @@ def test_execute_bounded_strips_trailing_semicolon_before_wrapping(mock_connect,
 def test_execute_bounded_strips_trailing_comments_before_wrapping(mock_connect, _mock_sleep, sql):
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = []
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.return_value = False
@@ -2415,7 +2416,7 @@ def test_execute_bounded_strips_trailing_comments_before_wrapping(mock_connect, 
 def test_execute_bounded_closes_connection_on_success(mock_connect, _mock_sleep):
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = [{"a": 1}]
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([{"a": 1}])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.side_effect = [True, False]
@@ -2449,7 +2450,7 @@ def test_execute_bounded_survives_a_failed_connection_close(mock_connect, _mock_
     # discipline - a failed close must not mask a successful result.
     mock_cursor = MagicMock()
     mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
-    mock_cursor.fetchall.return_value = [{"a": 1}]
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager([{"a": 1}])
     mock_conn = MagicMock()
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
     mock_conn.is_still_running.side_effect = [True, False]
@@ -3236,3 +3237,177 @@ def test_execute_bounded_does_not_consult_the_warehouse_state(_mock_sleep, snowf
 
     assert _no(cursor, "SHOW WAREHOUSES")
     assert cursor.executed[0] == "USE WAREHOUSE COMPUTE_WH"
+
+
+# --- #94: paged fetch under the remaining watchdog budget -----------------------------------
+
+
+def _fetchmany_pager(rows):
+    """A cursor.fetchmany stand-in: serves `rows` in pages, then empty pages, as the connector
+    does (its fetchmany loops fetchone until `size` rows or None)."""
+    remaining = iter(rows)
+    return lambda size: list(itertools.islice(remaining, size))
+
+
+def _finished_async_connection(mock_connect, rows):
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager(rows)
+    mock_cursor.fetchall.side_effect = AssertionError("execute_bounded must page, not fetchall")
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = False
+    mock_connect.return_value = mock_conn
+    return mock_conn, mock_cursor
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_fetches_in_pages_and_never_calls_fetchall(mock_connect, _mock_sleep):
+    _, mock_cursor = _finished_async_connection(
+        mock_connect, [{"a": index} for index in range(701)]
+    )
+
+    rows, row_count, row_cap_hit = execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+
+    assert row_count == len(rows) == 701
+    assert row_cap_hit is False
+    # 500, 201, then the empty page that ends the fetch - every call asks for one page.
+    assert [call.args for call in mock_cursor.fetchmany.call_args_list] == [(500,), (500,), (500,)]
+    mock_cursor.fetchall.assert_not_called()
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_row_cap_via_paging_stops_at_the_sentinel_row(mock_connect, _mock_sleep):
+    _, mock_cursor = _finished_async_connection(
+        mock_connect, [{"a": index} for index in range(1200)]
+    )
+
+    rows, row_count, row_cap_hit = execute_bounded(
+        "SHOW TABLES", warehouse=None, max_rows=1000, wrap_in_limit=False
+    )
+
+    assert (row_count, row_cap_hit) == (1000, True)
+    assert rows[-1] == {"a": 999}
+    assert mock_cursor.fetchmany.call_count == 3  # 500 + 500 + the page holding row 1001
+    mock_cursor.execute_async.assert_called_once_with("SHOW TABLES", num_statements=1)
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_wraps_by_default_and_not_when_asked(mock_connect, _mock_sleep):
+    _, mock_cursor = _finished_async_connection(mock_connect, [])
+    execute_bounded("SELECT * FROM t", warehouse=None, max_rows=5)
+    assert mock_cursor.execute_async.call_args.args[0] == (
+        "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
+    )
+
+    _, mock_cursor = _finished_async_connection(mock_connect, [])
+    execute_bounded("SELECT * FROM t", warehouse=None, max_rows=5, wrap_in_limit=False)
+    assert mock_cursor.execute_async.call_args.args[0] == "SELECT * FROM t"
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.monotonic")
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_fetch_phase_is_bounded_by_the_watchdog_deadline(
+    mock_connect, _mock_sleep, mock_monotonic, caplog
+):
+    # The connector issues the RESULT_SCAN lazily inside the first fetchmany, so that first
+    # page is deliberately never pre-empted (a finished, billed query always yields its first
+    # page); every later page is checked against the deadline armed at execute_async. Here
+    # the first page "takes" 121 s of wall clock: page 2 is refused, nothing is cancelled (the
+    # query has finished) and the connection is still closed.
+    mock_conn, mock_cursor = _finished_async_connection(mock_connect, [])
+    clock = {"now": 0.0}
+    mock_monotonic.side_effect = lambda: clock["now"]
+    pager = _fetchmany_pager([{"a": index} for index in range(1200)])
+
+    def slow_first_page(size):
+        clock["now"] = 121.0
+        return pager(size)
+
+    mock_cursor.fetchmany.side_effect = slow_first_page
+
+    with (
+        caplog.at_level(logging.WARNING, logger="cost_guard_mcp.engines.snowflake"),
+        pytest.raises(SanitizedEngineError, match="while fetching its result after 500 rows"),
+    ):
+        execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+
+    assert mock_cursor.fetchmany.call_count == 1
+    cancels = [c for c in mock_cursor.execute.call_args_list if "CANCEL_QUERY" in c.args[0]]
+    assert cancels == []
+    mock_conn.close.assert_called_once()
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and r.name == "cost_guard_mcp.engines.snowflake"
+    ]
+    assert len(warnings) == 1
+    assert "result fetch exceeded 120s" in warnings[0].message
+    assert "query_id='11111111-1111-1111-1111-111111111111'" in warnings[0].message
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.monotonic")
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_returns_a_complete_result_whose_only_page_overran_the_deadline(
+    mock_connect, _mock_sleep, mock_monotonic, caplog
+):
+    # A finished, billed query whose whole result fits in one short page, and that page arrives
+    # after the deadline. The only request left is the end-of-result probe (the connector fills
+    # a page until `size` rows or exhaustion, so a short page means the result is exhausted):
+    # nothing is downloading, so the check is skipped and the rows in hand are returned, not
+    # thrown away with a "while fetching its result" error.
+    mock_conn, mock_cursor = _finished_async_connection(mock_connect, [])
+    clock = {"now": 0.0}
+    mock_monotonic.side_effect = lambda: clock["now"]
+    pager = _fetchmany_pager([{"a": index} for index in range(10)])
+
+    def slow_only_page(size):
+        clock["now"] = 121.0
+        return pager(size)
+
+    mock_cursor.fetchmany.side_effect = slow_only_page
+
+    with caplog.at_level(logging.WARNING, logger="cost_guard_mcp.engines.snowflake"):
+        rows, row_count, row_cap_hit = execute_bounded("SELECT 1", warehouse=None, max_rows=1000)
+
+    assert (row_count, row_cap_hit) == (10, False)
+    assert rows[-1] == {"a": 9}
+    assert mock_cursor.fetchmany.call_count == 2  # the short page, then the empty probe
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.monotonic")
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_fetch_deadline_is_armed_at_execute_async_not_at_the_poll_counter(
+    mock_connect, _mock_sleep, mock_monotonic
+):
+    # The poll loop counts nominal 2 s sleeps and ignores the latency of each status call; the
+    # fetch budget is taken from a monotonic deadline armed when the query was submitted, so
+    # slow status polls shorten it. Here the polls "take" 119 s and page 1 adds 2 s.
+    mock_conn, mock_cursor = _finished_async_connection(mock_connect, [])
+    clock = {"now": 0.0}
+    mock_monotonic.side_effect = lambda: clock["now"]
+
+    def slow_status(query_id):
+        clock["now"] += 59.5
+        return "RUNNING"
+
+    mock_conn.get_query_status.side_effect = slow_status
+    mock_conn.is_still_running.side_effect = [True, False]
+    pager = _fetchmany_pager([{"a": index} for index in range(600)])
+
+    def page(size):
+        clock["now"] += 2.0
+        return pager(size)
+
+    mock_cursor.fetchmany.side_effect = page
+
+    with pytest.raises(SanitizedEngineError, match="while fetching its result after 500 rows"):
+        execute_bounded("SELECT 1", warehouse=None, max_rows=None)
