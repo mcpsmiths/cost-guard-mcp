@@ -112,6 +112,18 @@
           "description": "Maximum number of run_query_bounded calls allowed in flight at once (positive integer, default 8). A cancelled call keeps its slot until its warehouse query completes or the 120 s watchdog fires; a call over the cap fails with a tool error naming this variable before any warehouse connection is opened.",
           "isRequired": false,
           "isSecret": false
+        },
+        {
+          "name": "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START",
+          "description": "Set to true (exactly that value) to let the read-only Databricks tools (check_credentials, estimate_query_cost) open a session on a SQL warehouse that is not RUNNING, which starts the warehouse and bills compute until it auto-stops. Off by default: the server first reads the warehouse's state through the Warehouses API (GET /api/2.0/sql/warehouses/<id>, CAN_VIEW/CAN_USE suffices) and, unless it is RUNNING - also when the state cannot be read - check_credentials returns ok=false and estimate_query_cost returns no byte or dollar figure, without opening a session. run_query_bounded is not gated: its own pre-execution estimate and the execution may start the warehouse. Any other value leaves the guard on.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
+          "name": "COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME",
+          "description": "Set to true (exactly that value) to let the read-only Snowflake tools run SELECT CURRENT_REGION(), the INFORMATION_SCHEMA.QUERY_HISTORY read and check_credentials' session-context SELECT on a warehouse that is not STARTED, which can resume a suspended AUTO_RESUME warehouse and bill compute until it auto-suspends. Off by default: those statements are skipped unless the pinned warehouse's SHOW WAREHOUSES state is STARTED (also skipped when no warehouse is pinned or the state cannot be read), and the QUERY_HISTORY read is skipped whenever estimate_query_cost is called without a warehouse argument; estimate_query_cost then prices at Gen1 rates with the byte-tier heuristic and says so in a caveat, and check_credentials returns ok=true with a detail built from the SHOW WAREHOUSES row. USE WAREHOUSE, EXPLAIN USING JSON, SHOW WAREHOUSES and SELECT CURRENT_WAREHOUSE() always run; run_query_bounded is not gated. Any other value leaves the guard on.",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }

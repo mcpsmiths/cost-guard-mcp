@@ -6,6 +6,33 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+### Security
+
+- **Read-only tools no longer wake a warehouse by default** (`check_credentials`,
+  `estimate_query_cost`; `DECISIONS.md` #20; #91, #92). Databricks: the configured SQL
+  warehouse's state is read through the Warehouses API first; unless it is `RUNNING` - also
+  when the state cannot be read - `check_credentials` returns `ok: false` and
+  `estimate_query_cost` returns no byte or dollar figure, with no session opened. Snowflake:
+  `SELECT CURRENT_REGION()`, the `QUERY_HISTORY` read and `check_credentials`' session-context
+  `SELECT` run only when the pinned warehouse's `SHOW WAREHOUSES` state is `STARTED` (skipped
+  when no warehouse is pinned or the state cannot be read; the `QUERY_HISTORY` read is also
+  skipped whenever `estimate_query_cost` gets no `warehouse` argument); the estimate then
+  prices at Gen1 rates at the observed size with the byte-tier heuristic and a caveat, and
+  `check_credentials` returns `ok: true` with a detail built from the `SHOW WAREHOUSES` row.
+  `USE WAREHOUSE`, `EXPLAIN USING JSON`, `SHOW WAREHOUSES` and `SELECT CURRENT_WAREHOUSE()`
+  still run. `run_query_bounded` is unchanged (its estimate and execution may wake the
+  warehouse). Opt-ins to waking the warehouse: `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true`,
+  `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true` (exactly those values). Behaviour change for
+  Databricks principals without `CAN_VIEW`/`CAN_USE` on the warehouse: the read-only tools now
+  refuse instead of pricing at the caller-asserted size. Tool descriptions changed
+  (description-only `tools/list` diff). The owner's per-statement attribution test is the
+  recorded follow-up in `DECISIONS.md` #20.
+
+### Added
+
+- `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START` and `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME`,
+  documented in `server.json`, `.mcp.json.example` and the README (Setup, Known limitations).
+
 ## [0.4.0] - 2026-10-14
 
 The 2026-10 security-audit remediation (PR #86). **Breaking:** one SQL statement per call

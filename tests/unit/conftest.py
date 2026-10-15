@@ -14,6 +14,21 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from cost_guard_mcp.config import (
+    DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR,
+    SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR,
+)
+
+
+@pytest.fixture(autouse=True)
+def _warehouse_state_guards_enforced(monkeypatch):
+    """The read-only warehouse-state guards (DECISIONS.md #20) are read from the environment at
+    call time; unset both opt-ins so the suite runs with the guards enforced regardless of the
+    developer's shell. Opt-in tests set `monkeypatch.setenv(NAME, "true")` themselves."""
+    monkeypatch.delenv(DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR, raising=False)
+    monkeypatch.delenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, raising=False)
+
+
 # Column order of a SHOW WAREHOUSES result as the engine maps it by cursor.description
 # name; the real command returns many more columns, in a different order - the engine must
 # never rely on positions, only on these names.
@@ -22,6 +37,7 @@ SHOW_WAREHOUSES_COLUMNS = ("name", "state", "type", "size", "auto_resume", "gene
 _DEFAULT_PLAN = {
     "GlobalStats": {"partitionsTotal": 1, "partitionsAssigned": 1, "bytesAssigned": 1000}
 }
+DEFAULT_CONTEXT_ROW = ("COST_GUARD_READER", '{"roles":"","value":""}', "COMPUTE_WH", "ABC12345")
 
 
 def show_warehouses_row(
@@ -48,12 +64,16 @@ class FakeSnowflakeCursor:
         current_warehouse=None,
         history_rows=(),
         fail_on=(),
+        context_row=DEFAULT_CONTEXT_ROW,
     ):
         self.plan = plan
         self.show_rows = list(show_rows)
         self.region = region
         self.current_warehouse = current_warehouse
         self.history_rows = list(history_rows)
+        # The four-function session-context SELECT check_credentials runs (role, secondary
+        # roles, warehouse, account); None = "no rows".
+        self.context_row = context_row
         self.fail_on = tuple(fail_on)
         self.executed: list[str] = []
         self.timeouts: list[float | None] = []
@@ -88,6 +108,9 @@ class FakeSnowflakeCursor:
     def fetchone(self):
         if "EXPLAIN USING JSON" in self._last:
             return None if self.plan is None else (json.dumps(self.plan),)
+        # Checked BEFORE the CURRENT_WAREHOUSE() branch: the context SELECT contains it too.
+        if "CURRENT_ROLE()" in self._last:
+            return self.context_row
         if "CURRENT_WAREHOUSE()" in self._last:
             return (self.current_warehouse,)
         if "CURRENT_REGION()" in self._last:

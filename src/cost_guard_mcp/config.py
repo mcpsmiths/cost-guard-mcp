@@ -207,3 +207,35 @@ def load_databricks_config() -> DatabricksConfig:
         client_id=client_id,
         client_secret=client_secret,
     )
+
+
+# Read-only warehouse-state guard opt-ins (DECISIONS.md #20; issues #91, #92). check_credentials
+# and estimate_query_cost refuse to run the statements that can start a stopped Databricks SQL
+# warehouse or resume a suspended Snowflake warehouse unless the warehouse is observed RUNNING /
+# STARTED; these variables restore the pre-guard behaviour per engine. Parsed like
+# COST_GUARD_ALLOW_MULTI_STATEMENT_SQL (sql_scope.py): the value must be EXACTLY `true` -
+# unset, empty, `TRUE`, `1`, `yes` or padded text all leave the guard on, silently (no
+# ConfigError, no startup effect, the value is never echoed). Read at call time, not import
+# time, so a host that restarts the server with the variable set changes behaviour without a
+# code reload and unit tests can monkeypatch it. Deliberately NOT fields on the frozen config
+# dataclasses: the unit suite builds those as MagicMocks, whose unknown attributes are truthy,
+# so a guard reading `config.allow_...` would be silently disabled in every such test.
+DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR = "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START"
+SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR = "COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME"
+_WAREHOUSE_WAKE_OPT_IN_VALUE = "true"
+
+
+def _warehouse_wake_opt_in(name: str) -> bool:
+    return os.environ.get(name) == _WAREHOUSE_WAKE_OPT_IN_VALUE
+
+
+def databricks_warehouse_start_allowed() -> bool:
+    """True only when COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START is exactly `true`: the
+    read-only Databricks tools may then open a session on a non-RUNNING SQL warehouse."""
+    return _warehouse_wake_opt_in(DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR)
+
+
+def snowflake_warehouse_resume_allowed() -> bool:
+    """True only when COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME is exactly `true`: the
+    read-only Snowflake tools may then run the resume-prone lookups on a non-STARTED warehouse."""
+    return _warehouse_wake_opt_in(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR)

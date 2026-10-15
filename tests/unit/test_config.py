@@ -1,12 +1,16 @@
 import pytest
 
 from cost_guard_mcp.config import (
+    DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR,
+    SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR,
     ConfigError,
     DatabricksConfig,
     SnowflakeConfig,
+    databricks_warehouse_start_allowed,
     load_bigquery_config,
     load_databricks_config,
     load_snowflake_config,
+    snowflake_warehouse_resume_allowed,
 )
 
 
@@ -325,3 +329,63 @@ def test_snowflake_config_edition_defaults_to_standard_when_constructed_directly
         password=None,
     )
     assert config.edition == "standard"
+
+
+# --- read-only warehouse-state guard opt-ins (DECISIONS.md #20; issues #91, #92) --------------
+
+_WAKE_OPT_IN_VALUES = [
+    ("true", True),
+    (None, False),
+    ("", False),
+    ("TRUE", False),
+    ("True", False),
+    ("1", False),
+    ("yes", False),
+    (" true", False),
+    ("true ", False),
+    ("false", False),
+]
+
+
+def _set_or_unset(monkeypatch, name, raw):
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+
+
+@pytest.mark.parametrize(("raw", "expected"), _WAKE_OPT_IN_VALUES)
+def test_databricks_warehouse_start_allowed_only_for_exactly_true(monkeypatch, raw, expected):
+    # Mirrors the COST_GUARD_ALLOW_MULTI_STATEMENT_SQL parse (exactly one spelling): any other
+    # value leaves the guard on silently, and the refusal text spells the accepted value.
+    _set_or_unset(monkeypatch, DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR, raw)
+
+    assert databricks_warehouse_start_allowed() is expected
+
+
+@pytest.mark.parametrize(("raw", "expected"), _WAKE_OPT_IN_VALUES)
+def test_snowflake_warehouse_resume_allowed_only_for_exactly_true(monkeypatch, raw, expected):
+    _set_or_unset(monkeypatch, SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, raw)
+
+    assert snowflake_warehouse_resume_allowed() is expected
+
+
+def test_warehouse_wake_opt_ins_are_read_at_call_time(monkeypatch):
+    # Read per tool call, not at import: a host that restarts the server with the variable
+    # set changes behaviour without a code reload, and tests can monkeypatch it.
+    monkeypatch.delenv(DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR, raising=False)
+    monkeypatch.delenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, raising=False)
+    assert databricks_warehouse_start_allowed() is False
+    assert snowflake_warehouse_resume_allowed() is False
+
+    monkeypatch.setenv(DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR, "true")
+    monkeypatch.setenv(SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR, "true")
+
+    assert databricks_warehouse_start_allowed() is True
+    assert snowflake_warehouse_resume_allowed() is True
+
+
+def test_warehouse_wake_opt_in_names_are_the_documented_ones():
+    # The exact strings server.json, .mcp.json.example and the README document.
+    assert DATABRICKS_ALLOW_WAREHOUSE_START_ENV_VAR == "COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START"
+    assert SNOWFLAKE_ALLOW_WAREHOUSE_RESUME_ENV_VAR == "COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME"

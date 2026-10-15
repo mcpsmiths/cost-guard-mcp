@@ -199,14 +199,23 @@ _run_query_bounded_safe = as_tool_error(_run_query_bounded_in_thread)
 
 @mcp.tool(annotations=_CHECK_CREDENTIALS_ANNOTATIONS)
 def check_credentials(engine: Engine, warehouse: str | None = None) -> CredentialCheckResult:
-    """Verify credentials/connectivity for an engine with one lightweight session-context
-    statement - no real query and no dry-run estimate. Call this once after configuring a new
-    engine (or when a real tool call fails) to get a fast, clear yes/no signal instead of
-    debugging via trial queries.
+    """Verify credentials/connectivity for an engine without running a real query or a dry-run
+    estimate. What runs: BigQuery - one metadata call (the service-account lookup). Snowflake -
+    login, USE WAREHOUSE when a warehouse is given, SELECT CURRENT_WAREHOUSE() when none is,
+    SHOW WAREHOUSES LIKE for the pinned warehouse, and only when that row says STARTED one
+    session-context SELECT. Databricks - one control-plane GET of the configured SQL warehouse
+    (Warehouses API), and only when it is RUNNING a session running SELECT current_user().
+    Call this once after configuring a new engine (or when a real tool call fails) to get a
+    fast, clear yes/no signal instead of debugging via trial queries.
 
-    Compute disclosure: on Snowflake and Databricks that statement runs on the named (or
-    default/configured) warehouse session, which can resume a suspended or start a stopped
-    warehouse and bill compute unless it is already running.
+    Compute disclosure: on Snowflake and Databricks the session-context statement runs on the
+    named (or default/configured) warehouse session, which could resume a suspended or start a
+    stopped warehouse and bill compute - which is why the state is read first and the statement
+    is not run on a warehouse that is not STARTED (Snowflake: ok=true with a detail built from
+    the SHOW WAREHOUSES row) or not RUNNING (Databricks: ok=false, no session opened). The
+    operator opt-ins COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true and
+    COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true skip the state read and run the statement
+    regardless.
     """
     return _check_credentials_safe(engine, warehouse)
 
@@ -243,9 +252,18 @@ def estimate_query_cost(
     figure.
 
     Compute disclosure: on Snowflake and Databricks the EXPLAIN and the warehouse/history
-    metadata lookups run on the named (or default/configured) warehouse session, which can
-    resume a suspended or start a stopped warehouse and bill compute unless it is already
-    running."""
+    metadata lookups run on the named (or default/configured) warehouse session, which could
+    resume a suspended or start a stopped warehouse and bill compute. By default the server
+    reads the warehouse's state first (Snowflake: the SHOW WAREHOUSES row, after USE WAREHOUSE,
+    EXPLAIN USING JSON and SELECT CURRENT_WAREHOUSE() when no warehouse argument names one;
+    Databricks: a control-plane GET through the Warehouses API, before any session): on a
+    Snowflake warehouse that is not STARTED the cloud-provider (SELECT CURRENT_REGION()) and
+    query-history lookups are skipped and the estimate says so in a caveat (Gen1 rates,
+    heuristic runtime; the query-history lookup is also skipped when no warehouse argument is
+    given); on a Databricks warehouse that is not RUNNING, or whose state cannot be read, no
+    session is opened and the estimate carries no byte or dollar figure. Operator opt-ins:
+    COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true,
+    COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true. run_query_bounded is not gated."""
     return _estimate_query_cost_safe(engine, sql, warehouse, warehouse_size, edition)
 
 

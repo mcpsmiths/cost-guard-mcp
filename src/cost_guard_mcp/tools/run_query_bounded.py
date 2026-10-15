@@ -155,7 +155,13 @@ def run_query_bounded(
     # checked against the smallest warehouse's rate regardless of which warehouse the
     # query actually runs on, silently under-enforcing the cap for a caller specifying a
     # larger one.
-    estimate = estimate_query_cost(engine, sql, warehouse, warehouse_size, edition)
+    # allow_warehouse_wake=True: the read-only warehouse-state guards (DECISIONS.md #20) do not
+    # apply to this pre-execution estimate - the execution that follows wakes the warehouse
+    # anyway, and starting it is the accepted cost of an executed query under caps. The cap
+    # gate is therefore still fed the observed-warehouse, full-lookup estimate.
+    estimate = estimate_query_cost(
+        engine, sql, warehouse, warehouse_size, edition, allow_warehouse_wake=True
+    )
 
     if max_estimated_cost_usd is not None:
         if estimate.estimated_cost_usd is None:
