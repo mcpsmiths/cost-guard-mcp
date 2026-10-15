@@ -13,13 +13,13 @@ from unittest.mock import patch
 import pydantic_core
 from mcp.types import CallToolResult, TextContent
 
-from cost_guard_mcp.tools.run_query_bounded import (
+from cost_guard_mcp.tools.result_rows import (
     _MAX_CELL_NESTING_DEPTH,
     _NESTING_DEPTH_PLACEHOLDER,
     _json_safe_rows,
     _normalise_rows,
-    run_query_bounded,
 )
+from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 from cost_guard_mcp.types import AccuracyTier, BoundedQueryResult, CostEstimate
 
 _LOGGER_NAME = "cost_guard_mcp.tools.run_query_bounded"

@@ -22,13 +22,7 @@ from cost_guard_mcp.result_bounds import (
 from cost_guard_mcp.sql_scope import assert_single_statement
 from cost_guard_mcp.sql_scope_keywords import assert_read_statement, is_single_query_statement
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
-from cost_guard_mcp.tools.result_rows import (
-    _MAX_CELL_NESTING_DEPTH,
-    _NESTING_DEPTH_PLACEHOLDER,  # noqa: F401 - re-exported: the tests import it from here
-    _depth_note,
-    _json_safe_rows,  # noqa: F401 - re-exported: the tests import it from here
-    _normalise_rows,
-)
+from cost_guard_mcp.tools.result_rows import _MAX_CELL_NESTING_DEPTH, _depth_note, _normalise_rows
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
 
 logger = logging.getLogger(__name__)

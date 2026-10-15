@@ -20,7 +20,8 @@ from cost_guard_mcp.result_bounds import (
 )
 from cost_guard_mcp.sql_scope import ALLOW_MULTI_STATEMENT_SQL_ENV_VAR
 from cost_guard_mcp.sql_scope_keywords import ALLOW_WRITE_STATEMENTS_ENV_VAR
-from cost_guard_mcp.tools.run_query_bounded import _format_usd, _json_safe_rows, run_query_bounded
+from cost_guard_mcp.tools.result_rows import _json_safe_rows
+from cost_guard_mcp.tools.run_query_bounded import _format_usd, run_query_bounded
 from cost_guard_mcp.types import AccuracyTier, BoundedQueryResult, CostEstimate, RefusalReason
 
 _RUN_QUERY_BOUNDED_LOGGER_NAME = "cost_guard_mcp.tools.run_query_bounded"

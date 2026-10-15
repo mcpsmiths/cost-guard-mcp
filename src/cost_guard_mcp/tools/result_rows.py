@@ -5,8 +5,8 @@ deeper than the MCP SDK's serialiser can take, AFTER the billed execution and be
 return path (``ok``, ``row_cap_exceeded``, ``result_size_exceeded``), so a billed run always
 yields a structured result and never a post-billing serialisation error. The size cap (#94,
 ``result_bounds``) is measured on this module's output: what is measured is what is sent.
-Split out of ``tools/run_query_bounded.py`` for the 500-line guideline; the tool re-exports the
-names its tests import.
+Split out of ``tools/run_query_bounded.py`` for the 500-line guideline; the tool imports only
+what it uses, the tests import the normaliser from here.
 """
 
 import base64

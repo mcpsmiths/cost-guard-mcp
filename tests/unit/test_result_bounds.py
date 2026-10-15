@@ -24,7 +24,7 @@ from cost_guard_mcp.result_bounds import (
     size_cap_hint,
     trim_rows_to_byte_cap,
 )
-from cost_guard_mcp.tools.run_query_bounded import _MAX_CELL_NESTING_DEPTH, _json_safe_rows
+from cost_guard_mcp.tools.result_rows import _MAX_CELL_NESTING_DEPTH, _json_safe_rows
 
 
 def _nested(depth):
@@ -40,7 +40,7 @@ def _compact_bytes(rows):
     )
 
 
-# Every shape tools/run_query_bounded._json_safe_value (the DECISIONS.md #17 normaliser)
+# Every shape tools/result_rows._json_safe_value (the DECISIONS.md #17 normaliser)
 # distinguishes. A new branch there must add a row here: the engines' early stop is only safe
 # while the lower bound holds for every cell type the normaliser can produce.
 _TYPE_TABLE = [
@@ -88,7 +88,7 @@ def test_constants_are_the_documented_defaults():
     assert DEFAULT_MAX_ROWS == 1000
     assert MAX_RESULT_BYTES == 8 * 1024 * 1024 == 8388608
     assert FETCH_PAGE_SIZE == 500
-    # The tool keeps its alias so existing imports (and the placeholder text) are unchanged.
+    # result_rows keeps its alias for its own callers and the placeholder text; one value.
     assert _MAX_CELL_NESTING_DEPTH == MAX_CELL_NESTING_DEPTH == 64
 
 
