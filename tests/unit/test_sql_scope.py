@@ -269,8 +269,21 @@ def test_backslash_before_the_comment_terminator_is_refused(engine):
     # Snowflake value is unknown and a comment ending in a backslash has no legitimate use).
     _refuses("SELECT 1 -- x\\\n'\n; DROP TABLE t; --'", engine, match="backslash")
     _refuses("SELECT 1 -- x\\\n", engine, match="backslash")
+    # CRLF is one terminator for this rule: on the LF-only dialects the code point before
+    # the LF is the CR, and the backslash before THAT must be refused too, or the same bytes
+    # get a dialect-dependent verdict (Databricks already refused them: its match is the CR).
+    _refuses("SELECT 1 -- x\\\r\n'\n; DROP TABLE t; --'", engine, match="backslash")
+    _refuses("SELECT 1 -- x\\\r\n", engine, match="backslash")
     # End of text: nothing follows the comment, so there is nothing to continue into.
     _accepts("SELECT 1 -- ends with a backslash \\", engine)
+    # A backslash that is not immediately before the terminator is ordinary comment text.
+    _accepts("SELECT 1 -- x\\ \r\n; -- y\n", engine)
+
+
+def test_backslash_before_crlf_is_refused_in_every_line_comment_form():
+    _refuses("SELECT 1 # x\\\r\n'\n; DROP TABLE t; --'", "bigquery", match="backslash")
+    _refuses("SELECT 1 // x\\\r\n'\n; DROP TABLE t; --'", "snowflake", match="backslash")
+    _refuses("SELECT 1 -- x\\\r\n'\n; DROP TABLE t; --'", "redshift", match="backslash")
 
 
 def test_backslash_before_a_bare_carriage_return_terminator_is_refused_on_databricks():

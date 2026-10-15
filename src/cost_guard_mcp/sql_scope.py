@@ -50,7 +50,9 @@ _CONTRACT = "estimate_query_cost/run_query_bounded accept exactly one SQL statem
 #   A. a comment ends at the first code point of the dialect's terminator set;
 #   B. a comment containing one of the eight scanner-only separators, or a bare CR on a
 #      dialect whose set is LF-only, is refused - the two readings of where it ends disagree;
-#   C. a backslash immediately before the terminator is refused (Spark continues the comment).
+#   C. a backslash immediately before the terminator is refused (Spark continues the comment);
+#      CRLF counts as one terminator here, so the verdict on "\\\r\n" does not depend on
+#      whether the dialect's set holds the CR or only the LF.
 _SCANNER_ONLY_LINE_SEPARATORS = "\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029"
 _AMBIGUOUS_LINE_SEPARATOR_RE = re.compile(f"[{_SCANNER_ONLY_LINE_SEPARATORS}]")
 _BARE_CARRIAGE_RETURN_RE = re.compile("\r(?!\n)")
@@ -177,12 +179,16 @@ def _line_comment_end(sql: str, index: int, dialect: _Dialect) -> int:
                 "remove it or end the line with LF",
                 bare_cr.start(),
             )
-    if terminator is not None and sql[terminator.start() - 1] == "\\":
-        raise _refuse(
-            "a backslash at the end of a line comment continues the comment in Spark SQL - "
-            "remove it",
-            terminator.start() - 1,
-        )
+    if terminator is not None:
+        before = terminator.start() - 1
+        if terminator.group() == "\n" and before > index and sql[before] == "\r":
+            before -= 1  # the LF of a CRLF: the pair is the terminator
+        if before > index and sql[before] == "\\":
+            raise _refuse(
+                "a backslash at the end of a line comment continues the comment in Spark SQL - "
+                "remove it",
+                before,
+            )
     return end
 
 
