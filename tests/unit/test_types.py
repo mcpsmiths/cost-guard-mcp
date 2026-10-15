@@ -85,3 +85,15 @@ def test_bounded_query_result_serialises_bytes_as_base64_and_non_finite_floats_a
     dumped = result.model_dump_json()
     assert '"b":"_w=="' in dumped
     assert '"n":"NaN"' in dumped
+
+
+def test_refusal_reason_has_the_four_documented_values_in_declaration_order():
+    # #94 adds result_size_exceeded; the order is the outputSchema enum order clients see.
+    assert [reason.value for reason in RefusalReason] == [
+        "cost_cap_exceeded",
+        "byte_cap_exceeded",
+        "row_cap_exceeded",
+        "result_size_exceeded",
+    ]
+    # AccuracyTier must never grow: it is the project's three-value contract.
+    assert len(AccuracyTier) == 3

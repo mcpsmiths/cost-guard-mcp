@@ -12,6 +12,9 @@ from pydantic_core import PydanticSerializationError
 
 from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
 from cost_guard_mcp.errors import UserVisibleError, as_tool_error
+from cost_guard_mcp.result_bounds import DEFAULT_MAX_ROWS, MAX_RESULT_BYTES, trim_rows_to_byte_cap
+from cost_guard_mcp.sql_scope import ALLOW_MULTI_STATEMENT_SQL_ENV_VAR
+from cost_guard_mcp.sql_scope_keywords import ALLOW_WRITE_STATEMENTS_ENV_VAR
 from cost_guard_mcp.tools.run_query_bounded import _format_usd, _json_safe_rows, run_query_bounded
 from cost_guard_mcp.types import AccuracyTier, BoundedQueryResult, CostEstimate, RefusalReason
 
@@ -110,7 +113,9 @@ def test_run_query_bounded_dispatches_to_databricks(mock_estimate, mock_engine):
 
     result = run_query_bounded("databricks", "SELECT 1")
 
-    mock_engine.execute_bounded.assert_called_once_with("SELECT 1", warehouse=None, max_rows=None)
+    mock_engine.execute_bounded.assert_called_once_with(
+        "SELECT 1", warehouse=None, max_rows=DEFAULT_MAX_ROWS, wrap_in_limit=True
+    )
     assert result.status == "ok"
 
 
@@ -257,7 +262,8 @@ def test_bigquery_cost_cap_attaches_a_derived_server_side_byte_cap(mock_estimate
     mock_execute.assert_called_once_with(
         "SELECT * FROM rls_t",
         max_bytes_billed=cost_cap_to_max_bytes_billed(0.01),
-        max_rows=None,
+        max_rows=DEFAULT_MAX_ROWS,
+        wrap_in_limit=True,
     )
     assert mock_execute.call_args.kwargs["max_bytes_billed"] is not None
 
@@ -325,7 +331,9 @@ def test_derived_byte_cap_is_bigquery_only(mock_estimate, mock_snowflake, mock_d
     run_query_bounded(engine, "SELECT 1", max_estimated_cost_usd=1.0)
 
     engine_module = mock_snowflake if engine == "snowflake" else mock_databricks
-    engine_module.execute_bounded.assert_called_once_with("SELECT 1", warehouse=None, max_rows=None)
+    engine_module.execute_bounded.assert_called_once_with(
+        "SELECT 1", warehouse=None, max_rows=DEFAULT_MAX_ROWS, wrap_in_limit=True
+    )
 
 
 @patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
@@ -803,3 +811,257 @@ def test_accepts_the_largest_max_rows_whose_limit_literal_fits_int64(mock_estima
         result = run_query_bounded("bigquery", "SELECT 1", max_rows=2**63 - 2)
     assert result.status == "ok"
     assert execute.call_args.kwargs["max_rows"] == 2**63 - 2
+
+
+# --- #94: default row cap, LIMIT wrap rule, serialised-size cap ------------------------------
+
+
+def _wide_rows(count, cell_bytes):
+    return [{"s": "x" * cell_bytes, "n": index} for index in range(count)]
+
+
+@pytest.mark.parametrize("engine", ["bigquery", "snowflake", "databricks"])
+@patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.snowflake_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_omitted_max_rows_dispatches_the_default_row_cap_to_every_engine(
+    mock_estimate, mock_bigquery, mock_snowflake, mock_databricks, engine
+):
+    # The audit's reproduction: no max_rows used to mean no row bound at all (100,000 rows
+    # came back). The default is applied in the tool, so the inputSchema is unchanged.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    modules = {
+        "bigquery": mock_bigquery,
+        "snowflake": mock_snowflake,
+        "databricks": mock_databricks,
+    }
+    for module in modules.values():
+        module.execute_bounded.return_value = ([], 0, False)
+
+    result = run_query_bounded(engine, "SELECT 1")
+
+    kwargs = modules[engine].execute_bounded.call_args.kwargs
+    assert kwargs["max_rows"] == DEFAULT_MAX_ROWS == 1000
+    assert kwargs["wrap_in_limit"] is True
+    assert result.status == "ok"
+
+
+@pytest.mark.parametrize("max_rows", [1, 5000, 2**63 - 2])
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_explicit_max_rows_is_honoured_unchanged(mock_estimate, mock_execute, max_rows):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([], 0, False)
+
+    run_query_bounded("bigquery", "SELECT 1", max_rows=max_rows)
+
+    assert mock_execute.call_args.kwargs["max_rows"] == max_rows
+
+
+@pytest.mark.parametrize(
+    ("engine", "sql", "expected"),
+    [
+        ("databricks", "SHOW TABLES", False),
+        ("databricks", "DESCRIBE t", False),
+        ("databricks", "DESC t", False),
+        ("databricks", "EXPLAIN SELECT 1", False),
+        ("bigquery", "SELECT 1", True),
+        ("bigquery", "(SELECT 1)", True),
+        ("bigquery", "WITH t AS (SELECT 1) SELECT * FROM t", True),
+        ("snowflake", "VALUES (1)", True),
+        ("bigquery", "SELECT 1;", True),
+        ("bigquery", "-- lead\nSELECT 1 -- trail", True),
+    ],
+)
+@patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.snowflake_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_limit_wrap_applies_only_to_query_shaped_statements(
+    mock_estimate, mock_bigquery, mock_snowflake, mock_databricks, engine, sql, expected
+):
+    # SHOW/DESCRIBE/EXPLAIN are not valid as a derived table: with the default row cap they
+    # would otherwise be unusable (there is no "no max_rows" any more). Their row cap is the
+    # paged fetch's stop instead.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    modules = {
+        "bigquery": mock_bigquery,
+        "snowflake": mock_snowflake,
+        "databricks": mock_databricks,
+    }
+    for module in modules.values():
+        module.execute_bounded.return_value = ([], 0, False)
+
+    run_query_bounded(engine, sql)
+
+    kwargs = modules[engine].execute_bounded.call_args.kwargs
+    assert kwargs["wrap_in_limit"] is expected
+    assert kwargs["max_rows"] == DEFAULT_MAX_ROWS
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_limit_wrap_is_skipped_for_a_script_under_the_multi_statement_opt_out(
+    mock_estimate, mock_execute, monkeypatch
+):
+    # The documented opt-out configuration (README: BigQuery scripts) keeps working with the
+    # default row cap: the script runs unwrapped and the fetch stops at max_rows + 1.
+    monkeypatch.setenv(ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, "1")
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([], 0, False)
+
+    run_query_bounded("bigquery", "SELECT 1; SELECT 2")
+
+    assert mock_execute.call_args.kwargs["wrap_in_limit"] is False
+    assert mock_execute.call_args.kwargs["max_rows"] == DEFAULT_MAX_ROWS
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_limit_wrap_is_skipped_for_a_with_insert_under_the_write_opt_out(
+    mock_estimate, mock_execute, monkeypatch
+):
+    # Spark allows WITH ... INSERT; the read gate is skipped under the opt-out, and wrapping it
+    # would be invalid SQL - the first keyword alone (WITH) is not the wrap criterion.
+    monkeypatch.setenv(ALLOW_WRITE_STATEMENTS_ENV_VAR, "1")
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([], 0, False)
+
+    run_query_bounded("databricks", "WITH t AS (SELECT 1) INSERT INTO x SELECT * FROM t")
+
+    assert mock_execute.call_args.kwargs["wrap_in_limit"] is False
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_refuses_with_result_size_exceeded_and_the_longest_fitting_prefix(
+    mock_estimate, mock_execute, caplog
+):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    rows = _wide_rows(10, 1024 * 1024)  # ~1 MiB each: seven fit under 8 MiB, the eighth does not
+    mock_execute.return_value = (rows, 10, True)  # the engine's size estimate stopped the fetch
+
+    with caplog.at_level(logging.INFO, logger=_RUN_QUERY_BOUNDED_LOGGER_NAME):
+        result = run_query_bounded("bigquery", "SELECT * FROM wide")
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.RESULT_SIZE_EXCEEDED
+    expected = trim_rows_to_byte_cap(_json_safe_rows(rows))
+    assert result.rows == expected.rows
+    assert result.row_count == len(result.rows) == 7
+    assert f"{MAX_RESULT_BYTES}-byte (8 MiB)" in result.hint
+    assert "first 7 of the 10 rows fetched" in result.hint
+    assert "LIMIT" in result.hint
+    records = [r for r in caplog.records if r.name == _RUN_QUERY_BOUNDED_LOGGER_NAME]
+    assert len(records) == 1
+    message = records[0].message
+    assert "engine=bigquery" in message
+    assert "reason=result_size_exceeded" in message
+    assert f"result_bytes={expected.total_bytes}" in message
+    assert f"max_result_bytes={MAX_RESULT_BYTES}" in message
+    assert "rows_returned=7 rows_fetched=10" in message
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_first_row_alone_over_the_cap_returns_zero_rows(mock_estimate, mock_execute):
+    # The audit's second reproduction: one 8.4 MB cell, an 8.4 MB response. Never a partial
+    # row - the honest answer is zero rows and a hint that says what to narrow.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([{"blob": "x" * 8_400_000}], 1, True)
+
+    result = run_query_bounded("bigquery", "SELECT blob FROM t")
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.RESULT_SIZE_EXCEEDED
+    assert result.rows == []
+    assert result.row_count == 0
+    assert "first 0 of the 1 rows fetched" in result.hint
+    assert "narrower columns" in result.hint
+    assert len(result.model_dump_json()) < 2_000
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_size_cap_precedes_the_row_cap_and_the_hint_names_both(mock_estimate, mock_execute):
+    # Both tripped: the row-cap hint ("showing the first 1000") would be false once rows were
+    # dropped for size, so the size reason wins and its hint names the row cap too.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    rows = _wide_rows(1000, 9_000)  # 1000 rows x ~9 KB = ~9 MB
+    mock_execute.return_value = (rows, 1000, True)
+
+    result = run_query_bounded("bigquery", "SELECT * FROM t", max_rows=1000)
+
+    assert result.reason == RefusalReason.RESULT_SIZE_EXCEEDED
+    assert result.row_count < 1000
+    assert "the row cap max_rows=1000 was reached too" in result.hint
+    assert "rows beyond the 1000 fetched, if any, were not retrieved" in result.hint
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_result_exactly_at_the_size_cap_is_ok(mock_estimate, mock_execute):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    row = {"s": "x" * (MAX_RESULT_BYTES - 10)}  # '[{"s":"..."}]' is exactly the cap
+    mock_execute.return_value = ([row], 1, False)
+
+    result = run_query_bounded("bigquery", "SELECT 1")
+
+    assert result.status == "ok"
+    assert result.row_count == 1
+    assert result.hint is None
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_size_cap_is_measured_after_normalisation(mock_estimate, mock_execute):
+    # 6.5 MB of raw bytes is under the cap; its base64 form (what the caller receives) is
+    # ~8.7 MB and is what gets measured - the cap is on the normalised rows (DECISIONS.md #17).
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([{"blob": b"\xff" * 6_500_000}], 1, False)
+
+    result = run_query_bounded("bigquery", "SELECT blob FROM t")
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.RESULT_SIZE_EXCEEDED
+    assert result.rows == []
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_depth_note_is_appended_on_the_size_path(mock_estimate, mock_execute):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    deep = json.loads('{"a":' * 300 + "1" + "}" * 300)
+    mock_execute.return_value = ([{"j": deep}, {"s": "x" * MAX_RESULT_BYTES}], 2, True)
+
+    result = run_query_bounded("bigquery", "SELECT 1")
+
+    assert result.reason == RefusalReason.RESULT_SIZE_EXCEEDED
+    assert result.row_count == 1
+    assert "deeper than 64" in result.hint
+    assert result.hint.index("8 MiB") < result.hint.index("deeper than 64")
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_row_cap_refusal_with_fewer_rows_than_max_rows_says_the_fetch_stopped_early(
+    mock_estimate, mock_execute, caplog
+):
+    # Fail-closed fallback: the engine stopped on its size estimate (row_cap_hit=True) but the
+    # exact measurement came in under the cap. Only a broken lower bound gets here; the result
+    # is still a refusal, with an honest hint and one WARNING, never a silently truncated ok.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_execute.return_value = ([{"a": 1}] * 7, 7, True)
+
+    with caplog.at_level(logging.INFO, logger=_RUN_QUERY_BOUNDED_LOGGER_NAME):
+        result = run_query_bounded("bigquery", "SELECT 1", max_rows=1000)
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.ROW_CAP_EXCEEDED
+    assert result.row_count == 7
+    assert "stopped after 7 rows" in result.hint
+    assert "may be missing" in result.hint
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "rows_fetched=7 max_rows=1000" in warnings[0].message

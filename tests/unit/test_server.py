@@ -577,3 +577,85 @@ def test_tools_list_input_schemas_are_unchanged_by_the_warehouse_state_guard():
         assert "allow_warehouse_wake" not in tool.input_schema["properties"], tool.name
         assert tool.output_schema is not None, tool.name
         assert set(tool.output_schema["properties"]) == _PINNED_OUTPUT_KEYS[tool.name], tool.name
+
+
+# --- #94: the default row cap and the serialised-size cap at the SDK surface -----------------
+
+
+def test_run_query_bounded_refusal_reasons_gain_result_size_exceeded():
+    # The intended tools/list diff for #94: one additive enum value on one tool's outputSchema
+    # (declaration order), nothing on the other three.
+    tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+    enum = tools["run_query_bounded"].output_schema["$defs"]["RefusalReason"]["enum"]
+    assert enum == [
+        "cost_cap_exceeded",
+        "byte_cap_exceeded",
+        "row_cap_exceeded",
+        "result_size_exceeded",
+    ]
+    for name in ("check_credentials", "describe_engine_capabilities", "estimate_query_cost"):
+        assert "RefusalReason" not in tools[name].output_schema.get("$defs", {}), name
+
+
+def test_run_query_bounded_input_schema_is_unchanged_by_the_default_row_cap():
+    # #94 acceptance criterion: the default lives in the tool, not in the schema - max_rows is
+    # still an optional integer with a null default, exactly as published at 574c9dc.
+    tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+    schema = tools["run_query_bounded"].input_schema
+    assert schema["properties"]["max_rows"] == {
+        "anyOf": [{"type": "integer"}, {"type": "null"}],
+        "default": None,
+        "title": "Max Rows",
+    }
+    assert schema["required"] == ["engine", "sql"]
+
+
+def test_run_query_bounded_description_states_the_default_row_cap_and_the_size_cap():
+    description = _tool_description("run_query_bounded")
+    assert "max_rows defaults to 1000" in description
+    assert "9223372036854775806" in description
+    assert "8 MiB" in description
+    assert "result_size_exceeded" in description
+    assert "LIMIT max_rows + 1" in description
+    assert "alias" in description  # BigQuery: duplicate output column names in a derived table
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_applies_the_default_row_cap_through_the_sdk(
+    mock_bq_module, _mock_capacity
+):
+    # The audit's reproduction (100,000 rows back from a call with no max_rows), through the
+    # SDK's own dispatch: 1,500 real Rows, no max_rows -> 1,000 rows and a row-cap refusal.
+    rows = [Row((index,), {"n": 0}) for index in range(1500)]
+    client = _bigquery_mocks_returning_rows(mock_bq_module, rows)
+
+    result = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT n FROM t"})
+
+    assert result.is_error is not True
+    assert result.structured_content["status"] == "refused"
+    assert result.structured_content["reason"] == "row_cap_exceeded"
+    assert result.structured_content["row_count"] == 1000
+    assert len(result.structured_content["rows"]) == 1000
+    assert "LIMIT 1001" in client.query.call_args[0][0]
+    result_kwargs = client.query.return_value.result.call_args.kwargs
+    assert (result_kwargs["max_results"], result_kwargs["page_size"]) == (1001, 500)
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_caps_the_serialised_result_through_the_sdk(
+    mock_bq_module, _mock_capacity
+):
+    # The audit's second reproduction: one 8.4 MB cell used to leave as an 8.4 MB response.
+    _bigquery_mocks_returning_rows(mock_bq_module, [Row(("x" * 8_400_000,), {"blob": 0})])
+
+    result = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT blob FROM t"})
+
+    assert result.is_error is not True
+    assert result.structured_content["status"] == "refused"
+    assert result.structured_content["reason"] == "result_size_exceeded"
+    assert result.structured_content["rows"] == []
+    assert result.structured_content["row_count"] == 0
+    assert "8 MiB" in result.structured_content["hint"]
+    assert len(result.model_dump_json()) < 10_000

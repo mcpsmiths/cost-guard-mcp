@@ -111,7 +111,9 @@ def test_databricks_dollar_cap_still_discriminates_when_statistics_present(
 
     assert admitted.status == "ok"
     assert admitted.estimate.estimated_cost_usd == _EXPECTED_50TB_COST_USD
-    mock_execute_bounded.assert_called_once_with("SELECT * FROM t", warehouse=None, max_rows=None)
+    mock_execute_bounded.assert_called_once_with(
+        "SELECT * FROM t", warehouse=None, max_rows=1000, wrap_in_limit=True
+    )
 
 
 @patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine.execute_bounded")
@@ -210,5 +212,7 @@ def test_run_query_bounded_runs_on_a_stopped_databricks_warehouse_without_caps(
     assert result.status == "ok"
     assert result.estimate.estimated_cost_usd == _EXPECTED_50TB_COST_USD
     mock_connect.assert_called_once()
-    mock_execute_bounded.assert_called_once_with("SELECT * FROM t", warehouse=None, max_rows=None)
+    mock_execute_bounded.assert_called_once_with(
+        "SELECT * FROM t", warehouse=None, max_rows=1000, wrap_in_limit=True
+    )
     assert not any("no session was opened" in c for c in result.estimate.caveats)

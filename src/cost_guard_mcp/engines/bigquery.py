@@ -13,6 +13,7 @@ from cost_guard_mcp.errors import (
     sanitize_exceptions,
 )
 from cost_guard_mcp.pricing.bigquery_pricing import ON_DEMAND_USD_PER_TIB, TIB_IN_BYTES
+from cost_guard_mcp.result_bounds import FETCH_PAGE_SIZE, collect_rows
 from cost_guard_mcp.sql_scope import single_statement_body
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
@@ -299,17 +300,24 @@ def execute_bounded(
     max_bytes_billed: int | None,
     max_rows: int | None,
     project: str | None = None,
+    *,
+    wrap_in_limit: bool = True,
 ) -> tuple[list[dict], int, bool]:
     """Execute `sql` with optional byte and row bounds.
 
-    Row bounding wraps the query in `LIMIT max_rows + 1` so the fetch itself never pulls
-    more than max_rows + 1 rows over the wire — the caller can tell "there were exactly
-    max_rows" apart from "there were more than max_rows" via the returned bool.
+    Row bounding (#94): when `wrap_in_limit` (the tool passes the outcome of
+    sql_scope_keywords.is_single_query_statement; library callers get today's behaviour) the
+    query runs inside `LIMIT max_rows + 1`, so the result the service computes is bounded too.
+    In every case the fetch asks the API for at most max_rows + 1 rows in pages of
+    FETCH_PAGE_SIZE and stops consuming (result_bounds.collect_rows) at the sentinel row or
+    once the running size estimate crosses MAX_RESULT_BYTES. The returned bool is True whenever
+    the fetch stopped before the result was exhausted - "there were exactly max_rows" and
+    "there were more" stay distinguishable through the sentinel row.
     """
     client = bigquery.Client(project=project)
 
     wrapped_sql = sql
-    if max_rows is not None:
+    if max_rows is not None and wrap_in_limit:
         # `sql` is the caller's own query, passed as this tool's actual `sql` parameter -
         # wrapping their query in a LIMIT subquery to cap rows is this function's job, not
         # untrusted input reaching a query built from a different source. The trailing `;`
@@ -344,19 +352,25 @@ def execute_bounded(
             raise ProviderByteCapExceeded(max_bytes_billed) from None
         raise
     try:
-        rows = [
-            dict(row)
-            for row in query_job.result(
-                timeout=_MAX_EXECUTION_WAIT_SECONDS,
-                # Every RPC inside result() - jobs.get via done(), jobs.getQueryResults via
-                # _reload_query_results(), row paging - must carry the 30 s bound too: without
-                # retry= they inherit DEFAULT_RETRY's 600 s deadline, and the timeout above is
-                # only evaluated between those retried calls (issue #103). job_retry stays
-                # None: it alone decides whether the library re-submits the billed job.
-                retry=_API_RETRY,
-                job_retry=None,
-            )
-        ]
+        iterator = query_job.result(
+            timeout=_MAX_EXECUTION_WAIT_SECONDS,
+            # Every RPC inside result() - jobs.get via done(), jobs.getQueryResults via
+            # _reload_query_results(), row paging - must carry the 30 s bound too: without
+            # retry= they inherit DEFAULT_RETRY's 600 s deadline, and the timeout above is
+            # only evaluated between those retried calls (issue #103). job_retry stays
+            # None: it alone decides whether the library re-submits the billed job.
+            retry=_API_RETRY,
+            job_retry=None,
+            # max_results stops the iterator at the sentinel row; page_size also bounds the
+            # very first jobs.getQueryResults download (without it the API's default page
+            # arrives before our code sees a row). Each REST page is further capped by the
+            # API's ~10 MB response limit. Scripts return an _EmptyRowIterator that ignores
+            # both. max_rows + 1 fits int64: the tool validated max_rows <= 2^63 - 2.
+            max_results=None if max_rows is None else max_rows + 1,
+            page_size=FETCH_PAGE_SIZE if max_rows is None else min(FETCH_PAGE_SIZE, max_rows + 1),
+        )
+        # The paging RPCs happen while iterating, so the consume stays inside this try.
+        rows, row_cap_hit = collect_rows(iterator, max_rows)
     except GoogleAPICallError as exc:
         if _is_bytes_billed_limit_exceeded(exc):
             raise ProviderByteCapExceeded(max_bytes_billed) from None
@@ -390,10 +404,6 @@ def execute_bounded(
             f"Query exceeded {_MAX_EXECUTION_WAIT_SECONDS}s and was cancelled "
             f"(job_id={presented_job_id})."
         ) from None
-
-    row_cap_hit = max_rows is not None and len(rows) > max_rows
-    if row_cap_hit:
-        rows = rows[:max_rows]
 
     return rows, len(rows), row_cap_hit
 

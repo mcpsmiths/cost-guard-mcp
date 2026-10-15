@@ -85,3 +85,12 @@ def test_statement_timeout_is_in_the_connectors_own_session_conf_allowlist():
 def test_sdk_config_exposes_the_bounds_and_auth_type_connect_sets():
     for attribute in ("retry_timeout_seconds", "http_timeout_seconds", "auth_type"):
         assert hasattr(Config, attribute), attribute
+
+
+# #94: execute_bounded opens its cursor with arraysize=FETCH_PAGE_SIZE so the connector's own
+# FetchResults round trips match the paged fetch. Connection.cursor takes real keyword
+# parameters (no **kwargs catch-all), so a rename would raise - this pin keeps that visible.
+def test_connection_cursor_accepts_arraysize():
+    params = inspect.signature(databricks_sql_client.Connection.cursor).parameters
+    assert "arraysize" in params
+    assert "kwargs" not in params

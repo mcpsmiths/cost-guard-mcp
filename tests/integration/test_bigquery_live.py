@@ -73,3 +73,26 @@ def test_run_query_bounded_succeeds_under_generous_cap():
     assert result.status == "ok"
     assert result.row_count == 5
     assert len(result.rows) == 5
+
+
+def test_run_query_bounded_default_limit_wrap_rejects_duplicate_output_columns():
+    """#94: with max_rows omitted a single SELECT runs inside `SELECT * FROM (...) AS
+    cost_guard_row_cap LIMIT 1001`, so it must be valid as a derived table. BigQuery accepts
+    duplicate output column names at the top level (the dry run prices the unwrapped text and
+    passes) but rejects them inside a subquery with "Duplicate column names in the result are
+    not supported"; the job fails at compile time, nothing is billed. This pins the real provider
+    behaviour behind the README / tool-description remedy (alias colliding output columns). If
+    BigQuery ever accepts the wrapped form, this test fails and the remedy text comes out."""
+    from cost_guard_mcp.errors import SanitizedEngineError
+    from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
+
+    _require_env("BIGQUERY_PROJECT")
+    _require_env("GOOGLE_APPLICATION_CREDENTIALS")
+
+    with pytest.raises(SanitizedEngineError, match="(?i)duplicate column"):
+        run_query_bounded("bigquery", "SELECT 1 AS a, 2 AS a")
+
+    # The remedy, under the same default wrap.
+    result = run_query_bounded("bigquery", "SELECT 1 AS a, 2 AS b")
+    assert result.status == "ok"
+    assert result.rows == [{"a": 1, "b": 2}]

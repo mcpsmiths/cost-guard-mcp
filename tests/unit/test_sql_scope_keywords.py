@@ -19,6 +19,7 @@ from cost_guard_mcp.sql_scope_keywords import (
     READ_STATEMENT_KEYWORDS,
     assert_read_statement,
     first_keyword,
+    is_single_query_statement,
 )
 
 ENGINES = ["bigquery", "snowflake", "databricks"]
@@ -374,3 +375,56 @@ def test_refusal_is_logged_once_and_success_is_silent(caplog):
 )
 def test_first_keyword_returns_the_upper_cased_word_and_its_offset(sql, expected):
     assert first_keyword(sql, dialect_for("bigquery")) == expected
+
+
+# --- #94: is the statement valid as the derived table of the LIMIT wrap? ---------------------
+
+
+def _nested_with(depth):
+    sql = "SELECT 1"
+    for _ in range(depth):
+        sql = f"WITH t AS ({sql}) SELECT * FROM t"  # noqa: S608 - test text, never executed
+    return sql
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT 1", True),
+        ("select 1;", True),
+        ("(SELECT 1)", True),
+        ("((SELECT 1))", True),
+        ("-- c\nSELECT 1", True),
+        ("/* c */ VALUES (1)", True),
+        ("WITH t AS (SELECT 1) SELECT * FROM t", True),
+        ("WITH t AS (SELECT 1) VALUES (1)", True),
+        ("WITH t AS (SELECT 1), u AS (SELECT 2) (SELECT * FROM t)", True),
+        (_nested_with(3), True),
+        # A WITH is not enough: Spark allows WITH ... INSERT, and under the write opt-out the
+        # gate does not look at it - wrapping it would be invalid SQL.
+        ("WITH t AS (SELECT 1) INSERT INTO x SELECT * FROM t", False),
+        ("WITH t AS (SELECT 1) MERGE INTO x USING t ON 1=1", False),
+        ("SHOW TABLES", False),
+        ("DESCRIBE t", False),
+        ("DESC t", False),
+        ("EXPLAIN SELECT 1", False),
+        ("INSERT INTO t VALUES (1)", False),
+        ("DELETE FROM t", False),
+        ("SELECT 1; SELECT 2", False),
+        ("", False),
+        ("-- only", False),
+        ("'x'", False),
+        ("WITH t AS (SELECT 1", False),  # unbalanced: the walker refuses -> False, no raise
+        (_nested_with(_MAX_CTE_NESTING + 2), False),  # too deep: refused -> False, no raise
+    ],
+)
+def test_is_single_query_statement_truth_table(sql, expected, engine):
+    assert is_single_query_statement(sql, engine) is expected  # type: ignore[arg-type]
+
+
+def test_is_single_query_statement_never_logs(caplog):
+    with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+        is_single_query_statement("SELECT 1; SELECT 2", "bigquery")
+        is_single_query_statement(_nested_with(_MAX_CTE_NESTING + 2), "bigquery")
+    assert [r for r in caplog.records if r.name == _LOGGER_NAME] == []

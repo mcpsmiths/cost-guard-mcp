@@ -2,6 +2,7 @@ import logging
 import math
 import re
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -25,6 +26,7 @@ from cost_guard_mcp.errors import (
 )
 from cost_guard_mcp.pricing.databricks_pricing import SERVERLESS_USD_PER_DBU, dbus_per_hour
 from cost_guard_mcp.pricing.runtime_scaling import scale_runtime_hours
+from cost_guard_mcp.result_bounds import FETCH_PAGE_SIZE, collect_rows, iter_fetchmany
 from cost_guard_mcp.sql_scope import single_statement_body
 from cost_guard_mcp.types import AccuracyTier, CostEstimate, CredentialCheckResult
 
@@ -664,12 +666,20 @@ def execute_bounded(
     warehouse: str | None,
     max_rows: int | None,
     *,
+    wrap_in_limit: bool = True,
     _max_wait_seconds: float | None = None,
 ) -> tuple[list[dict], int, bool]:
     """Execute `sql_text` with an optional row bound and a wall-clock execution cap.
 
     `warehouse` is accepted only for calling-convention consistency and is a documented
     no-op - see check_credentials's docstring for why.
+
+    `wrap_in_limit` (#94): the tool passes whether the text is one SELECT/WITH/VALUES statement
+    and so valid inside `SELECT * FROM (...) LIMIT max_rows + 1`; SHOW/DESCRIBE/EXPLAIN and the
+    like run unwrapped and are capped by the paged fetch alone (result_bounds.collect_rows: the
+    sentinel row or the running size estimate). The returned bool is True whenever that fetch
+    stopped before the result was exhausted. The fetch runs under what is left of the
+    wall-clock cap, checked between pages.
 
     `_max_wait_seconds` is a private, test-only override for `_MAX_EXECUTION_WAIT_SECONDS`.
     It exists because patching the module-level constant from a test needs a target
@@ -689,7 +699,7 @@ def execute_bounded(
     conn = _connect(statement_timeout_seconds=max(1, math.ceil(max_wait_seconds)))
     try:
         wrapped_sql = sql_text
-        if max_rows is not None:
+        if max_rows is not None and wrap_in_limit:
             # `sql_text` is the caller's own query, passed as this tool's actual `sql`
             # parameter - wrapping their query in a LIMIT subquery to cap rows is this
             # function's job, not untrusted input reaching a query built elsewhere. The
@@ -698,7 +708,9 @@ def execute_bounded(
             inner_sql = single_statement_body(sql_text, "databricks")
             wrapped_sql = f"SELECT * FROM ({inner_sql}) AS cost_guard_row_cap LIMIT {max_rows + 1}"  # noqa: S608
 
-        cur = conn.cursor()
+        # arraysize sizes the connector's own FetchResults round trips to the paged fetch below
+        # (#94); its 100 MB buffer_size_bytes default stays as the byte bound per round trip.
+        cur = conn.cursor(arraysize=FETCH_PAGE_SIZE)
         execution_error: list[BaseException] = []
 
         def _run() -> None:
@@ -707,6 +719,9 @@ def execute_bounded(
             except BaseException as exc:  # noqa: BLE001 - re-raised on the calling thread below
                 execution_error.append(exc)
 
+        # One wall-clock budget for the statement and its fetch: the fetch phase below takes
+        # what the join leaves of it.
+        deadline = time.monotonic() + max_wait_seconds
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()
         thread.join(timeout=max_wait_seconds)
@@ -731,12 +746,32 @@ def execute_bounded(
         # a live run against a real warehouse, not just unit tests). Build dicts from
         # cursor.description instead, which is guaranteed by DB API 2.0 regardless of row type.
         columns = [col[0] for col in cur.description] if cur.description else []
-        rows = [dict(zip(columns, row, strict=True)) for row in cur.fetchall()]
-        cur.close()
 
-        row_cap_hit = max_rows is not None and len(rows) > max_rows
-        if row_cap_hit:
-            rows = rows[:max_rows]
+        def _check_fetch_deadline(fetched: int) -> None:
+            # Between pages only (#94); the first page is never pre-empted. No cur.cancel():
+            # the statement finished, only its download overran.
+            if time.monotonic() < deadline:
+                return
+            logger.warning(
+                "engine=databricks execute_bounded result fetch exceeded %ss after %s rows",
+                max_wait_seconds,
+                fetched,
+            )
+            raise TimeoutError(
+                f"Query exceeded {max_wait_seconds}s while fetching its result after "
+                f"{fetched} rows."
+            )
+
+        # fetchall used to materialise the whole result here (#94): page it and stop at the
+        # sentinel row or the size estimate instead.
+        rows, row_cap_hit = collect_rows(
+            (
+                dict(zip(columns, row, strict=True))
+                for row in iter_fetchmany(cur.fetchmany, between_pages=_check_fetch_deadline)
+            ),
+            max_rows,
+        )
+        cur.close()
 
         return rows, len(rows), row_cap_hit
     finally:

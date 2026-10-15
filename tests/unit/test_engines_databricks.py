@@ -1,3 +1,4 @@
+import itertools
 import logging
 import time
 from types import SimpleNamespace
@@ -537,9 +538,19 @@ def _make_mock_cursor(rows, execute_delay_seconds=0.0, columns=("a",)):
             time.sleep(execute_delay_seconds)
 
     mock_cursor.execute.side_effect = _execute
-    mock_cursor.fetchall.return_value = rows
+    # #94: the engine pages with fetchmany; a fetchall would silently serve nothing from this
+    # fixture, so it is made loud instead.
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager(rows)
+    mock_cursor.fetchall.side_effect = AssertionError("execute_bounded must page, not fetchall")
     mock_cursor.description = [(col,) for col in columns]
     return mock_cursor
+
+
+def _fetchmany_pager(rows):
+    """A cursor.fetchmany stand-in: serves `rows` in pages, then empty pages, as the connector
+    does."""
+    remaining = iter(rows)
+    return lambda size: list(itertools.islice(remaining, size))
 
 
 @patch("cost_guard_mcp.engines.databricks._connect")
@@ -1694,3 +1705,87 @@ def _make_mock_cursor_connection(rows):
     mock_conn = MagicMock()
     mock_conn.cursor.return_value = _make_mock_cursor(rows)
     return mock_conn
+
+
+# --- #94: paged fetch, page-sized cursor, fetch-phase deadline ------------------------------
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_opens_the_cursor_with_the_fetch_page_size(mock_connect):
+    mock_conn = _make_mock_cursor_connection([(1,)])
+    mock_connect.return_value = mock_conn
+
+    execute_bounded("SELECT 1", warehouse=None, max_rows=None)
+
+    # arraysize sizes the connector's own FetchResults round trips to match our paging; the
+    # 100 MB buffer_size_bytes bound is the connector's default and stays.
+    mock_conn.cursor.assert_called_once_with(arraysize=500)
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_fetches_in_pages_and_never_calls_fetchall(mock_connect):
+    mock_cursor = _make_mock_cursor([(index,) for index in range(1200)])
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    rows, row_count, row_cap_hit = execute_bounded(
+        "SHOW TABLES", warehouse=None, max_rows=1000, wrap_in_limit=False
+    )
+
+    assert (row_count, row_cap_hit) == (1000, True)
+    assert rows[0] == {"a": 0} and rows[-1] == {"a": 999}
+    assert [call.args for call in mock_cursor.fetchmany.call_args_list] == [(500,), (500,), (500,)]
+    mock_cursor.fetchall.assert_not_called()
+    assert mock_cursor.execute.call_args[0][0] == "SHOW TABLES"  # unwrapped
+
+
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_wraps_by_default_for_library_callers(mock_connect):
+    mock_connect.return_value = _make_mock_cursor_connection([(1,)])
+
+    execute_bounded("SELECT * FROM t", warehouse=None, max_rows=5)
+
+    cursor = mock_connect.return_value.cursor.return_value
+    assert cursor.execute.call_args[0][0] == (
+        "SELECT * FROM (SELECT * FROM t) AS cost_guard_row_cap LIMIT 6"
+    )
+
+
+@patch("cost_guard_mcp.engines.databricks.time.monotonic")
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_fetch_phase_is_bounded_by_the_remaining_watchdog_budget(
+    mock_connect, mock_monotonic, caplog
+):
+    # Symmetry with Snowflake (D8): the post-join fetch used to run outside the watchdog. The
+    # first page is never pre-empted; the check before page 2 sees the budget gone.
+    mock_cursor = _make_mock_cursor([(index,) for index in range(1200)])
+    clock = {"now": 0.0}
+    mock_monotonic.side_effect = lambda: clock["now"]
+    pager = mock_cursor.fetchmany.side_effect
+
+    def slow_first_page(size):
+        clock["now"] = 1.0
+        return pager(size)
+
+    mock_cursor.fetchmany.side_effect = slow_first_page
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with (
+        caplog.at_level(logging.WARNING, logger="cost_guard_mcp.engines.databricks"),
+        pytest.raises(SanitizedEngineError, match="while fetching its result after 500 rows"),
+    ):
+        execute_bounded("SELECT 1", warehouse=None, max_rows=None, _max_wait_seconds=0.2)
+
+    assert mock_cursor.fetchmany.call_count == 1
+    mock_cursor.cancel.assert_not_called()  # the statement finished; only the fetch overran
+    mock_conn.close.assert_called_once()
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelname == "WARNING" and r.name == "cost_guard_mcp.engines.databricks"
+    ]
+    assert len(warnings) == 1
+    assert "result fetch exceeded 0.2s after 500 rows" in warnings[0].message

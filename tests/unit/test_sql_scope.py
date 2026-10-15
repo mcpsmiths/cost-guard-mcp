@@ -4,6 +4,7 @@ from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.sql_scope import (
     ALLOW_MULTI_STATEMENT_SQL_ENV_VAR,
     assert_single_statement,
+    is_single_statement,
     single_statement_body,
 )
 
@@ -469,3 +470,36 @@ def test_refuses_text_with_no_sql_statement(sql, engine):
     # gate, the estimate was dispatched on the raw text and, with max_rows, an empty subquery
     # 'SELECT * FROM () AS cost_guard_row_cap LIMIT n' reached the provider.
     _refuses(sql, engine, match="no SQL statement")
+
+
+# --- #94: the non-raising single-statement predicate the LIMIT wrap rule uses ----------------
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+@pytest.mark.parametrize(
+    ("sql", "expected"),
+    [
+        ("SELECT 1", True),
+        ("SELECT 1;", True),
+        ("SELECT 1 /* c */ ;", True),
+        ("  -- lead\nSELECT 1 -- trail", True),
+        ("SELECT 1; SELECT 2", False),
+        ("SELECT 1;;", False),  # the gate refuses a second ";" as "more SQL"; so does this
+        ("", False),
+        ("   ", False),
+        ("-- only a comment", False),
+        (";", False),
+        ("SELECT 'unterminated", False),
+        ("SELECT 1 /* unterminated", False),
+    ],
+)
+def test_is_single_statement_truth_table(sql, expected, engine):
+    assert is_single_statement(sql, engine) is expected  # type: ignore[arg-type]
+
+
+def test_is_single_statement_ignores_the_operator_opt_out(monkeypatch):
+    # A shape question, not a gate: under the opt-out the gate lets a script through, and the
+    # wrap rule must still see it as more than one statement (a wrapped script is invalid SQL).
+    monkeypatch.setenv(ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, "1")
+    assert_single_statement("SELECT 1; SELECT 2", "bigquery")  # the gate is off
+    assert is_single_statement("SELECT 1; SELECT 2", "bigquery") is False
