@@ -325,7 +325,7 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
   than this estimate. Live-verified 2026-09-18 against a real trial account: its default
   warehouse (`COMPUTE_WH`) is genuinely Gen2 on AWS, and the detection applied the Gen2 rate;
   the `SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution are pinned
-  by `tests/integration/test_snowflake_live.py` (run before each release since 0.4.0). The same row's
+  by `tests/integration/test_snowflake_live.py` (run weekly and on demand by `integration.yml`). The same row's
   `state` and `auto_resume` columns drive the warehouse-state guard described below.
 - Snowflake's edition is operator configuration (`SNOWFLAKE_EDITION`, default `standard`),
   because the server cannot observe it without ORGADMIN; the per-call `edition` argument can
