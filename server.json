@@ -108,6 +108,12 @@
           "isSecret": false
         },
         {
+          "name": "COST_GUARD_ALLOW_WRITE_STATEMENTS",
+          "description": "Set to 1 (exactly that value) to let estimate_query_cost/run_query_bounded accept statements that are not reads. Off by default: only text whose first keyword (after comments and opening parentheses) is SELECT, WITH, VALUES, SHOW, DESCRIBE, DESC or EXPLAIN is estimated or run - a WITH must be followed by a SELECT or VALUES - because warehouse rows re-enter the model's context and can steer the next call. The gate is defence in depth: the authorisation boundary is the credential's grants (deploy a read-only principal). With COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1 every statement in the text must be a read, so BigQuery scripts (DECLARE/SET/BEGIN) need both opt-outs. Any other value leaves the gate on.",
+          "isRequired": false,
+          "isSecret": false
+        },
+        {
           "name": "COST_GUARD_MAX_IN_FLIGHT_QUERIES",
           "description": "Maximum number of run_query_bounded calls allowed in flight at once (positive integer, default 8). A cancelled call keeps its slot until its warehouse query completes or the 120 s watchdog fires; a call over the cap fails with a tool error naming this variable before any warehouse connection is opened.",
           "isRequired": false,

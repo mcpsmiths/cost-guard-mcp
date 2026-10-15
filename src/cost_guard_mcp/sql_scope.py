@@ -283,15 +283,9 @@ def _scan(sql: str, dialect: _Dialect) -> int:
     statement_end = 0
     while index < len(sql):
         ch = sql[index]
-        if (
-            sql.startswith("--", index)
-            or (dialect.hash_line_comments and ch == "#")
-            or (dialect.double_slash_line_comments and sql.startswith("//", index))
-        ):
-            index = _line_comment_end(sql, index, dialect)
-            continue
-        if sql.startswith("/*", index):
-            index = _block_comment_end(sql, index)
+        comment = comment_end(sql, index, dialect)
+        if comment is not None:
+            index = comment
             continue
         if ch.isspace():
             index += 1
@@ -308,26 +302,55 @@ def _scan(sql: str, dialect: _Dialect) -> int:
             terminator_seen = True
             index += 1
             continue
-        if ch in "'\"":
-            index = statement_end = _quoted_end(sql, index, dialect)
-            continue
-        if ch == "`" and dialect.backtick_identifiers:
-            index = statement_end = _unescaped_literal_end(sql, index + 1, "`", "quoted identifier")
-            continue
-        if dialect.dollar_strings and sql.startswith("$$", index):
-            if _prefix_before(sql, index):
-                raise _refuse(
-                    "'$$' directly attached to an identifier is ambiguous ($ is an identifier "
-                    "character) - put whitespace before it",
-                    index,
-                )
-            index = statement_end = _unescaped_literal_end(
-                sql, index + 2, "$$", "dollar-quoted string"
-            )
+        literal = literal_end(sql, index, dialect)
+        if literal is not None:
+            index = statement_end = literal
             continue
         index += 1
         statement_end = index
     return statement_end
+
+
+def dialect_for(engine: str) -> _Dialect:
+    """The dialect table for ``engine``; the shared-constructs fallback for an unknown one."""
+    return _DIALECTS.get(engine, _FALLBACK)
+
+
+def comment_end(sql: str, index: int, dialect: _Dialect) -> int | None:
+    """End (exclusive) of the comment opening at ``index``, or None when none opens there.
+
+    Shared with ``sql_scope_keywords`` so both gates end comments at the same place. Raises
+    this module's refusals (unterminated or nested block comment, the #104 line-comment
+    shapes)."""
+    if (
+        sql.startswith("--", index)
+        or (dialect.hash_line_comments and sql[index] == "#")
+        or (dialect.double_slash_line_comments and sql.startswith("//", index))
+    ):
+        return _line_comment_end(sql, index, dialect)
+    if sql.startswith("/*", index):
+        return _block_comment_end(sql, index)
+    return None
+
+
+def literal_end(sql: str, index: int, dialect: _Dialect) -> int | None:
+    """End (exclusive) of the quoted construct opening at ``index`` - string literal, quoted
+    identifier, backtick identifier or dollar-quoted string, per dialect - or None when none
+    opens there. Raises this module's refusals for unterminated or ambiguous shapes."""
+    ch = sql[index]
+    if ch in "'\"":
+        return _quoted_end(sql, index, dialect)
+    if ch == "`" and dialect.backtick_identifiers:
+        return _unescaped_literal_end(sql, index + 1, "`", "quoted identifier")
+    if dialect.dollar_strings and sql.startswith("$$", index):
+        if _prefix_before(sql, index):
+            raise _refuse(
+                "'$$' directly attached to an identifier is ambiguous ($ is an identifier "
+                "character) - put whitespace before it",
+                index,
+            )
+        return _unescaped_literal_end(sql, index + 2, "$$", "dollar-quoted string")
+    return None
 
 
 def single_statement_body(sql: str, engine: Engine) -> str:

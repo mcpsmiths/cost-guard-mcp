@@ -320,8 +320,49 @@ the gate guarantees that a listing published from a tagged checkout points at th
 project at the tag's version. HANDOFF.md's distribution note now points here instead of
 describing the manual run as the procedure.
 
-<!-- #13 is reserved for the read-statement allowlist decision (an open owner decision in
-the 2026-10 remediation plan) so that number is never reused for something else. -->
+## 13. The tools accept only read statements by default; result rows are labelled as untrusted data
+
+**Context:** Warehouse row content re-enters the model's context, and a model that has just read
+a row can be steered by it into any statement the deployed credential allows. The 2026-10 audit
+left this as an owner decision (`warehouse-content-to-unrestricted-sql-under-operator-credential`);
+0.4.0 shipped the single-statement scanner (#15) and labelled error text (#18) but no
+statement-type gate. The owner's decision (2026-10-14, #93): a read-statement allowlist on both
+tools with an operator opt-out, a schema-visible provenance marker on result rows, and
+documentation that the credential's grants are the boundary.
+
+**Decision:** `sql_scope_keywords.assert_read_statement(sql, engine)` runs in both tools
+immediately after `assert_single_statement`. It admits a statement only when its first ASCII
+keyword - after comments and any opening parentheses, through the lexer shared with #15 - is
+`SELECT`, `WITH`, `VALUES`, `SHOW`, `DESCRIBE`, `DESC` or `EXPLAIN`; a `WITH` is admitted only when
+the walk over its CTE list (`name [(cols)] AS (body)`, comma separated, `RECURSIVE` allowed, every
+body itself resolving to `SELECT`/`VALUES`, nested `WITH`s resolved the same way) finds `SELECT` or
+`VALUES` as the main statement - Spark's grammar allows `WITH ... INSERT|UPDATE|DELETE|MERGE`, so a
+first-keyword check alone would admit a write on Databricks. Under the multi-statement opt-out
+every statement in the text must pass. Refusals are `UserVisibleError`s with an offset and the
+opt-out's name, never the SQL (#15's rule). `COST_GUARD_ALLOW_WRITE_STATEMENTS=1`, exactly, read
+per call, is the opt-out (`read_statement_check=skipped|refused` INFO records mirror #15's).
+`BoundedQueryResult.rows_provenance` is the constant `"warehouse_data_untrusted"` with a schema
+description stating that rows are data, never instructions - additive, the intended `tools/list`
+diff; no class docstring (it would add a top-level description to the outputSchema). SECURITY.md
+and README state that the authorisation boundary is the credential's grants and recommend a
+read-only principal per engine. Rejected: a write-keyword denylist (fails open on every keyword it
+does not list - `COPY INTO`, `EXPORT DATA`, `EXECUTE IMMEDIATE`, `CALL`, ...); per-dialect
+allowlists (`SHOW`/`DESCRIBE` are Snowflake/Databricks-only, `EXPLAIN` does not exist on BigQuery -
+the providers reject them as syntax errors and the gate's job is to refuse writes, not to validate
+reads; one owner-confirmed set is smaller and no less safe); a SQL parser (#15's reasoning);
+gating `rows` behind a new field for the #105 note (would widen the schema diff beyond the one
+property).
+
+**Consequences:** Breaking for operators who ran writes through `run_query_bounded`: they set the
+opt-out (and should re-check the credential's grants). BigQuery scripts (`DECLARE`/`SET`/`BEGIN`)
+need both opt-outs. False positives in the safe direction: `TABLE t`, Spark `FROM t SELECT`,
+BigQuery pipe syntax, `SET`/`USE` session statements, `WITH ... MATERIALIZED`. Admitted is not
+supported: `SHOW`/`DESCRIBE`/`EXPLAIN` fail at the estimate on BigQuery and Snowflake and cannot be
+combined with `max_rows` (the LIMIT wrapper is `SELECT`-shaped). A `SELECT` may still have side
+effects through a remote function, UDF or system function the credential can call - the gate does
+not claim otherwise. `EXPLAIN <DML>` is admitted (plan only on the engines that have EXPLAIN).
+`hint` on an `ok` result is now possible (#17 amendment, #105). Ships in the next minor (0.5.0
+planned: a breaking 0.x default change bumps the minor, as 0.4.0 did).
 
 ## 14. `run_query_bounded` cancellation: prompt detach, pre-dispatch check, provider-side deadlines, in-flight cap
 

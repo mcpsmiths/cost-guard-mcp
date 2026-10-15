@@ -8,6 +8,15 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ### Security
 
+- **Breaking: read statements only by default.** `estimate_query_cost` and `run_query_bounded`
+  refuse any statement whose first keyword is not `SELECT`, `WITH` (followed by `SELECT`/`VALUES`),
+  `VALUES`, `SHOW`, `DESCRIBE`, `DESC` or `EXPLAIN`, before any estimate or execution
+  (`DECISIONS.md` #13; #93). Opt-out: `COST_GUARD_ALLOW_WRITE_STATEMENTS=1` (exactly). With
+  `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1` every statement must be a read, so BigQuery scripts now
+  need both opt-outs. `run_query_bounded` results carry the constant
+  `rows_provenance: warehouse_data_untrusted` (additive `outputSchema` change, the intended
+  `tools/list` diff) and both tool descriptions changed. The authorisation boundary remains the
+  deployed credential's grants (read-only recommended; SECURITY.md, README).
 - **Read-only tools no longer wake a warehouse by default** (`check_credentials`,
   `estimate_query_cost`; `DECISIONS.md` #20; #91, #92). Databricks: the configured SQL
   warehouse's state is read through the Warehouses API first; unless it is `RUNNING` - also
@@ -30,6 +39,8 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ### Added
 
+- `COST_GUARD_ALLOW_WRITE_STATEMENTS`, documented in `server.json`, `.mcp.json.example` and the README
+  (Setup, Known limitations, the Codex env block).
 - `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START` and `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME`,
   documented in `server.json`, `.mcp.json.example` and the README (Setup, Known limitations).
 

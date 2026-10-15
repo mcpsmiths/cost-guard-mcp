@@ -188,6 +188,43 @@ def test_refuses_multi_statement_text_before_any_estimate_or_execute(
         engine_module.execute_bounded.assert_not_called()
 
 
+@pytest.mark.parametrize("engine", ["bigquery", "snowflake", "databricks"])
+@patch("cost_guard_mcp.tools.run_query_bounded.databricks_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.snowflake_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_refuses_a_write_statement_before_any_estimate_or_execute(
+    mock_estimate, mock_bigquery, mock_snowflake, mock_databricks, engine
+):
+    # DECISIONS.md #13: the read gate runs right after the single-statement gate (the
+    # multi-statement shape above is still refused by THAT contract, proving the order) and
+    # before the estimate and the dispatch; the refusal names the operator opt-out.
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+
+    with pytest.raises(UserVisibleError, match="only read statements") as excinfo:
+        run_query_bounded(engine, "DELETE FROM big_t WHERE TRUE", max_estimated_cost_usd=1.0)
+
+    assert "COST_GUARD_ALLOW_WRITE_STATEMENTS=1" in str(excinfo.value)
+    mock_estimate.assert_not_called()
+    for engine_module in (mock_bigquery, mock_snowflake, mock_databricks):
+        engine_module.execute_bounded.assert_not_called()
+
+
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_every_result_carries_the_constant_rows_provenance(mock_estimate, mock_engine):
+    mock_estimate.return_value = _estimate(cost=10.0, bytes_=1000)
+    refused = run_query_bounded("bigquery", "SELECT 1", max_estimated_cost_usd=1.0)
+    assert refused.status == "refused"
+    assert refused.rows_provenance == "warehouse_data_untrusted"
+
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    mock_engine.execute_bounded.return_value = ([{"a": 1}], 1, False)
+    ok = run_query_bounded("bigquery", "SELECT 1")
+    assert ok.status == "ok"
+    assert ok.rows_provenance == "warehouse_data_untrusted"
+
+
 @patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine")
 @patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
 def test_single_statement_with_trailing_semicolon_still_runs(mock_estimate, mock_engine):

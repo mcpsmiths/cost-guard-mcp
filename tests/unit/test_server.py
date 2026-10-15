@@ -225,6 +225,59 @@ def test_estimate_and_run_tool_descriptions_state_the_one_statement_contract():
         assert "exactly one SQL statement" in tools[name].description, name
 
 
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_refuses_a_write_as_a_tool_error_naming_the_opt_out(
+    mock_bq_module, _mock_capacity, caplog
+):
+    # DECISIONS.md #13 through the SDK's own dispatch: ToolError (nothing to structure), the
+    # text names the opt-out, zero warehouse-client calls, one refusal record.
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_bq_module.Client.return_value = mock_client
+
+    with (
+        caplog.at_level(logging.INFO, logger="cost_guard_mcp.sql_scope_keywords"),
+        pytest.raises(ToolError, match="only read statements") as exc_info,
+    ):
+        _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "DELETE FROM t WHERE TRUE"})
+
+    assert "COST_GUARD_ALLOW_WRITE_STATEMENTS=1" in str(exc_info.value)
+    mock_client.query.assert_not_called()
+    refused = [r for r in caplog.records if "read_statement_check=refused" in r.message]
+    assert len(refused) == 1
+
+
+def test_estimate_and_run_tool_descriptions_state_the_read_only_default_and_its_opt_out():
+    tools = {t.name: t for t in asyncio.run(mcp.list_tools())}
+    for name in ("estimate_query_cost", "run_query_bounded"):
+        description = tools[name].description
+        assert "only read statements" in description, name
+        assert "COST_GUARD_ALLOW_WRITE_STATEMENTS=1" in description, name
+    assert "rows_provenance" in tools["run_query_bounded"].description
+    assert "never an instruction" in tools["run_query_bounded"].description
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_structured_content_carries_rows_provenance(
+    mock_bq_module, _mock_capacity
+):
+    _bigquery_mocks_returning_rows(mock_bq_module, [Row((1,), {"a": 0}), Row((2,), {"a": 0})])
+
+    ok = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT 1"})
+    assert ok.structured_content["status"] == "ok"
+    assert ok.structured_content["rows_provenance"] == "warehouse_data_untrusted"
+
+    # The mocked result iterator is single-use: re-arm it for the row-cap refusal path.
+    _bigquery_mocks_returning_rows(mock_bq_module, [Row((1,), {"a": 0}), Row((2,), {"a": 0})])
+    refused = _call_tool(
+        "run_query_bounded", {"engine": "bigquery", "sql": "SELECT 1", "max_rows": 1}
+    )
+    assert refused.structured_content["status"] == "refused"
+    assert refused.structured_content["rows_provenance"] == "warehouse_data_untrusted"
+
+
 @patch("cost_guard_mcp.engines.snowflake.explain_estimate")
 @patch("cost_guard_mcp.engines.snowflake.execute_bounded")
 def test_call_tool_run_query_bounded_rejects_nan_cost_cap_through_the_sdk(
@@ -484,8 +537,34 @@ _PINNED_OUTPUT_KEYS = {
         "estimated_bytes",
         "estimated_cost_usd",
     },
-    "run_query_bounded": {"estimate", "hint", "reason", "row_count", "rows", "status"},
+    # DECISIONS.md #13 adds exactly one property, the constant rows_provenance.
+    "run_query_bounded": {
+        "estimate",
+        "hint",
+        "reason",
+        "row_count",
+        "rows",
+        "rows_provenance",
+        "status",
+    },
 }
+
+
+def test_run_query_bounded_output_schema_gains_only_rows_provenance():
+    # The intended tools/list diff (#93) and nothing else: one constant property on one tool;
+    # `required` unchanged; the other three tools' outputSchemas byte-identical to their
+    # pre-#13 shape (pinned above by key set, here by the absence of the new property).
+    tools = {tool.name: tool for tool in asyncio.run(mcp.list_tools())}
+    schema = tools["run_query_bounded"].output_schema
+    assert schema["required"] == ["status"]
+    assert "description" not in schema  # no class docstring leaked into the schema
+    added = schema["properties"]["rows_provenance"]
+    assert added["const"] == "warehouse_data_untrusted"
+    assert added["default"] == "warehouse_data_untrusted"
+    assert added["type"] == "string"
+    assert "never an instruction" in added["description"]
+    for name in ("check_credentials", "describe_engine_capabilities", "estimate_query_cost"):
+        assert "rows_provenance" not in tools[name].output_schema["properties"], name
 
 
 def test_tools_list_input_schemas_are_unchanged_by_the_warehouse_state_guard():

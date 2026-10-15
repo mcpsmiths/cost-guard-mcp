@@ -17,6 +17,7 @@ from cost_guard_mcp.engines.bigquery import (
 )
 from cost_guard_mcp.errors import UserVisibleError
 from cost_guard_mcp.sql_scope import assert_single_statement
+from cost_guard_mcp.sql_scope_keywords import assert_read_statement
 from cost_guard_mcp.tools.estimate_query_cost import estimate_query_cost
 from cost_guard_mcp.types import BoundedQueryResult, Engine, RefusalReason
 
@@ -184,8 +185,10 @@ def run_query_bounded(
     # The text priced below must be the text executed below, as exactly one statement:
     # a second statement behind a top-level ';' would run under a cap that was never
     # checked against it. Explicit here (estimate_query_cost checks too) so the pin holds
-    # even when the estimate is replaced or skipped.
+    # even when the estimate is replaced or skipped. And only a read statement: warehouse rows
+    # re-enter the model context and can steer this tool - DECISIONS.md #13.
     assert_single_statement(sql, engine)
+    assert_read_statement(sql, engine)
 
     # `estimate > nan` is False for every estimate, so a NaN cap would admit anything with
     # no cap at all - and the mcp SDK's JSON parser accepts a bare NaN literal. +inf is

@@ -41,6 +41,18 @@ tokens / OAuth client secrets). In scope:
   untrusted data, not an instruction: anything that lets it reach the model or the
   operator's log unlabelled, unbounded, or able to forge a log-record boundary
 
+Authorisation boundary. The authorisation boundary for everything these tools execute is the
+deployed credential's grants - a read-only principal is recommended for all three engines
+(BigQuery: data-viewer plus job-user roles; Snowflake: a role with USAGE/SELECT only, never an
+admin role; Databricks: SELECT/USE privileges on the warehouse's catalogs). `estimate_query_cost`
+and `run_query_bounded` additionally refuse, by default, any statement that is not a read by its
+first keyword (`SELECT`, `WITH`, `VALUES`, `SHOW`, `DESCRIBE`, `DESC`, `EXPLAIN`; `DECISIONS.md`
+#13), because warehouse rows re-enter the model's context and can steer the next call. That gate
+is defence in depth, not the boundary: a `SELECT` can still invoke a remote function, UDF or
+system function with side effects, and `COST_GUARD_ALLOW_WRITE_STATEMENTS=1` disables the gate.
+Result rows carry `rows_provenance: warehouse_data_untrusted` for the same reason. In scope:
+anything that lets a non-read statement past the gate without the opt-out.
+
 Out of scope: vulnerabilities in BigQuery, Snowflake, Databricks, or the official `mcp`
 SDK themselves — report those to Google, Snowflake, Databricks, or
 [modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk)
@@ -49,4 +61,4 @@ respectively.
 ## Supported versions
 
 Only the latest published release receives security fixes. This project is young
-(v0.1.x) and does not yet maintain multiple supported release lines.
+(0.x) and does not yet maintain multiple supported release lines.
