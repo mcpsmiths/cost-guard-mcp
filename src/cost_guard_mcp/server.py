@@ -244,8 +244,8 @@ def estimate_query_cost(
     Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
     more statements is refused before anything is estimated. This tool accepts
     only read statements (first keyword SELECT, WITH, VALUES, SHOW, DESCRIBE, DESC or EXPLAIN;
-    a WITH must lead to a SELECT or VALUES) - others are refused before anything is estimated. Operator opt-out:
-    COST_GUARD_ALLOW_WRITE_STATEMENTS=1.
+    a WITH must lead to a SELECT or VALUES) - others are refused before anything is estimated.
+    Operator opt-out: COST_GUARD_ALLOW_WRITE_STATEMENTS=1.
 
     warehouse_size (Snowflake/Databricks only, e.g. "SMALL", "X-Large") and edition
     (Snowflake only, e.g. "enterprise") can only raise the estimate: the dollar figure is
