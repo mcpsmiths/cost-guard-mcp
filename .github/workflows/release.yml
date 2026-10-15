@@ -79,7 +79,26 @@ jobs:
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           version: "0.12.23"
-      - run: uv build
+      # Hash-pinned build backend (DECISIONS.md #11, amended 2026-10-16; #97). The version pins
+      # above still trusted the index to serve the right bytes for hatchling==1.32.4; this step
+      # accepts only the wheels whose SHA-256 digests the reviewed .github/requirements-build.txt
+      # lists - hatchling and its closure, --no-deps so nothing outside the file is resolved,
+      # --only-binary so no sdist is ever built - installed into a venv under $RUNNER_TEMP, outside
+      # the checkout, so neither the sdist's contents nor `uv export` can see it. A wrong or missing
+      # hash fails here, before anything is built. tests/unit/test_release_metadata.py pins the
+      # flags and runs this script offline against a fixture wheel with a correct, a wrong and a
+      # missing hash.
+      - name: Install the hash-pinned build backend
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/build-venv"
+          uv pip install --python "$RUNNER_TEMP/build-venv/bin/python" \
+            --require-hashes --only-binary :all: --no-deps \
+            -r .github/requirements-build.txt
+      # --no-build-isolation: uv builds with that interpreter's already-installed backend instead
+      # of resolving one from the index at run time (an environment without hatchling fails the
+      # build - checked locally 2026-10-16).
+      - name: Build sdist and wheel with the pinned backend
+        run: uv build --no-build-isolation --python "$RUNNER_TEMP/build-venv/bin/python"
       # uv's cyclonedx1.5 export is experimental per uv's own warning (verified
       # 2026-09-13) and may change without notice in a future uv release -
       # harmless if it does, since this is a separate step from uv build/publish.

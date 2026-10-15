@@ -52,11 +52,12 @@ otel = [
 ]
 
 [build-system]
-# Exact pin, mirrored in [tool.uv] build-constraint-dependencies below and recorded in
-# uv.lock's [manifest]: the backend executes during every build (uv build, the editable
-# install inside uv sync, the Docker build), so it must only move through a reviewed diff.
-# Dependabot does not bump this line; tests/unit/test_release_metadata.py pins the
-# equality. See DECISIONS.md #11.
+# Exact pin, mirrored in [tool.uv] build-constraint-dependencies below, recorded in
+# uv.lock's [manifest] and hash-pinned with its closure in .github/requirements-build.txt
+# (what the release build installs under --require-hashes): the backend executes during
+# every build (uv build, the editable install inside uv sync, the Docker build), so it must
+# only move through a reviewed diff. Dependabot bumps only the hashed file;
+# tests/unit/test_release_metadata.py pins the equality of all three. See DECISIONS.md #11.
 requires = ["hatchling==1.32.4"]
 build-backend = "hatchling.build"
 
