@@ -140,3 +140,17 @@ jobs:
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
             dist/* sbom.json provenance.intoto.jsonl
+
+  # The MCP Registry listing io.github.mcpsmiths/cost-guard-mcp is published from this same
+  # tagged commit once PyPI has the version (DECISIONS.md #12; it replaces the manual
+  # device-flow publish from a personal host). The reusable workflow declares the
+  # `mcp-registry` environment and the tag-pinned checkout; this caller grants exactly the
+  # permissions a listing publish needs and nothing it does not (no contents: write).
+  registry-publish:
+    needs: publish
+    permissions:
+      contents: read
+      id-token: write
+    uses: ./.github/workflows/mcp-registry-publish.yml
+    with:
+      tag: ${{ github.ref_name }}

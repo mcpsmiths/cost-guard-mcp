@@ -137,6 +137,20 @@ def _job_block(workflow_text: str, job_name: str) -> list[str]:
     return lines[start:end]
 
 
+def _granted_permissions(block: list[str]) -> list[str]:
+    """The ``<scope>: read|write`` lines of a job's ``permissions:`` block, in file order."""
+    stripped = [line.strip() for line in block]
+    permissions_start = stripped.index("permissions:")
+    granted = []
+    for line in stripped[permissions_start + 1 :]:
+        if not line or line.startswith("#"):
+            continue
+        if not re.match(r"^[a-z-]+: (read|write)$", line):
+            break
+        granted.append(line)
+    return granted
+
+
 def _named_step(block: list[str], step_name: str) -> list[str]:
     steps = _step_blocks("\n".join(block), f"name: {step_name}")
     assert len(steps) == 1, f"expected exactly one step named {step_name!r}, found {len(steps)}"
@@ -298,14 +312,7 @@ def test_release_workflow_publish_job_is_environment_gated():
     publish_job = _job_block(RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8"), "publish")
     stripped = [line.strip() for line in publish_job]
     assert "environment: pypi" in stripped
-    permissions_start = stripped.index("permissions:")
-    granted = []
-    for line in stripped[permissions_start + 1 :]:
-        if not line or line.startswith("#"):
-            continue
-        if not re.match(r"^[a-z-]+: (read|write)$", line):
-            break
-        granted.append(line)
+    granted = _granted_permissions(publish_job)
     assert granted == ["id-token: write"], f"publish job permissions are {granted!r}"
 
 
@@ -731,3 +738,182 @@ def test_warehouse_state_opt_ins_document_their_scope():
     assert "DECISIONS.md` #20" in limitations or "DECISIONS.md #20" in limitations
     assert "attribution" in limitations
     assert "open owner decision" not in limitations
+
+
+# --- mcp-registry-listing-manual-device-flow-publish-unbound-to-release-workflow:
+#     .github/workflows/mcp-registry-publish.yml (DECISIONS.md #12, decided 2026-10-15) -------
+# The listing is published from the tagged commit by release.yml through a reusable workflow.
+# These pins keep the chain honest: the caller job holds only what a listing publish needs,
+# the callee runs under the `mcp-registry` environment with a tag-pinned, credential-free
+# checkout, the publisher binary is a pinned, digest-checked release, authentication is OIDC
+# only, and the two verification steps refuse exactly what release.yml's own gates refuse.
+
+REGISTRY_WORKFLOW_PATH = WORKFLOWS_DIR / "mcp-registry-publish.yml"
+_REGISTRY_JOB = "publish-listing"
+_REGISTRY_VERSION_GATE_STEP = "Verify tag matches"
+_REGISTRY_ANCESTRY_STEP = "Verify the checkout is the release tag on main"
+
+
+def _registry_workflow_text() -> str:
+    return REGISTRY_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+
+def _registry_job() -> list[str]:
+    return _job_block(_registry_workflow_text(), _REGISTRY_JOB)
+
+
+def _registry_step_script(step_name: str) -> str:
+    return _step_run_script(_named_step(_registry_job(), step_name))
+
+
+def test_release_workflow_publishes_the_listing_after_pypi_with_minimal_permissions():
+    # DECISIONS.md #12: `needs: publish` orders the listing after PyPI has the version; the
+    # caller job's permissions are exactly the callee's needs (no contents: write), and the
+    # tag it passes is the pushed ref, never a computed or caller-chosen value.
+    job = _job_block(RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8"), "registry-publish")
+    stripped = [line.strip() for line in job]
+    assert "needs: publish" in stripped
+    assert "uses: ./.github/workflows/mcp-registry-publish.yml" in stripped
+    assert "tag: ${{ github.ref_name }}" in stripped
+    assert sorted(_granted_permissions(job)) == ["contents: read", "id-token: write"]
+
+
+def test_registry_workflow_job_is_environment_gated_and_oidc_only():
+    # Decision #8's blast-radius split, applied to the second publisher: its own environment
+    # (never `pypi`), exactly contents: read + id-token: write, and no stored registry token.
+    text = _registry_workflow_text()
+    job = _registry_job()
+    stripped = [line.strip() for line in job]
+    assert "environment: mcp-registry" in stripped
+    assert "environment: pypi" not in stripped
+    assert sorted(_granted_permissions(job)) == ["contents: read", "id-token: write"]
+    assert "login github-oidc" in text
+    assert "login github --token" not in text
+    assert "secrets." not in text
+
+
+def test_registry_workflow_checks_out_the_tag_without_credentials():
+    # The published entry must be the reviewed tag's server.json: the checkout is pinned to
+    # refs/tags/<input>, carries full history for the ancestry gate, keeps no token, and uses
+    # the same action commit as release.yml so Dependabot moves both pins or neither.
+    checkout_steps = _step_blocks("\n".join(_registry_job()), "uses: actions/checkout@")
+    assert len(checkout_steps) == 1
+    stripped = [line.strip() for line in checkout_steps[0]]
+    assert "ref: refs/tags/${{ inputs.tag }}" in stripped
+    assert "fetch-depth: 0" in stripped
+    assert "persist-credentials: false" in stripped
+    release_checkout = _step_blocks(
+        RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8"), "uses: actions/checkout@"
+    )[0]
+    assert checkout_steps[0][0].strip() == release_checkout[0].strip()
+
+
+def test_registry_workflow_pins_and_verifies_the_publisher_binary():
+    # Never `releases/latest`: a fixed release, downloaded over TLS only, checked against a
+    # digest that lives in reviewed source (DECISIONS.md #12 records how it was taken).
+    script = _registry_step_script("Install mcp-publisher (pinned, SHA256-verified)")
+    assert re.search(r'^version="\d+\.\d+\.\d+"$', script, re.MULTILINE)
+    assert re.search(r'^expected_sha256="[0-9a-f]{64}"$', script, re.MULTILINE)
+    assert "sha256sum --check --strict" in script
+    assert "--proto '=https' --tlsv1.2" in script
+    assert "releases/latest" not in script
+
+
+def test_registry_workflow_dry_run_publishes_nothing_and_is_the_dispatch_default():
+    # The workflow_dispatch path is the acceptance test for the registry grant and the
+    # break-glass re-publish; publishing must be the explicit, non-default choice there.
+    text = _registry_workflow_text()
+    job = _registry_job()
+    publish_step = _named_step(job, "Publish server.json to the MCP Registry")
+    confirm_step = _named_step(job, "Confirm the published entry")
+    for step in (publish_step, confirm_step):
+        assert any(line.strip() == "if: ${{ inputs.dry_run != true }}" for line in step)
+    dispatch_block = text[text.index("workflow_dispatch:") : text.index("\npermissions:")]
+    assert "dry_run:" in dispatch_block
+    assert "default: true" in dispatch_block
+
+
+def test_registry_workflow_version_gate_is_the_release_gate():
+    # One gate, two workflows: the registry job must refuse exactly what release.yml's build
+    # job refuses. The only permitted difference is where the tag comes from (the input, not
+    # the push ref), so changing one text without the other fails here.
+    registry = _registry_step_script(_REGISTRY_VERSION_GATE_STEP)
+    aligned = registry.replace('TAG_VERSION="${TAG#v}"', 'TAG_VERSION="${GITHUB_REF_NAME#v}"')
+    assert aligned == _version_gate_script()
+    assert "jq" not in registry  # the manifest is verified, never rewritten in-workspace
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected_exit"),
+    [
+        pytest.param({}, 0, id="consistent"),
+        pytest.param({"package_version": "0.0.1"}, 1, id="package_version_drifts"),
+        pytest.param({"identifier": "someone-elses-package"}, 1, id="identifier_other_package"),
+        pytest.param({"registry_type": "npm"}, 1, id="registry_type_not_pypi"),
+        pytest.param({"server_version": "8.8.8"}, 1, id="top_level_version_drifts"),
+        pytest.param({"pyproject_version": "8.8.8"}, 1, id="pyproject_version_drifts"),
+    ],
+)
+def test_registry_version_gate_against_fixture_manifests(tmp_path, overrides, expected_exit):
+    # Runs the registry step's own shell text for tag v9.9.9 against the same fixture
+    # manifests as the release gate - the audit's `0.0.1` reproduction is the negative control.
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    _write_release_fixture(checkout, **overrides)
+    completed = _run_step_script(
+        _registry_step_script(_REGISTRY_VERSION_GATE_STEP),
+        cwd=checkout,
+        env={"PATH": os.environ["PATH"], "TAG": "v9.9.9"},
+        scratch=tmp_path,
+    )
+    assert completed.returncode == expected_exit, completed.stdout + completed.stderr
+
+
+def test_registry_workflow_refuses_an_off_main_tag_and_a_checkout_of_another_tag(tmp_path):
+    # Behavioural check of the step's own script against a fixture origin: an annotated tag
+    # off main is refused; a checkout that is not the commit behind the named tag is refused
+    # even when that checkout is reviewed history; the consistent case is admitted.
+    env = _hermetic_git_env(tmp_path)
+    origin = tmp_path / "origin.git"
+    seed = tmp_path / "seed"
+    runner = tmp_path / "runner"
+    _git("init", "--bare", "--initial-branch=main", str(origin), cwd=tmp_path, env=env)
+    _git("init", "--initial-branch=main", str(seed), cwd=tmp_path, env=env)
+    (seed / "reviewed.txt").write_text("merged through a PR\n", encoding="utf-8")
+    _git("add", ".", cwd=seed, env=env)
+    _git("commit", "-q", "-m", "reviewed", cwd=seed, env=env)
+    _git("tag", "-a", "v1.0.0", "-m", "release from main", cwd=seed, env=env)
+    _git("checkout", "-q", "-b", "unreviewed", cwd=seed, env=env)
+    (seed / "payload.txt").write_text("never reviewed\n", encoding="utf-8")
+    _git("add", ".", cwd=seed, env=env)
+    _git("commit", "-q", "-m", "unreviewed", cwd=seed, env=env)
+    _git("tag", "-a", "v9.9.9", "-m", "release off main", cwd=seed, env=env)
+    _git("tag", "origin/main", cwd=seed, env=env)  # the shadowing tag, at the unreviewed commit
+    _git("remote", "add", "origin", str(origin), cwd=seed, env=env)
+    _git(
+        "push",
+        "-q",
+        "origin",
+        "main",
+        "v1.0.0",
+        "v9.9.9",
+        "refs/tags/origin/main",
+        cwd=seed,
+        env=env,
+    )
+    _git("clone", "-q", str(origin), str(runner), cwd=tmp_path, env=env)
+
+    script = _registry_step_script(_REGISTRY_ANCESTRY_STEP)
+
+    _git("checkout", "-q", "--detach", "v9.9.9", cwd=runner, env=env)
+    off_main = _run_step_script(script, cwd=runner, env={**env, "TAG": "v9.9.9"}, scratch=tmp_path)
+    assert off_main.returncode == 1, off_main.stdout + off_main.stderr
+    assert "not an ancestor of origin/main" in off_main.stdout
+
+    _git("checkout", "-q", "--detach", "v1.0.0", cwd=runner, env=env)
+    wrong_tag = _run_step_script(script, cwd=runner, env={**env, "TAG": "v9.9.9"}, scratch=tmp_path)
+    assert wrong_tag.returncode == 1, wrong_tag.stdout + wrong_tag.stderr
+    assert "HEAD is not the commit tagged v9.9.9" in wrong_tag.stdout
+
+    admitted = _run_step_script(script, cwd=runner, env={**env, "TAG": "v1.0.0"}, scratch=tmp_path)
+    assert admitted.returncode == 0, admitted.stdout + admitted.stderr
