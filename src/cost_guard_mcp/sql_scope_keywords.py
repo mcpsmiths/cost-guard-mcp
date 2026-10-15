@@ -13,14 +13,23 @@ credential's grants (a read-only principal is recommended; SECURITY.md), and a S
 still call a remote function, UDF or system function with side effects. The lexer is shared
 with ``sql_scope`` so the two gates never disagree about where a comment or literal ends, and
 every shape the walker cannot resolve is refused - a mistake must land in the refuse direction.
+The walk is bounded too (``_MAX_CTE_NESTING``): the text is model-controlled, and a gate that
+can be made slow or made to overflow the stack is a gate that can be made to fail generically.
 """
 
 import logging
 import os
 import re
+from dataclasses import dataclass
 
 from cost_guard_mcp.errors import UserVisibleError
-from cost_guard_mcp.sql_scope import _Dialect, comment_end, dialect_for, literal_end
+from cost_guard_mcp.sql_scope import (
+    LEXER_OPENERS,
+    _Dialect,
+    comment_end,
+    dialect_for,
+    literal_end,
+)
 from cost_guard_mcp.types import Engine
 
 logger = logging.getLogger(__name__)
@@ -55,6 +64,29 @@ _CTE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*", re.ASCII)
 
 _WITH = "WITH"
 
+# How deep a WITH may sit inside another (a CTE body, or the parenthesised main statement the
+# walk descends into). The walk re-scans the enclosed text once per level, so unbounded it was
+# quadratic in one model-controlled string (496 levels padded to 500 KB: 47 s, holding a
+# run_query_bounded in-flight slot) and past ~497 levels overran the interpreter's recursion
+# limit, where the RecursionError surfaced as the generic tool error instead of this gate's
+# labelled refusal. Real queries nest two or three; 16 caps the worst case at 16 scans.
+_MAX_CTE_NESTING = 16
+
+
+@dataclass(frozen=True)
+class _Frame:
+    """Where the walk is: the statement it is checking (for the refusal text), the offset of
+    the text it holds within the submitted SQL (CTE bodies are walked as slices), and how
+    many WITHs enclose that text."""
+
+    which: str
+    base: int
+    depth: int
+
+    def inner(self, shift: int) -> "_Frame":
+        """The frame for a slice starting ``shift`` characters into this one, one WITH deeper."""
+        return _Frame(self.which, self.base + shift, self.depth + 1)
+
 
 def _refuse(detail: str, position: int) -> UserVisibleError:
     # Never the SQL itself: model-controlled input whose refusal goes straight back to the
@@ -62,16 +94,26 @@ def _refuse(detail: str, position: int) -> UserVisibleError:
     return UserVisibleError(f"{_CONTRACT}; {detail} (at character {position}). {_HINT}")
 
 
+def _lexeme_end(sql: str, index: int, dialect: _Dialect) -> int | None:
+    """End of the comment or literal opening at ``index``, None when neither does. One set
+    membership test settles the common character before the lexer is consulted."""
+    if sql[index] not in LEXER_OPENERS:
+        return None
+    end = comment_end(sql, index, dialect)
+    return literal_end(sql, index, dialect) if end is None else end
+
+
 def _skip_trivia(sql: str, index: int, dialect: _Dialect, *, parens: bool) -> int:
     """Advance past whitespace, comments and - when ``parens`` - opening parentheses."""
     while index < len(sql):
-        comment = comment_end(sql, index, dialect)
-        if comment is not None:
-            index = comment
-        elif sql[index].isspace() or (parens and sql[index] == "("):
+        ch = sql[index]
+        if ch.isspace() or (parens and ch == "("):
             index += 1
-        else:
+            continue
+        comment = comment_end(sql, index, dialect) if ch in LEXER_OPENERS else None
+        if comment is None:
             break
+        index = comment
     return index
 
 
@@ -94,9 +136,7 @@ def _group_end(sql: str, index: int, dialect: _Dialect) -> int:
     depth = 0
     position = index
     while position < len(sql):
-        skipped = comment_end(sql, position, dialect)
-        if skipped is None:
-            skipped = literal_end(sql, position, dialect)
+        skipped = _lexeme_end(sql, position, dialect)
         if skipped is not None:
             position = skipped
             continue
@@ -122,15 +162,24 @@ def _cte_name_end(sql: str, index: int, dialect: _Dialect) -> int | None:
     return literal_end(sql, index, dialect) if is_quoted_identifier else None
 
 
-def _resolve_query_keyword(sql: str, dialect: _Dialect) -> tuple[str | None, int]:
-    """``first_keyword`` with a WITH resolved through its CTE list to the main statement."""
+def _resolve_query_keyword(sql: str, dialect: _Dialect, frame: _Frame) -> tuple[str | None, int]:
+    """``first_keyword`` with a WITH resolved through its CTE list to the main statement;
+    a WITH nested past ``_MAX_CTE_NESTING`` is refused rather than walked."""
     keyword, offset = first_keyword(sql, dialect)
     if keyword != _WITH:
         return keyword, offset
-    return _main_keyword_after_ctes(sql, offset + len(_WITH), dialect)
+    if frame.depth > _MAX_CTE_NESTING:
+        raise _refuse(
+            f"the WITH clause of {frame.which} nests CTEs more than {_MAX_CTE_NESTING} levels "
+            "deep - rewrite without the nested CTEs",
+            frame.base + offset,
+        )
+    return _main_keyword_after_ctes(sql, offset + len(_WITH), dialect, frame)
 
 
-def _main_keyword_after_ctes(sql: str, index: int, dialect: _Dialect) -> tuple[str | None, int]:
+def _main_keyword_after_ctes(
+    sql: str, index: int, dialect: _Dialect, frame: _Frame
+) -> tuple[str | None, int]:
     """Walk ``name [(columns)] AS (body)``, comma separated, from just after a WITH, and
     return the main statement's keyword (resolved through parentheses and nested WITHs)
     with its offset; ``(None, offset)`` at the first shape the walk cannot resolve. Every
@@ -151,7 +200,8 @@ def _main_keyword_after_ctes(sql: str, index: int, dialect: _Dialect) -> tuple[s
         if not sql.startswith("(", index):
             return None, index
         body_end = _group_end(sql, index, dialect)
-        body_keyword, body_offset = _resolve_query_keyword(sql[index + 1 : body_end - 1], dialect)
+        body = sql[index + 1 : body_end - 1]
+        body_keyword, body_offset = _resolve_query_keyword(body, dialect, frame.inner(index + 1))
         if body_keyword not in _QUERY_KEYWORDS:
             return None, index + 1 + body_offset
         index = _skip_trivia(sql, body_end, dialect, parens=False)
@@ -159,7 +209,7 @@ def _main_keyword_after_ctes(sql: str, index: int, dialect: _Dialect) -> tuple[s
             index = _skip_trivia(sql, index + 1, dialect, parens=False)
             continue
         if sql.startswith("(", index):
-            keyword, offset = _resolve_query_keyword(sql[index:], dialect)
+            keyword, offset = _resolve_query_keyword(sql[index:], dialect, frame.inner(index))
             return keyword, index + offset
         return _word_at(sql, index), index
 
@@ -170,9 +220,7 @@ def _statement_segments(sql: str, dialect: _Dialect) -> list[tuple[int, int]]:
     segments: list[tuple[int, int]] = []
     start = index = 0
     while index < len(sql):
-        skipped = comment_end(sql, index, dialect)
-        if skipped is None:
-            skipped = literal_end(sql, index, dialect)
+        skipped = _lexeme_end(sql, index, dialect)
         if skipped is not None:
             index = skipped
             continue
@@ -189,7 +237,8 @@ def _check_statement(segment: str, base: int, ordinal: int | None, dialect: _Dia
     which = "the statement" if ordinal is None else f"statement {ordinal}"
     keyword, offset = first_keyword(segment, dialect)
     if keyword == _WITH:
-        main, main_offset = _main_keyword_after_ctes(segment, offset + len(_WITH), dialect)
+        frame = _Frame(which, base, depth=1)
+        main, main_offset = _main_keyword_after_ctes(segment, offset + len(_WITH), dialect, frame)
         if main not in _QUERY_KEYWORDS:
             raise _refuse(
                 f"the WITH clause of {which} is not followed by a SELECT or VALUES the gate "

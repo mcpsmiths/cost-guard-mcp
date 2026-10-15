@@ -337,7 +337,16 @@ keyword - after comments and any opening parentheses, through the lexer shared w
 the walk over its CTE list (`name [(cols)] AS (body)`, comma separated, `RECURSIVE` allowed, every
 body itself resolving to `SELECT`/`VALUES`, nested `WITH`s resolved the same way) finds `SELECT` or
 `VALUES` as the main statement - Spark's grammar allows `WITH ... INSERT|UPDATE|DELETE|MERGE`, so a
-first-keyword check alone would admit a write on Databricks. Under the multi-statement opt-out
+first-keyword check alone would admit a write on Databricks. The walk is bounded at 16 nested
+`WITH`s (`_MAX_CTE_NESTING`, counting CTE bodies and the parenthesised main statement it descends
+into) and refuses deeper text with its own labelled message: it re-scans the enclosed text once per
+level, so the unbounded first cut was quadratic in a model-controlled string (496 levels padded to
+500 KB cost 47 s inside a `run_query_bounded` in-flight slot - eight such calls exhaust
+`COST_GUARD_MAX_IN_FLIGHT_QUERIES`) and past ~497 levels overran the interpreter's recursion limit,
+where the `RecursionError` surfaced as the generic tool error rather than this gate's refusal.
+Sixteen exceeds any real query by an order of magnitude and caps the worst case at 16 scans of the
+text; the walk's loops also skip every character that cannot open a comment or literal
+(`sql_scope.LEXER_OPENERS`) before consulting the shared lexer. Under the multi-statement opt-out
 every statement in the text must pass. Refusals are `UserVisibleError`s with an offset and the
 opt-out's name, never the SQL (#15's rule). `COST_GUARD_ALLOW_WRITE_STATEMENTS=1`, exactly, read
 per call, is the opt-out (`read_statement_check=skipped|refused` INFO records mirror #15's).
@@ -356,7 +365,8 @@ property).
 **Consequences:** Breaking for operators who ran writes through `run_query_bounded`: they set the
 opt-out (and should re-check the credential's grants). BigQuery scripts (`DECLARE`/`SET`/`BEGIN`)
 need both opt-outs. False positives in the safe direction: `TABLE t`, Spark `FROM t SELECT`,
-BigQuery pipe syntax, `SET`/`USE` session statements, `WITH ... MATERIALIZED`. Admitted is not
+BigQuery pipe syntax, `SET`/`USE` session statements, `WITH ... MATERIALIZED`, CTEs nested more
+than 16 levels deep. Admitted is not
 supported: `SHOW`/`DESCRIBE`/`EXPLAIN` fail at the estimate on BigQuery and Snowflake and cannot be
 combined with `max_rows` (the LIMIT wrapper is `SELECT`-shaped). A `SELECT` may still have side
 effects through a remote function, UDF or system function the credential can call - the gate does

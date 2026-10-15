@@ -1,12 +1,20 @@
 """DECISIONS.md #13: the tools accept only read statements by default."""
 
 import logging
+import time
 
 import pytest
 
 from cost_guard_mcp.errors import UserVisibleError
-from cost_guard_mcp.sql_scope import ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, dialect_for
+from cost_guard_mcp.sql_scope import (
+    ALLOW_MULTI_STATEMENT_SQL_ENV_VAR,
+    LEXER_OPENERS,
+    comment_end,
+    dialect_for,
+    literal_end,
+)
 from cost_guard_mcp.sql_scope_keywords import (
+    _MAX_CTE_NESTING,
     ALLOW_WRITE_STATEMENTS_ENV_VAR,
     READ_STATEMENT_KEYWORDS,
     assert_read_statement,
@@ -182,6 +190,9 @@ def test_refuses_a_with_whose_main_statement_is_a_write(sql, engine):
         "WITH x AS (SELECT 1) (DELETE FROM t)",
         "WITH x AS (SELECT 1), SELECT 1",
         "WITH 'x' AS (SELECT 1) SELECT 1",
+        # Text ends where a CTE name should start (after WITH, after a trailing comma).
+        "WITH",
+        "WITH x AS (SELECT 1),",
     ],
 )
 def test_refuses_a_with_the_walker_cannot_resolve(sql, engine):
@@ -191,6 +202,75 @@ def test_refuses_a_with_the_walker_cannot_resolve(sql, engine):
 @pytest.mark.parametrize("engine", ENGINES)
 def test_unbalanced_cte_body_is_refused(engine):
     _refuses("WITH x AS (SELECT 1 SELECT 2", engine, match="not closed")
+
+
+# --- CTE nesting bound ----------------------------------------------------------------------
+
+
+def _nested_with(levels: int) -> str:
+    """``levels`` WITHs, each the only CTE body of the one outside it."""
+    return "WITH a AS (" * levels + "SELECT 1" + ") SELECT 1" * levels
+
+
+def _nested_with_in_parens(levels: int) -> str:
+    """``levels`` WITHs, each the parenthesised main statement of the one outside it."""
+    return "WITH x AS (SELECT 1) (" * levels + "SELECT 1" + ")" * levels
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_cte_nesting_at_the_bound_is_admitted_and_one_past_it_is_refused(engine):
+    _accepts(_nested_with(_MAX_CTE_NESTING), engine)
+    message = _refuses(_nested_with(_MAX_CTE_NESTING + 1), engine, match="nests CTEs")
+    assert f"the WITH clause of the statement nests CTEs more than {_MAX_CTE_NESTING} levels" in (
+        message
+    )
+    assert "rewrite without the nested CTEs" in message
+    assert f"{ALLOW_WRITE_STATEMENTS_ENV_VAR}=1" in message
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_nesting_through_a_parenthesised_main_statement_counts_too(engine):
+    # The walk also descends into "WITH ... (WITH ...)": the same recursion, the same bound.
+    _accepts(_nested_with_in_parens(_MAX_CTE_NESTING), engine)
+    _refuses(_nested_with_in_parens(_MAX_CTE_NESTING + 1), engine, match="nests CTEs")
+
+
+def test_nesting_refusal_points_at_the_first_with_past_the_bound():
+    offset = len("WITH a AS (") * _MAX_CTE_NESTING
+    assert f"(at character {offset})" in _refuses(_nested_with(_MAX_CTE_NESTING + 1), "bigquery")
+
+
+def test_nesting_refusal_names_the_statement_and_offsets_from_the_text_start(monkeypatch):
+    monkeypatch.setenv(ALLOW_MULTI_STATEMENT_SQL_ENV_VAR, "1")
+    prefix = "SELECT 1; "
+    message = _refuses(prefix + _nested_with(_MAX_CTE_NESTING + 1), "bigquery")
+    assert "the WITH clause of statement 2 nests CTEs" in message
+    assert f"(at character {len(prefix) + len('WITH a AS (') * _MAX_CTE_NESTING})" in message
+
+
+def test_deeply_nested_with_is_refused_fast_and_without_a_recursion_error():
+    # Unbounded, the walk overran the interpreter's recursion limit near 500 levels - a
+    # RecursionError the tool layer turned into the generic UnexpectedToolError instead of
+    # this gate's labelled refusal - and re-scanned the enclosed text once per level, so a
+    # 500 KB string cost ~47 s inside a run_query_bounded in-flight slot.
+    sql = _nested_with(2000)
+    started = time.perf_counter()
+    _refuses(sql, "bigquery", match="nests CTEs")
+    assert time.perf_counter() - started < 1.0
+
+
+@pytest.mark.parametrize("engine", [*ENGINES, "redshift"])
+def test_comments_and_literals_open_only_at_the_lexer_opener_characters(engine):
+    # The walker's loops skip any character outside LEXER_OPENERS without consulting the
+    # lexer; this pins that no comment or literal form, on any dialect, starts elsewhere.
+    dialect = dialect_for(engine)
+    sample = "SELECT a, b_$1 FROM t WHERE x = 1.5e3 AND y IN (2, 3) ; -- # // /* ' \" ` $$ \\"
+    sample += " \t\n\r\x0b\x0c\x85  @!%^&*+=<>?[]{}|~,:x'y\"z`w"
+    for index, ch in enumerate(sample):
+        if ch in LEXER_OPENERS:
+            continue
+        assert comment_end(sample, index, dialect) is None, (index, ch)
+        assert literal_end(sample, index, dialect) is None, (index, ch)
 
 
 @pytest.mark.parametrize("engine", ENGINES)

@@ -9,9 +9,10 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 ### Security
 
 - **Breaking: read statements only by default.** `estimate_query_cost` and `run_query_bounded`
-  refuse any statement whose first keyword is not `SELECT`, `WITH` (followed by `SELECT`/`VALUES`),
-  `VALUES`, `SHOW`, `DESCRIBE`, `DESC` or `EXPLAIN`, before any estimate or execution
-  (`DECISIONS.md` #13; #93). Opt-out: `COST_GUARD_ALLOW_WRITE_STATEMENTS=1` (exactly). With
+  refuse any statement whose first keyword is not `SELECT`, `WITH` (followed by `SELECT`/`VALUES`;
+  CTEs nested more than 16 levels deep are refused too, so the walk stays bounded on
+  model-controlled text), `VALUES`, `SHOW`, `DESCRIBE`, `DESC` or `EXPLAIN`, before any estimate or
+  execution (`DECISIONS.md` #13; #93). Opt-out: `COST_GUARD_ALLOW_WRITE_STATEMENTS=1` (exactly). With
   `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1` every statement must be a read, so BigQuery scripts now
   need both opt-outs. `run_query_bounded` results carry the constant
   `rows_provenance: warehouse_data_untrusted` (additive `outputSchema` change, the intended

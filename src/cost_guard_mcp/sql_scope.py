@@ -322,6 +322,13 @@ def dialect_for(engine: str) -> _Dialect:
     return _DIALECTS.get(engine, _FALLBACK)
 
 
+# Every character at which comment_end or literal_end can return non-None on any dialect
+# ("--", "#", "//", "/*"; ' " ` and $$; a prefixed literal still opens at its quote). Loops
+# over model-controlled text test membership here first and skip everything else without
+# consulting the lexer; test_sql_scope pins the invariant against both functions.
+LEXER_OPENERS = frozenset("-#/'\"`$")
+
+
 def comment_end(sql: str, index: int, dialect: _Dialect) -> int | None:
     """End (exclusive) of the comment opening at ``index``, or None when none opens there.
 
