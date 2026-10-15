@@ -11,8 +11,9 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 - `run_query_bounded` result size cap: 8 MiB of compact JSON over the normalised rows; larger
   results return the longest prefix of whole rows with the new `reason: result_size_exceeded`
   (additive `outputSchema` enum value); `executed` boolean on every `BoundedQueryResult`
-  (additive, required property) stating whether the warehouse ran the statement
-  (`DECISIONS.md` #21; #94, #101).
+  (additive, required property) stating whether the warehouse ran the statement; one WARNING
+  when an explicit `max_rows` exceeds 100,000 (the byte cap bounds the serialised rows, not the
+  process memory behind millions of narrow rows) (`DECISIONS.md` #21; #94, #101).
 
 ### Changed
 
@@ -23,7 +24,9 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   other admitted statements and opt-out scripts run unwrapped and are capped by the fetch;
   Snowflake and Databricks fetch results in pages of 500 and stop early, BigQuery passes
   `max_results`/`page_size`; the Snowflake post-poll fetch (and Databricks' post-join fetch) now
-  honour the remaining 120 s budget between pages (`DECISIONS.md` #21; #94).
+  honour the remaining 120 s budget, checked before each page that follows a full page, so a
+  complete result that fits in one page is never discarded for a deadline its only page overran
+  (`DECISIONS.md` #21; #94).
 
 ### Fixed
 

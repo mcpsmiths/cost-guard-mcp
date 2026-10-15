@@ -695,7 +695,8 @@ exactly one additive `outputSchema` property. 64 is far above BigQuery STRUCT's 
 limit and an order of magnitude below the guard; raising it is a one-line change.
 Amended (#94, 2026-10): a third post-execution path, `result_size_exceeded`, goes through the
 same choke point; the size cap is measured on its output - #21. The normaliser now lives in
-`tools/result_rows.py` (split for size; the tool re-exports it).
+`tools/result_rows.py` (split for size; the tool imports what it uses, the tests import the
+normaliser from there).
 
 ## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
 
@@ -950,14 +951,23 @@ believing nothing had been spent. Owner decisions 2026-10-15; held for 0.5.1.
   `jobs.getQueryResults` download is bounded too. The estimate (`approx_row_size`) is a strict lower
   bound on the exact measurement, by construction and by a property test over the normaliser's
   whole type table (`tests/unit/test_result_bounds.py`; a new branch in `_json_safe_value` must
-  extend it): a size stop therefore never produces an `ok`. It under-estimates by up to ~6x for
-  text made of control characters (six JSON bytes per estimated byte), 4/3 for binary, so an engine
-  may hold up to ~6x the cap plus one driver page before the stop fires. `collect_rows` reports a
+  extend it): a size stop therefore never produces an `ok`. It counts the framing compact JSON
+  always renders - braces, brackets, every key's and string's quotes, colons, commas and the
+  inter-row comma - so it is exact for rows of bare primitives (the first cut skipped these and let
+  narrow rows run ~2.7x past the cap; fix-up review 2026-10-15). It still under-estimates by up to
+  ~6x for text made of control characters (six JSON bytes per estimated byte), 4/3 for binary, so in
+  serialised bytes an engine may hold up to ~6x the cap plus one driver page before the stop fires.
+  `collect_rows` reports a
   hit on a size stop as well as on the sentinel, and the tool refuses - with an honest "the fetch
   stopped after N rows" hint and one WARNING - if the exact measurement ever comes in under the cap
   after such a stop (a broken bound; the one known theoretical case is a cell whose dict keys
   collide after stringification). The fail-closed direction is a truncation refusal, never a
   silent `ok`.
+- *Large explicit `max_rows`.* `result_bounds.LARGE_MAX_ROWS_WARNING_THRESHOLD = 100_000`: an
+  explicit value above it is honoured and logged once at WARNING (counts only, no row content). No
+  refusal and no new knob - the explicit value is the opt-out - but the byte cap bounds the
+  serialised rows, not the process memory and post-billing CPU they cost (Consequences), and the
+  operator should see when a caller reaches for millions of rows.
 - *LIMIT wrap rule.* `sql_scope_keywords.is_single_query_statement`: the text is exactly one
   statement (`sql_scope.is_single_statement`, the gate's scanner, never raising) and its main
   keyword - resolved through any CTE list by the read gate's own walker - is `SELECT` or `VALUES`.
@@ -968,17 +978,22 @@ believing nothing had been spent. Owner decisions 2026-10-15; held for 0.5.1.
   always applies, and an explicit `max_rows` on those statements now works instead of failing at the
   provider. Decided once in the tool, with the gates' lexer, so the engines cannot drift.
 - *Fetch under the watchdog.* A monotonic deadline is armed at submission (`execute_async` on
-  Snowflake, before `thread.start()` on Databricks) and checked between pages; the poll loop's
-  nominal counter (which ignores status-call latency) is left untouched. The first page is never
-  pre-empted: Snowflake's connector issues the `RESULT_SCAN` lazily inside the first `fetchmany`,
-  and a finished, billed query always yields its first page. No cancel on a fetch timeout: the
-  query is done, only its download overran.
+  Snowflake, before `thread.start()` on Databricks) and checked only before a page request that
+  follows a full page; the poll loop's nominal counter (which ignores status-call latency) is left
+  untouched. The first page is never pre-empted (Snowflake's connector issues the `RESULT_SCAN`
+  lazily inside the first `fetchmany`), and a short page means the connector has exhausted the
+  result (Snowflake's `fetchmany` loops `fetchone` until `size` rows or `None`; Databricks'
+  `fetchmany_arrow` fills from the server while `has_more_rows`), so the end-of-result probe that
+  follows it is never checked: a complete, billed result already in hand is never discarded because
+  its only page overran (the first cut checked before the probe too and discarded such results -
+  fix-up review 2026-10-15). No cancel on a fetch timeout: the query is done, only its download
+  overran.
 - *Placement.* `result_bounds.py` sits at package level next to `sql_scope.py`: the engines must
   not import from the tool layer, and `sql_scope.py` is the precedent for engine-shared helpers
   there (no import cycle exists either way - `tools/__init__.py` is empty; this is layering, not
   necessity). `tools/run_query_bounded.py` would have crossed the 500-line guideline, so the #17
-  normaliser moved to `tools/result_rows.py` (re-exported for its tests; the depth-note INFO record
-  stays under the tool's logger). No new environment variable: the explicit `max_rows` is the
+  normaliser moved to `tools/result_rows.py` (the tests import it from there; the depth-note INFO
+  record stays under the tool's logger). No new environment variable: the explicit `max_rows` is the
   opt-out, the byte cap has none.
 
 **Rejected / deferred:** `status: "truncated"`; reusing `row_cap_exceeded` with a distinct hint;
@@ -1003,20 +1018,38 @@ BigQuery accepts duplicate output column names at the top level (the dry run pri
 text and passes) but rejects them inside the wrap - `Duplicate column names in the result are not
 supported`, a compile-time failure, nothing billed - so such queries must alias their columns; the
 README, the tool description and a live integration case
-(`tests/integration/test_bigquery_live.py`) record it. `SHOW`/`DESCRIBE`/scripts gain a working row
+(`tests/integration/test_bigquery_live.py`) record it. Two further live cases there pin provider
+facts the fix-up review flagged as unverified at merge time: whether BigQuery accepts
+`WITH RECURSIVE` inside the wrap, and whether an inner `ORDER BY` survives the outer
+`LIMIT max_rows + 1` (if not, the tool description gains "put the LIMIT inside your query when
+order matters"). `SHOW`/`DESCRIBE`/scripts gain a working row
 cap. The `tools/list` diff is exactly: `+ "result_size_exceeded"` in
 `outputSchema.$defs.RefusalReason.enum`, the new `executed` property, `required` becomes
 `["status", "executed"]`, and the description text; the inputSchema and the other three tools are
 byte-identical. The wire response is not the measured size: the SDK renders the rows twice -
 compact in `structuredContent` and `indent=2` in a text block that is JSON-string-escaped again in
 the frame - so the frame is 2x-3.5x `total_bytes` (narrow rows are the worst case; an 8 MiB result
-leaves the process as ~20-28 MiB). Memory while fetching is bounded by the cap times the
-estimator's worst-case ratio (~6x) plus one driver page (BigQuery REST pages <= ~10 MB and
-`maxResults=500`; Snowflake lazily downloaded chunks; Databricks `FetchResults(max_rows=500,
-max_bytes=100 MB)`). For unwrapped statements Snowflake still computes the full result server-side
-(bounded by the 120 s statement timeout); the client downloads only the chunks it iterates. The
-Snowflake and Databricks fetch phase can exceed 120 s by the one round trip the deadline cannot
-pre-empt: Snowflake's `RESULT_SCAN` (connector network timeout 60 s, `STATEMENT_TIMEOUT_IN_SECONDS`
-120 s) plus the first chunk. `tests/unit/test_result_bounds.py`'s property test is the guard on the
-estimator; the hit-on-size-stop rule is the fail-closed fallback behind it. Ships in 0.5.1
+leaves the process as ~20-28 MiB). The bounds above are in serialised bytes: what an engine holds
+before the stop fires is at most ~6x the cap in JSON terms (the control-character worst case) plus
+one driver page (BigQuery REST pages <= ~10 MB and `maxResults=500`; Snowflake lazily downloaded
+chunks; Databricks `FetchResults(max_rows=500, max_bytes=100 MB)`). Process memory is another
+matter: the Python objects behind narrow rows weigh ~25x their JSON size, and the normalise + trim
+pass over them runs after the billed execution, outside any watchdog, on the single-process stdio
+server with the GIL held. Measured on the development machine with `{"a": 1}` rows and an explicit
+`max_rows=5,000,000` (the schema allows it): the fetch stops at 1,048,577 rows after 1.7 s at a
+223 MB peak, normalise + trim take 2.3 s more and peak at 444 MB
+(`scratch-pad/rq-caps-2026-10/fixup/probe_narrow_rows_cost.log`; before the estimator counted the
+JSON framing the same probe collected 2.8M rows at 539 MB and spent 52 s and 1.77 GB in normalise +
+trim - the fix-up review's finding). An explicit `max_rows` in the millions therefore costs
+hundreds of MB and seconds of post-billing CPU per call: keep explicit values in the tens of
+thousands; the tool logs one WARNING above 100,000; the default 1000 is nowhere near any of this.
+For unwrapped statements Snowflake still computes the full result server-side (bounded by the 120 s
+statement timeout); the client downloads only the chunks it iterates. The Snowflake and Databricks
+fetch phase can exceed 120 s by what the deadline cannot pre-empt: Snowflake's `RESULT_SCAN`
+(connector network timeout 60 s, `STATEMENT_TIMEOUT_IN_SECONDS` 120 s) plus the first chunk; a page
+requested within budget while it downloads; and a result whose last page was full (exactly a
+multiple of 500 rows) still pays the check before its end-of-result probe, since the client cannot
+tell it from a result with more pages. `tests/unit/test_result_bounds.py`'s property test is the
+guard on the estimator; the hit-on-size-stop rule is the fail-closed fallback behind it. Ships in
+0.5.1
 (additive schema; a default change on a 0.x line that already moved defaults in 0.5.0).
