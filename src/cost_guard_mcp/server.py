@@ -18,6 +18,7 @@ from mcp_types import ToolAnnotations
 
 from cost_guard_mcp.config import ConfigError
 from cost_guard_mcp.errors import UserVisibleError, as_tool_error
+from cost_guard_mcp.log_hygiene import configure_log_hygiene
 from cost_guard_mcp.tools.check_credentials import check_credentials as _check_credentials
 from cost_guard_mcp.tools.describe_engine_capabilities import (
     describe_engine_capabilities as _describe_engine_capabilities,
@@ -358,6 +359,11 @@ def _bootstrap_opentelemetry() -> None:
 
 
 def main() -> None:
+    # First: the SDK installed the root stderr handler when `mcp` was constructed above, and
+    # no tool body (hence no warehouse-client call) can run before mcp.run(), so this is the
+    # one point that is both after the handler exists and before any library record is
+    # emitted. See log_hygiene.py for what it pins and why.
+    configure_log_hygiene()
     _bootstrap_opentelemetry()
     mcp.run()
 
