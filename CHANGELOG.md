@@ -26,7 +26,13 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   `estimated_bytes` stays as reported and `max_bytes_billed` keeps working, enforced server-side
   as `maximumBytesBilled`. `estimate_query_cost` shows the same facts; the no-dollar-estimate
   refusal hint and `describe_engine_capabilities` name the shapes and the remedy. `UNKNOWN`
-  accuracy is unchanged (`DECISIONS.md` #22; #96).
+  accuracy is unchanged. Any 0-byte dry run on a statement that references a table is treated as
+  the row-level-security shape - including an unfiltered `COUNT(*)` answered from table
+  metadata, an empty table and a fully pruned partition filter - so a dollar cap refuses those
+  too (use `max_bytes_billed`); the caveat names these causes rather than asserting row-level
+  security. `max_estimated_cost_usd=+inf` still counts as a requested dollar cap when no dollar
+  figure exists and refuses, as it already did for capacity-billed projects (`DECISIONS.md` #22;
+  #96).
 - `run_query_bounded`: `max_rows` now defaults to 1000 when omitted (behaviour change for
   callers relying on unbounded results - pass an explicit `max_rows`, up to 2^63-2); a single
   `SELECT`/`WITH`/`VALUES` statement is wrapped in `LIMIT max_rows + 1` as before and must be
