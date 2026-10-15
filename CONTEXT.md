@@ -33,7 +33,9 @@ something different depending on which engine you're reading about.
 - **Bounded** (as in `run_query_bounded`) — refers to the caller-supplied caps
   (`max_bytes_billed`, `max_rows`, `max_estimated_cost_usd`), checked *before* execution.
   Not related to SQL's `LIMIT` clause, though `LIMIT` is the mechanism used internally to
-  enforce the row cap on the wire.
+  enforce the row cap on the wire for a single `SELECT`/`WITH`/`VALUES` statement (other
+  statements are capped by the paged fetch). `max_rows` defaults to 1000, and the serialised
+  result is capped at 8 MiB (`DECISIONS.md` #21).
 - **Fail-closed** (as used in `DECISIONS.md` and code comments) — when a cap is requested
   but the tool can't produce the matching estimate field to check it against, the query is
   refused, not run unbounded. The opposite (fail-open) would silently ignore an

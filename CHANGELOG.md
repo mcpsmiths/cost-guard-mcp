@@ -6,6 +6,32 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+### Added
+
+- `run_query_bounded` result size cap: 8 MiB of compact JSON over the normalised rows; larger
+  results return the longest prefix of whole rows with the new `reason: result_size_exceeded`
+  (additive `outputSchema` enum value); `executed` boolean on every `BoundedQueryResult`
+  (additive, required property) stating whether the warehouse ran the statement
+  (`DECISIONS.md` #21; #94, #101).
+
+### Changed
+
+- `run_query_bounded`: `max_rows` now defaults to 1000 when omitted (behaviour change for
+  callers relying on unbounded results - pass an explicit `max_rows`, up to 2^63-2); a single
+  `SELECT`/`WITH`/`VALUES` statement is wrapped in `LIMIT max_rows + 1` as before and must be
+  valid as a derived table (BigQuery rejects duplicate output column names there - alias them);
+  other admitted statements and opt-out scripts run unwrapped and are capped by the fetch;
+  Snowflake and Databricks fetch results in pages of 500 and stop early, BigQuery passes
+  `max_results`/`page_size`; the Snowflake post-poll fetch (and Databricks' post-join fetch) now
+  honour the remaining 120 s budget between pages (`DECISIONS.md` #21; #94).
+
+### Fixed
+
+- `run_query_bounded` tool description claimed every `refused` result "did NOT run";
+  `row_cap_exceeded` (and now `result_size_exceeded`) follow a billed execution and carry
+  truncated rows. The description, `DECISIONS.md` #4 and README now say which refusals ran
+  (check `executed`) (#101).
+
 ## [0.5.0] - 2026-10-15
 
 The follow-up release to the 2026-10 audit remediation (#106, #107 and the registry-channel
