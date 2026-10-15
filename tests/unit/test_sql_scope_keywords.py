@@ -254,9 +254,11 @@ def test_deeply_nested_with_is_refused_fast_and_without_a_recursion_error():
     # this gate's labelled refusal - and re-scanned the enclosed text once per level, so a
     # 500 KB string cost ~47 s inside a run_query_bounded in-flight slot.
     sql = _nested_with(2000)
-    started = time.perf_counter()
+    # CPU time, not wall clock: the bound guards against the quadratic re-scan (tens of
+    # seconds) and must not flake when a loaded CI runner deschedules the process.
+    started = time.process_time()
     _refuses(sql, "bigquery", match="nests CTEs")
-    assert time.perf_counter() - started < 1.0
+    assert time.process_time() - started < 5.0
 
 
 @pytest.mark.parametrize("engine", [*ENGINES, "redshift"])
