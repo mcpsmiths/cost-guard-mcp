@@ -4,9 +4,11 @@ Instructions for AI coding agents working in this repository.
 
 ## Project overview
 
-`cost-guard-mcp` is a Python MCP server: three tools (`describe_engine_capabilities`,
-`estimate_query_cost`, `run_query_bounded`) that give an AI agent a pre-flight query-cost
-and result-size estimate for BigQuery and Snowflake before a query actually runs. Local
+`cost-guard-mcp` is a Python MCP server: four tools (`check_credentials`,
+`describe_engine_capabilities`, `estimate_query_cost`, `run_query_bounded`) that give an AI
+agent a pre-flight query-cost and result-size estimate for BigQuery and Snowflake before a
+query actually runs (`tests/unit/test_agents_md.py` holds this sentence and the registered
+tool set in lockstep). Local
 stdio transport only, built on the official `mcp` SDK v2. See `ARCHITECTURE.md` for the
 component/data-flow map and `DECISIONS.md` for why the design looks the way it does.
 
