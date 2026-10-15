@@ -343,10 +343,40 @@ def test_iter_fetchmany_defaults_to_the_fetch_page_size():
     assert sizes == [FETCH_PAGE_SIZE]
 
 
-def test_iter_fetchmany_calls_between_pages_with_the_count_before_every_page_after_the_first():
+def test_iter_fetchmany_calls_between_pages_only_before_a_request_that_follows_a_full_page():
     seen = []
     list(iter_fetchmany(_pager(range(7)), page_size=3, between_pages=seen.append))
-    assert seen == [3, 6, 7]  # never before page 1; before pages 2, 3 and the empty 4th
+    # Never before page 1; before pages 2 and 3 (each follows a full page). Page 3 is short,
+    # so the request after it is the end-of-result probe, not a download: no check before it.
+    assert seen == [3, 6]
+
+
+def test_iter_fetchmany_skips_between_pages_after_a_short_page_but_still_probes_for_the_end():
+    # A complete result that fits in one short page: its page may have overrun the deadline,
+    # but the only request left is the terminating empty fetch, so the check does not run and
+    # the rows already in hand are never discarded. The termination rule is unchanged: the
+    # probe is still issued (a short page is not taken as the end).
+    seen = []
+    sizes = []
+    pager = _pager(range(2))
+
+    def fetchmany(size):
+        sizes.append(size)
+        return pager(size)
+
+    assert list(iter_fetchmany(fetchmany, page_size=3, between_pages=seen.append)) == [0, 1]
+    assert seen == []
+    assert sizes == [3, 3]
+
+
+def test_iter_fetchmany_still_checks_before_the_end_probe_that_follows_a_full_page():
+    # The documented residual: after a full page the client cannot tell a finished result
+    # from one with more pages, so the check runs before the request that turns out to be the
+    # end-of-result probe.
+    seen = []
+    rows = list(iter_fetchmany(_pager(range(3)), page_size=3, between_pages=seen.append))
+    assert rows == [0, 1, 2]
+    assert seen == [3]
 
 
 def test_iter_fetchmany_never_calls_between_pages_when_the_first_page_is_empty():

@@ -3353,6 +3353,38 @@ def test_execute_bounded_fetch_phase_is_bounded_by_the_watchdog_deadline(
 @patch("cost_guard_mcp.engines.snowflake.time.monotonic")
 @patch("cost_guard_mcp.engines.snowflake.time.sleep")
 @patch("cost_guard_mcp.engines.snowflake._connect")
+def test_execute_bounded_returns_a_complete_result_whose_only_page_overran_the_deadline(
+    mock_connect, _mock_sleep, mock_monotonic, caplog
+):
+    # A finished, billed query whose whole result fits in one short page, and that page arrives
+    # after the deadline. The only request left is the end-of-result probe (the connector fills
+    # a page until `size` rows or exhaustion, so a short page means the result is exhausted):
+    # nothing is downloading, so the check is skipped and the rows in hand are returned, not
+    # thrown away with a "while fetching its result" error.
+    mock_conn, mock_cursor = _finished_async_connection(mock_connect, [])
+    clock = {"now": 0.0}
+    mock_monotonic.side_effect = lambda: clock["now"]
+    pager = _fetchmany_pager([{"a": index} for index in range(10)])
+
+    def slow_only_page(size):
+        clock["now"] = 121.0
+        return pager(size)
+
+    mock_cursor.fetchmany.side_effect = slow_only_page
+
+    with caplog.at_level(logging.WARNING, logger="cost_guard_mcp.engines.snowflake"):
+        rows, row_count, row_cap_hit = execute_bounded("SELECT 1", warehouse=None, max_rows=1000)
+
+    assert (row_count, row_cap_hit) == (10, False)
+    assert rows[-1] == {"a": 9}
+    assert mock_cursor.fetchmany.call_count == 2  # the short page, then the empty probe
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+    mock_conn.close.assert_called_once()
+
+
+@patch("cost_guard_mcp.engines.snowflake.time.monotonic")
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
 def test_execute_bounded_fetch_deadline_is_armed_at_execute_async_not_at_the_poll_counter(
     mock_connect, _mock_sleep, mock_monotonic
 ):

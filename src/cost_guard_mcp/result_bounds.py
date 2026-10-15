@@ -162,19 +162,27 @@ def iter_fetchmany[T](
 
     A short page is NOT taken as the end - only an empty one is (no assumption about the
     driver; a fully fetched result costs one extra round trip). ``between_pages(fetched)`` is
-    called before every page request after the first: the first page is never pre-empted
-    (Snowflake's connector runs the RESULT_SCAN lazily inside it, and a finished, billed query
-    always yields its first page); an exception from it propagates and no further page is
-    requested. A consumer that stops iterating stops the paging too.
+    called only before a page request that follows a FULL page: the first page is never
+    pre-empted (Snowflake's connector runs the RESULT_SCAN lazily inside it), and on both
+    connectors a short page means the result is exhausted (Snowflake's ``fetchmany`` loops
+    ``fetchone`` until ``size`` rows or ``None``; Databricks fills from the server while
+    ``has_more_rows``), so the request after it is the end-of-result probe - never a download
+    worth pre-empting, and a complete, billed result already in hand is never discarded for a
+    deadline its only page overran. After a full page the caller cannot tell a finished result
+    from one with more pages, so the check does run before what may turn out to be the probe.
+    An exception from ``between_pages`` propagates and no further page is requested. A consumer
+    that stops iterating stops the paging too.
     """
     fetched = 0
+    last_page_was_full = False
     while True:
-        if fetched and between_pages is not None:
+        if last_page_was_full and between_pages is not None:
             between_pages(fetched)
         page = fetchmany(page_size)
         if not page:
             return
         fetched += len(page)
+        last_page_was_full = len(page) >= page_size
         yield from page
 
 

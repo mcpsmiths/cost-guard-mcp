@@ -1789,3 +1789,37 @@ def test_execute_bounded_fetch_phase_is_bounded_by_the_remaining_watchdog_budget
     ]
     assert len(warnings) == 1
     assert "result fetch exceeded 0.2s after 500 rows" in warnings[0].message
+
+
+@patch("cost_guard_mcp.engines.databricks.time.monotonic")
+@patch("cost_guard_mcp.engines.databricks._connect")
+def test_execute_bounded_returns_a_complete_result_whose_only_page_overran_the_deadline(
+    mock_connect, mock_monotonic, caplog
+):
+    # Same as Snowflake: a short page means the connector has exhausted the result (fetchmany
+    # fills from the server while has_more_rows), so the request after it is the end-of-result
+    # probe and is not checked against the deadline; the complete result in hand is returned.
+    mock_cursor = _make_mock_cursor([(index,) for index in range(10)])
+    clock = {"now": 0.0}
+    mock_monotonic.side_effect = lambda: clock["now"]
+    pager = mock_cursor.fetchmany.side_effect
+
+    def slow_only_page(size):
+        clock["now"] = 1.0
+        return pager(size)
+
+    mock_cursor.fetchmany.side_effect = slow_only_page
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+
+    with caplog.at_level(logging.WARNING, logger="cost_guard_mcp.engines.databricks"):
+        rows, row_count, row_cap_hit = execute_bounded(
+            "SELECT 1", warehouse=None, max_rows=1000, _max_wait_seconds=0.2
+        )
+
+    assert (row_count, row_cap_hit) == (10, False)
+    assert rows[-1] == {"a": 9}
+    assert mock_cursor.fetchmany.call_count == 2  # the short page, then the empty probe
+    assert [r for r in caplog.records if r.levelname == "WARNING"] == []
+    mock_conn.close.assert_called_once()

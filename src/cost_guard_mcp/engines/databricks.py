@@ -679,7 +679,7 @@ def execute_bounded(
     like run unwrapped and are capped by the paged fetch alone (result_bounds.collect_rows: the
     sentinel row or the running size estimate). The returned bool is True whenever that fetch
     stopped before the result was exhausted. The fetch runs under what is left of the
-    wall-clock cap, checked between pages.
+    wall-clock cap, checked before each page request that follows a full page.
 
     `_max_wait_seconds` is a private, test-only override for `_MAX_EXECUTION_WAIT_SECONDS`.
     It exists because patching the module-level constant from a test needs a target
@@ -748,8 +748,11 @@ def execute_bounded(
         columns = [col[0] for col in cur.description] if cur.description else []
 
         def _check_fetch_deadline(fetched: int) -> None:
-            # Between pages only (#94); the first page is never pre-empted. No cur.cancel():
-            # the statement finished, only its download overran.
+            # Only before a page request that follows a full page (#94): the first page is never
+            # pre-empted, and a short page means the result is exhausted (fetchmany fills from
+            # the server while has_more_rows), so the probe after it is never a download and a
+            # complete result already in hand is never discarded. No cur.cancel(): the
+            # statement finished, only its download overran.
             if time.monotonic() < deadline:
                 return
             logger.warning(

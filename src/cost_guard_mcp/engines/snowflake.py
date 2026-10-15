@@ -1121,10 +1121,13 @@ def execute_bounded(
             cur.get_results_from_sfqid(query_id)
 
             def _check_fetch_deadline(fetched: int) -> None:
-                # Between pages only (#94): the connector issues the RESULT_SCAN lazily inside
-                # the first fetchmany, and a finished, billed query always yields its first
-                # page. No _cancel_query: the query is done, only its download overran; each
-                # chunk download is bounded by the connector's own network timeout.
+                # Only before a page request that follows a full page (#94): the connector
+                # issues the RESULT_SCAN lazily inside the first fetchmany, so the first page
+                # is never pre-empted, and a short page means the result is exhausted (fetchmany
+                # loops fetchone until `size` rows or None), so the probe after it is never a
+                # download and a complete result already in hand is never discarded. No
+                # _cancel_query: the query is done, only its download overran; each chunk
+                # download is bounded by the connector's own network timeout.
                 if time.monotonic() < deadline:
                     return
                 presented_query_id = present_remote_text(str(query_id))
