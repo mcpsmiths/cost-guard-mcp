@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,6 +18,33 @@ def test_estimate_query_cost_dispatches_to_bigquery(mock_engine):
     result = estimate_query_cost("bigquery", "SELECT 1")
     mock_engine.dry_run.assert_called_once_with("SELECT 1")
     assert result.engine == "bigquery"
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_estimate_query_cost_bigquery_rls_shape_reports_no_dollar_figure(
+    mock_bq_module, _mock_capacity
+):
+    # #96: the read-only estimate shares dry_run with run_query_bounded's gate, so it shows the
+    # same facts - the hidden 0 bytes as reported, HEURISTIC, estimated_cost_usd null and the
+    # caveat that says why - instead of a $0.00 PRECISE figure.
+    dry_run_job = MagicMock()
+    dry_run_job.total_bytes_processed = 0
+    dry_run_job._properties = {"statistics": {"query": {"totalBytesProcessedAccuracy": "PRECISE"}}}
+    dry_run_job.referenced_tables = [MagicMock()]
+    dry_run_job.location = "US"
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = dry_run_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+
+    result = estimate_query_cost("bigquery", "SELECT * FROM rls_protected_table")
+
+    assert result.estimated_bytes == 0
+    assert result.estimated_cost_usd is None
+    assert result.accuracy_tier == AccuracyTier.HEURISTIC
+    assert any("row-level security" in c.lower() for c in result.caveats)
 
 
 def test_estimate_query_cost_rejects_unsupported_engine():

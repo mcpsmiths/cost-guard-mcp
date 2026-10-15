@@ -132,16 +132,24 @@ def run_query_bounded(
                 engine,
                 RefusalReason.COST_CAP_EXCEEDED.value,
             )
+            hint = (
+                "Could not produce a dollar cost estimate for this query (e.g. a capacity-billed "
+                "project, or a BigQuery dry run whose byte figure is not usable for pricing - "
+                "row-level security or LOWER_BOUND accuracy; the estimate's caveats say which) "
+                "— refusing rather than running with no cost-cap enforcement."
+            )
+            if engine == "bigquery":
+                # The documented way to run such a query under a cap (#96, DECISIONS.md #22).
+                hint += (
+                    " On BigQuery, bound the run with max_bytes_billed instead; it is enforced "
+                    "server-side as maximumBytesBilled."
+                )
             return BoundedQueryResult(
                 status="refused",
                 executed=False,
                 reason=RefusalReason.COST_CAP_EXCEEDED,
                 estimate=estimate,
-                hint=(
-                    "Could not produce a dollar cost estimate for this query (e.g. a "
-                    "capacity-billed project) — refusing rather than running with no "
-                    "cost-cap enforcement."
-                ),
+                hint=hint,
             )
         if estimate.estimated_cost_usd > max_estimated_cost_usd:
             logger.info(
@@ -202,13 +210,15 @@ def run_query_bounded(
                 ),
             )
 
-    # BigQuery only: make the provider enforce the dollar cap too. The gate above trusts
-    # the dry-run figure, which BigQuery itself flags as uninformative for row-level-
-    # security-protected tables (always 0 bytes), LOWER_BOUND estimates and absent
-    # statistics - so attach a maximumBytesBilled derived from the cap. A caller-supplied
-    # byte cap is only ever lowered, never raised; +inf means "no cap" and derives nothing.
-    # (The dollar gate above has already refused a finite cap with no dollar estimate, so a
-    # dollar estimate is guaranteed to exist whenever this derivation runs.)
+    # BigQuery only: make the provider enforce the dollar cap too. The gate above trusts the
+    # dry-run figure. Since #96 the shapes BigQuery itself flags as uninformative - row-level-
+    # security-protected tables (always 0 bytes) and LOWER_BOUND accuracy - carry no dollar
+    # figure and were refused above; the maximumBytesBilled derived here is the second layer
+    # for the figures that do pass (UNKNOWN or unrecognised accuracy, absent statistics on a
+    # statement that references no table, and the dry-run-versus-run gap in general). A
+    # caller-supplied byte cap is only ever lowered, never raised; +inf means "no cap" and
+    # derives nothing. (The dollar gate above has already refused a finite cap with no dollar
+    # estimate, so a dollar estimate is guaranteed to exist whenever this derivation runs.)
     effective_max_bytes_billed = max_bytes_billed
     byte_cap_derived_from_cost_cap = False
     if (

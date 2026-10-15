@@ -256,9 +256,11 @@ def test_single_statement_with_trailing_semicolon_still_runs(mock_estimate, mock
 @patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
 @patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
 def test_bigquery_cost_cap_attaches_a_derived_server_side_byte_cap(mock_estimate, mock_execute):
-    # The RLS shape: BigQuery's dry run reports 0 bytes / $0.00 PRECISE for a row-level-
-    # security-protected table by design. The gate admits it; the provider must still
-    # enforce the dollar cap via maximumBytesBilled derived from it.
+    # A $0.00 PRECISE figure the gate admits (a statement that references no table, or any
+    # figure below the cap): the provider must still enforce the dollar cap via a
+    # maximumBytesBilled derived from it. (Since #96 the row-level-security shape no longer
+    # reaches this point - its dry run carries no dollar figure and the gate refuses it; see
+    # test_bigquery_dollar_cap_refuses_rls_and_lower_bound_dry_runs_before_dispatch.)
     mock_estimate.return_value = _estimate(cost=0.0, bytes_=0)
     mock_execute.return_value = ([{"a": 1}], 1, False)
 
@@ -396,6 +398,113 @@ def test_provider_byte_cap_rejection_with_no_cap_attached_is_not_attributed_to_t
     mock_execute.reset_mock()
     with pytest.raises(ProviderByteCapExceeded):
         run_query_bounded("bigquery", "SELECT 1", max_estimated_cost_usd=float("inf"))
+
+
+# --- #96: dry runs without a usable byte figure carry no dollar figure, so a dollar cap refuses
+
+
+def _dry_run_job(total_bytes_processed, accuracy="PRECISE", referenced_tables=1, location="US"):
+    job = MagicMock()
+    job.total_bytes_processed = total_bytes_processed
+    job._properties = {"statistics": {"query": {"totalBytesProcessedAccuracy": accuracy}}}
+    job.referenced_tables = [MagicMock() for _ in range(referenced_tables)]
+    job.location = location
+    return job
+
+
+_RLS_SHAPED_JOB = _dry_run_job(total_bytes_processed=0, accuracy="PRECISE", referenced_tables=1)
+_LOWER_BOUND_JOB = _dry_run_job(total_bytes_processed=500, accuracy="LOWER_BOUND")
+_UNPRICEABLE_SHAPES = pytest.mark.parametrize(
+    "dry_run_job", [_RLS_SHAPED_JOB, _LOWER_BOUND_JOB], ids=["rls_zero_bytes", "lower_bound"]
+)
+
+
+def _bigquery_client_returning(mock_bq_module, dry_run_job):
+    mock_client = MagicMock()
+    mock_client.project = "my-project"
+    mock_client.query.return_value = dry_run_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+    return mock_client
+
+
+@_UNPRICEABLE_SHAPES
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_bigquery_dollar_cap_refuses_rls_and_lower_bound_dry_runs_before_dispatch(
+    mock_bq_module, _mock_capacity, mock_execute, dry_run_job, caplog
+):
+    # Through the real dry_run: the RLS shape (0 bytes on a statement that references a table)
+    # and a LOWER_BOUND accuracy produce no dollar figure, so the existing fail-closed dollar
+    # gate (DECISIONS.md #5) refuses before anything is submitted - executed is False and the
+    # engine's execute_bounded is never called (#96, DECISIONS.md #22).
+    _bigquery_client_returning(mock_bq_module, dry_run_job)
+
+    with caplog.at_level(logging.INFO, logger=_RUN_QUERY_BOUNDED_LOGGER_NAME):
+        result = run_query_bounded("bigquery", "SELECT * FROM t", max_estimated_cost_usd=1.00)
+
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.COST_CAP_EXCEEDED
+    assert result.executed is False
+    assert result.rows is None
+    assert result.estimate is not None
+    assert result.estimate.estimated_cost_usd is None
+    assert result.estimate.accuracy_tier == AccuracyTier.HEURISTIC
+    assert "max_bytes_billed" in result.hint and "maximumBytesBilled" in result.hint
+    mock_execute.assert_not_called()
+    [record] = [r for r in caplog.records if r.name == _RUN_QUERY_BOUNDED_LOGGER_NAME]
+    assert "reason=cost_cap_exceeded" in record.message
+    assert "detail=no_cost_estimate_available" in record.message
+
+
+@_UNPRICEABLE_SHAPES
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_bigquery_byte_cap_alone_still_runs_rls_and_lower_bound_dry_runs(
+    mock_bq_module, _mock_capacity, mock_execute, dry_run_job
+):
+    # The documented way to run such a query under a cap: max_bytes_billed. The reported byte
+    # figure (0 / the floor) admits it at the gate and the cap travels to BigQuery as
+    # maximumBytesBilled, which the service enforces before running the job (DECISIONS.md #16).
+    _bigquery_client_returning(mock_bq_module, dry_run_job)
+    mock_execute.return_value = ([{"a": 1}], 1, False)
+
+    result = run_query_bounded("bigquery", "SELECT * FROM t", max_bytes_billed=10_000_000)
+
+    assert result.status == "ok"
+    assert result.executed is True
+    assert result.estimate is not None and result.estimate.estimated_cost_usd is None
+    mock_execute.assert_called_once()
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] == 10_000_000
+
+
+@pytest.mark.parametrize(
+    "dry_run_job",
+    [
+        _dry_run_job(total_bytes_processed=500, accuracy="UNKNOWN"),
+        _dry_run_job(total_bytes_processed=500, accuracy="PRECISE"),
+    ],
+    ids=["unknown_accuracy", "precise"],
+)
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_bigquery_dollar_cap_still_admits_unknown_accuracy_and_precise_dry_runs(
+    mock_bq_module, _mock_capacity, mock_execute, dry_run_job
+):
+    # Unchanged by #96: these shapes keep a dollar figure, the gate compares it and the derived
+    # maximumBytesBilled rides along.
+    _bigquery_client_returning(mock_bq_module, dry_run_job)
+    mock_execute.return_value = ([{"a": 1}], 1, False)
+
+    result = run_query_bounded("bigquery", "SELECT * FROM t", max_estimated_cost_usd=1.00)
+
+    assert result.status == "ok"
+    assert result.estimate is not None and result.estimate.estimated_cost_usd is not None
+    mock_execute.assert_called_once()
+    assert mock_execute.call_args.kwargs["max_bytes_billed"] == cost_cap_to_max_bytes_billed(1.00)
 
 
 # --- non-finite caps (plan-review amendment A2) -------------------------------------------

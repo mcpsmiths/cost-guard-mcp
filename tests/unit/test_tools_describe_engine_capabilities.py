@@ -13,6 +13,17 @@ def test_bigquery_capabilities_are_precise_by_default():
     assert len(caps.known_gaps) >= 1
 
 
+def test_bigquery_known_gaps_disclose_the_shapes_that_carry_no_dollar_figure():
+    # #96: LOWER_BOUND is a floor (HEURISTIC, no dollar figure), the row-level-security 0-byte
+    # shape carries no dollar figure either, and the capacity check is made for the job's
+    # location. The old text said LOWER_BOUND "downgrades to UPPER_BOUND".
+    caps = describe_engine_capabilities("bigquery")
+    assert any("LOWER_BOUND" in gap and "HEURISTIC" in gap for gap in caps.known_gaps)
+    assert any("row-level security" in gap and "max_bytes_billed" in gap for gap in caps.known_gaps)
+    assert any("location" in gap for gap in caps.known_gaps)
+    assert not any("downgrades to UPPER_BOUND" in gap for gap in caps.known_gaps)
+
+
 def test_unknown_engine_string_raises_clear_error():
     with pytest.raises(ValueError, match="not yet supported"):
         describe_engine_capabilities("redshift")  # type: ignore[arg-type]
