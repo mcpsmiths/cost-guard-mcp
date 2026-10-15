@@ -22,9 +22,10 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 - Redacting log filter and pinned third-party loggers: at server start the
   `snowflake.connector`, `databricks`, `databricks.sql`, `databricks.sdk`, `google`, `urllib3`,
   `httpx` and `httpcore` loggers are set to WARNING, and every record that reaches the stderr
-  handler — the `mcp` SDK's and the client libraries' included — is rendered once and passed
-  through `redact_secrets` before it is written (never drops a record, never raises). The
-  project's own `tool=<name> outcome=` INFO records are unchanged; no new configuration (#95).
+  handler — the `mcp` SDK's and the client libraries' included — has its message, exception
+  traceback and stack text rendered once and passed through `redact_secrets` before it is
+  written (never drops a record, never raises). The project's own `tool=<name> outcome=` INFO
+  records are unchanged; no new configuration (#95).
 - `run_query_bounded` result size cap: 8 MiB of compact JSON over the normalised rows; larger
   results return the longest prefix of whole rows with the new `reason: result_size_exceeded`
   (additive `outputSchema` enum value); `executed` boolean on every `BoundedQueryResult`

@@ -11,6 +11,7 @@ both after each test so nothing here leaks into the rest of the session.
 
 import io
 import logging
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -184,6 +185,152 @@ def test_filter_covers_a_record_logged_through_the_project_logger_too(root_strea
 
     assert secret not in stream.getvalue()
     assert "engine=bigquery password=***REDACTED***" in stream.getvalue()
+
+
+# --- exception traceback and stack text: appended by the Formatter, not part of getMessage() --
+
+
+def _record_with_exc_info(exc: Exception, message: str = "call failed") -> logging.LogRecord:
+    try:
+        raise exc
+    except type(exc):  # raised and caught so the record carries a real traceback
+        exc_info = sys.exc_info()
+    return logging.LogRecord(
+        "snowflake.connector", logging.WARNING, __file__, 1, message, None, exc_info
+    )
+
+
+def test_root_stream_handler_redacts_the_traceback_of_a_third_party_warning_with_exc_info(
+    root_stream,
+):
+    # snowflake-connector-python #1323's shape: the credential is in the exception text and
+    # the library logs it with exc_info=True, so it travels in the traceback the Formatter
+    # appends - never through getMessage().
+    stream, _ = root_stream
+    secret = _dummy_secret("sf")
+    configure_log_hygiene()
+
+    try:
+        raise RuntimeError("250001: login failed, " + "pass" + "word=" + secret)
+    except RuntimeError:
+        logging.getLogger("snowflake.connector.network").warning(
+            "connector failure during login", exc_info=True
+        )
+
+    output = stream.getvalue()
+    assert secret not in output
+    assert "connector failure during login" in output
+    assert "Traceback (most recent call last)" in output
+    assert "RuntimeError: 250001: login failed, password=***REDACTED***" in output
+
+
+def test_root_stream_handler_redacts_the_traceback_logged_by_logger_exception(root_stream):
+    stream, _ = root_stream
+    secret = _dummy_secret("dbx")
+    configure_log_hygiene()
+
+    try:
+        raise ValueError("Authorization: " + "tok" + "en=" + secret)
+    except ValueError:
+        logging.getLogger("databricks.sdk").exception("request failed")
+
+    output = stream.getvalue()
+    assert secret not in output
+    assert "request failed" in output
+    assert "ValueError: Authorization: token=***REDACTED***" in output
+
+
+def test_root_stream_handler_redacts_a_record_logged_with_stack_info(root_stream):
+    stream, _ = root_stream
+    secret = _dummy_secret("bq")
+    configure_log_hygiene()
+
+    logging.getLogger("google.auth").warning(
+        "refresh failed, " + "pass" + "word=%s", secret, stack_info=True
+    )
+
+    output = stream.getvalue()
+    assert secret not in output
+    assert "refresh failed, password=***REDACTED***" in output
+    assert "Stack (most recent call last)" in output
+
+
+def test_redacting_filter_redacts_stack_text_and_moves_exc_info_into_redacted_exc_text():
+    secret = _dummy_secret("sf")
+    record = _record_with_exc_info(RuntimeError("login failed, " + "pass" + "word=" + secret))
+    record.stack_info = (
+        "Stack (most recent call last):\n  File x, line 1\n    " + "tok" + "en=" + secret
+    )
+
+    assert RedactingLogFilter().filter(record) is True
+
+    # exc_info is cleared so no handler can render the raw traceback again from it - the
+    # stdlib Formatter reuses exc_text, but rich's RichHandler (which the SDK installs when
+    # `rich` is importable) renders exc_info itself and ignores exc_text.
+    assert record.exc_info is None
+    assert record.exc_text is not None
+    assert secret not in record.exc_text
+    assert record.exc_text.startswith("Traceback (most recent call last)")
+    assert "RuntimeError: login failed, password=***REDACTED***" in record.exc_text
+    assert record.stack_info is not None
+    assert secret not in record.stack_info
+    assert "token=***REDACTED***" in record.stack_info
+
+
+def test_redacting_filter_redacts_a_cached_exc_text_that_arrived_without_exc_info():
+    # A handler earlier in the chain (one on a child logger, without this filter) may already
+    # have run its Formatter and cached the raw traceback on record.exc_text.
+    secret = _dummy_secret("dbx")
+    record = logging.LogRecord("databricks", logging.ERROR, __file__, 1, "failed", None, None)
+    record.exc_text = "Traceback ...\nValueError: " + "tok" + "en=" + secret
+
+    assert RedactingLogFilter().filter(record) is True
+
+    assert secret not in (record.exc_text or "")
+    assert "ValueError: token=***REDACTED***" in (record.exc_text or "")
+
+
+def test_redacting_filter_renders_a_traceback_whose_exception_str_raises_without_raising():
+    class StrRaises(Exception):
+        def __str__(self) -> str:
+            raise RuntimeError("__str__ failed")
+
+    record = _record_with_exc_info(StrRaises(), message="connector failure")
+
+    assert RedactingLogFilter().filter(record) is True
+
+    # The record is still emitted with its message; the stdlib renders the exception line as
+    # "<exception str() failed>" rather than raising, and nothing here changes that.
+    assert record.getMessage() == "connector failure"
+    assert record.exc_info is None
+    assert record.exc_text is not None
+    assert "Traceback (most recent call last)" in record.exc_text
+
+
+def test_redacting_filter_withholds_the_whole_record_when_the_traceback_cannot_be_rendered():
+    # A malformed exc_info (a bare True, as a hand-built record or a buggy wrapper can carry)
+    # makes Formatter.formatException raise. The filter must neither raise nor drop; it
+    # withholds the text and clears every field a handler could render raw.
+    secret = _dummy_secret("sf")
+    record = logging.LogRecord(
+        "snowflake.connector",
+        logging.WARNING,
+        __file__,
+        1,
+        "login " + "pass" + "word=%s",
+        (secret,),
+        None,
+    )
+    record.exc_info = True  # type: ignore[assignment]
+    record.stack_info = "Stack: " + "tok" + "en=" + secret
+
+    assert RedactingLogFilter().filter(record) is True
+
+    assert record.getMessage() == log_hygiene._UNRENDERABLE_RECORD_MESSAGE
+    assert record.args is None
+    assert record.exc_info is None
+    assert record.exc_text is None
+    assert record.stack_info is None
 
 
 def test_main_configures_log_hygiene_before_running_the_server():

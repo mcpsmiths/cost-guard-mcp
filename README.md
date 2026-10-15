@@ -250,12 +250,13 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
     and ERROR records (the ones that carry an exception's text) still do. The project's own
     loggers are not touched by this pin.
   - Defence in depth behind both of the above: every record that reaches the stderr handler,
-    whichever logger produced it (this project's, the `mcp` SDK's or a client library's), is
-    rendered once and passed through the same `redact_secrets` by a filter on that handler
-    before it is written. The filter never drops a record and never raises; a record whose
-    format string cannot be rendered is written as
-    `<log record withheld: message could not be rendered>` instead of the standard library's
-    raw `msg`/`args` error dump.
+    whichever logger produced it (this project's, the `mcp` SDK's or a client library's), has
+    its message, its exception traceback (`exc_info=True` / `logger.exception`) and its stack
+    text rendered once and passed through the same `redact_secrets` by a filter on that
+    handler before any of it is written. The filter never drops a record and never raises; a
+    record whose format string or traceback cannot be rendered is written as
+    `<log record withheld: message could not be rendered>`, traceback and stack text withheld
+    with it, instead of the standard library's raw `msg`/`args` error dump.
   - The `mcp` SDK writes its own records to the same stderr, and this project's one-line
     rule does not shape them (the redacting filter above does apply to them). Every tool
     error this project raises is followed by the SDK's
