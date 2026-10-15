@@ -1,12 +1,20 @@
 import base64
 import concurrent.futures
 import logging
+import random
+import time
 from fractions import Fraction
 from unittest.mock import MagicMock, patch
 
 import pytest
-from google.api_core.exceptions import BadRequest, InternalServerError
+from google.api_core.exceptions import (
+    BadRequest,
+    InternalServerError,
+    RetryError,
+    ServiceUnavailable,
+)
 from google.cloud import bigquery
+from google.cloud.bigquery.retry import DEFAULT_RETRY
 
 from cost_guard_mcp.engines import bigquery as bigquery_engine
 from cost_guard_mcp.engines.bigquery import (
@@ -491,8 +499,137 @@ def test_execute_bounded_passes_timeout_to_result(mock_bq_module):
     # job_retry=None at result() too (not only at client.query): QueryJob.result resolves
     # job_retry from the client.query call when left at its default, so passing None at
     # both sites keeps 'the billed query is never re-submitted by the library' independent
-    # of that internal plumbing.
-    mock_query_job.result.assert_called_once_with(timeout=120, job_retry=None)
+    # of that internal plumbing. retry=_API_RETRY (#103): result() threads it to every
+    # polling RPC (done() -> jobs.get, _reload_query_results() -> jobs.getQueryResults, row
+    # paging), which otherwise inherit DEFAULT_RETRY's 600 s deadline.
+    mock_query_job.result.assert_called_once_with(
+        timeout=120, retry=bigquery_engine._API_RETRY, job_retry=None
+    )
+    assert mock_query_job.result.call_args.kwargs["retry"] is bigquery_engine._API_RETRY
+
+
+class _FakeClock:
+    """Replaces time.monotonic/time.sleep for api-core's retry loop: a sleep advances the
+    clock instantly, so even the library's 600 s backoff schedule costs no wall time."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    @property
+    def elapsed(self) -> float:
+        return self.now - 1_000.0
+
+
+class _PollingQueryJob:
+    """A QueryJob whose result() does with its `retry` argument what the real one does: wraps
+    the polling RPC in it. The RPC fails with a retryable 503 on every attempt."""
+
+    job_id = "job-polling"
+
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.cancel = MagicMock(return_value=True)
+
+    def result(self, **kwargs):
+        def poll():
+            self.attempts += 1
+            raise ServiceUnavailable("fake 503")
+
+        return kwargs["retry"](poll)()
+
+
+@pytest.fixture
+def deterministic_retry_clock(monkeypatch):
+    # api-core's retry_target measures its deadline with time.monotonic(), waits with
+    # time.sleep() and draws each backoff with random.uniform(0, max_delay) (retry_base.py,
+    # exponential_sleep_generator); pinning the draw to its maximum makes the schedule exactly
+    # 1, 2, 4, 8, 16, 32, 60, 60, ... seconds, so attempt counts are deterministic.
+    clock = _FakeClock()
+    monkeypatch.setattr(time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    monkeypatch.setattr(random, "uniform", lambda low, high: high)
+    return clock
+
+
+def _client_returning(mock_bq_module, job):
+    mock_client = MagicMock()
+    mock_client.query.return_value = job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+    return mock_client
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_result_polling_retries_are_bounded_by_the_api_retry(
+    mock_bq_module, deterministic_retry_clock
+):
+    # Issue #103: without retry= the polling RPCs inside result() inherited DEFAULT_RETRY's
+    # 600 s deadline, so a Google-side outage that began after job submission pinned the
+    # worker thread and its in-flight slot for ~10 min. Under _API_RETRY the schedule is
+    # 1+2+4+8 = 15 s of sleeps over 5 attempts; the next 16 s sleep would pass the 30 s
+    # deadline, so api-core refuses it and raises.
+    job = _PollingQueryJob()
+    _client_returning(mock_bq_module, job)
+
+    with pytest.raises(SanitizedEngineError) as excinfo:
+        execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=None)
+
+    assert job.attempts == 5
+    assert deterministic_retry_clock.elapsed == 15.0
+    assert "Timeout of 30.0s exceeded" in str(excinfo.value)
+    assert "600" not in str(excinfo.value)
+
+
+def test_default_retry_control_runs_the_600s_schedule_under_the_same_clock(
+    deterministic_retry_clock,
+):
+    # Control for the fixture: the same harness with the library default must run the long
+    # schedule (1+2+4+8+16+32, then 60 s steps: 15 attempts, 543 s of sleeps), or the bounded
+    # test above would pass for any retry object.
+    job = _PollingQueryJob()
+
+    with pytest.raises(RetryError, match="Timeout of 600.0s exceeded"):
+        job.result(retry=DEFAULT_RETRY)
+
+    assert job.attempts == 15
+    assert deterministic_retry_clock.elapsed == 543.0
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_execute_bounded_cancels_the_job_when_result_polling_retries_are_exhausted(
+    mock_bq_module, deterministic_retry_clock
+):
+    # RetryError is a GoogleAPIError, not a GoogleAPICallError or TimeoutError, so the
+    # exhausted-retries exit used to skip the cancel branch. A jobs.getQueryResults 5xx storm
+    # does not imply jobs.cancel is unreachable, the cancel is bounded like every other call,
+    # and it stops billing before jobTimeoutMs would - so it is attempted, best effort.
+    job = _PollingQueryJob()
+    _client_returning(mock_bq_module, job)
+
+    with pytest.raises(SanitizedEngineError, match="Timeout of 30.0s exceeded"):
+        execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=None)
+
+    job.cancel.assert_called_once_with(
+        retry=bigquery_engine._API_RETRY, timeout=bigquery_engine._MAX_API_WAIT_SECONDS
+    )
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_exhausted_polling_retries_error_survives_a_failed_cancel(
+    mock_bq_module, deterministic_retry_clock
+):
+    job = _PollingQueryJob()
+    job.cancel.side_effect = Exception("cancel also failed")
+    _client_returning(mock_bq_module, job)
+
+    with pytest.raises(SanitizedEngineError, match="Timeout of 30.0s exceeded"):
+        execute_bounded("SELECT 1", max_bytes_billed=None, max_rows=None)
 
 
 @patch("cost_guard_mcp.engines.bigquery.bigquery")

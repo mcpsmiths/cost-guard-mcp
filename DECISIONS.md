@@ -363,7 +363,13 @@ cancel into the engines:
   the caller gets a sanitized error and exactly one WARNING record (the watchdog's own, or
   the `warehouse_client_call_failed` record when the warehouse's cancellation wins).
 - BigQuery API calls carry a 30 s retry bound and `job_retry=None` (see
-  `engines/bigquery.py`), so the pre-dispatch window is seconds, not minutes.
+  `engines/bigquery.py`), so the pre-dispatch window is seconds, not minutes. Since #103
+  (fixed after 0.4.0) that includes the polling RPCs inside `QueryJob.result()`, which had
+  inherited the 600 s default; and when those retries are exhausted (`RetryError`, a
+  `GoogleAPIError` that is not a `GoogleAPICallError`) the same bounded best-effort
+  `QueryJob.cancel` the watchdog issues runs first - a `getQueryResults` 5xx storm does not
+  imply `jobs.cancel` is unreachable, and one bounded cancel RPC is cheap against up to
+  `jobTimeoutMs` of billing.
 - An explicit in-flight cap, `COST_GUARD_MAX_IN_FLIGHT_QUERIES` (default 8, positive
   integer, rejected at startup otherwise), implemented as a `threading.BoundedSemaphore`
   whose slot is acquired non-blocking and released inside the worker thread. Acquire and

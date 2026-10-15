@@ -2,7 +2,7 @@ import concurrent.futures
 import logging
 import re
 
-from google.api_core.exceptions import GoogleAPICallError
+from google.api_core.exceptions import GoogleAPICallError, RetryError
 from google.cloud import bigquery, bigquery_reservation_v1
 from google.cloud.bigquery.retry import DEFAULT_RETRY
 
@@ -252,17 +252,21 @@ def _is_bytes_billed_limit_exceeded(exc: GoogleAPICallError) -> bool:
     )
 
 
-# How long to wait for a bounded query to finish before giving up and cancelling it. This
-# is a Polling Timeout in google-api-core's terms — confirmed via the base
-# PollingFuture._blocking_poll implementation, not just QueryJob.result()'s own (looser)
-# docstring wording — so it genuinely bounds the whole wait, not just one HTTP call. Without
-# this, a query stuck behind slot contention or a cold warehouse could block a tool call
-# indefinitely, which defeats the point of a "bounded" execution tool.
+# How long to wait for a bounded query to finish before giving up and cancelling it. It is
+# the polling deadline QueryJob.result() evaluates between is_job_done() returns, and the
+# per-request transport timeout it passes to each jobs.get / jobs.getQueryResults call. It
+# does NOT bound the retries inside those calls - those come from `retry=`, which is why
+# result() receives _API_RETRY below (issue #103). Without the deadline a query stuck behind
+# slot contention or a cold warehouse could block a tool call indefinitely, defeating the
+# point of a "bounded" execution tool. Worst case for the result phase: one polling call
+# that hangs for the per-request timeout (120 s, a black-holed connection) plus 30 s of
+# retries, instead of the 600-720 s before #103.
 _MAX_EXECUTION_WAIT_SECONDS = 120
 
 # Bound on every *other* BigQuery API round-trip this module makes - the service-account
-# lookup, the dry-run and execution job submissions (jobs.insert), and the Reservations
-# search. Without an explicit retry/timeout each of those inherits google-cloud-bigquery's
+# lookup, the dry-run and execution job submissions (jobs.insert), the Reservations search,
+# and the polling RPCs inside result(). Without an explicit retry/timeout each of those
+# inherits google-cloud-bigquery's
 # DEFAULT_RETRY (a 600 s deadline with no per-request timeout), and client.query() wraps
 # jobs.insert in a second, hard-coded 600 s job-level retry whenever job_retry is not None -
 # so a read-only tool could block for ~10-20 minutes while Google is unreachable, and an
@@ -273,6 +277,20 @@ _MAX_EXECUTION_WAIT_SECONDS = 120
 # wrapper for any non-None value.
 _MAX_API_WAIT_SECONDS = 30
 _API_RETRY = DEFAULT_RETRY.with_timeout(_MAX_API_WAIT_SECONDS)
+
+
+def _cancel_best_effort(query_job: bigquery.QueryJob) -> None:
+    """Ask BigQuery to cancel a job whose result wait was abandoned; never raises.
+
+    A cancel is a BigQuery API round-trip too: bound it like every other call, or an
+    unreachable Google pins this worker thread (and its in-flight slot) for the library's
+    600 s DEFAULT_RETRY deadline. The caller's own error is the message that matters; a
+    failed cancel must not mask it.
+    """
+    try:
+        query_job.cancel(retry=_API_RETRY, timeout=_MAX_API_WAIT_SECONDS)
+    except Exception:  # noqa: BLE001, S110 - best-effort, see docstring
+        pass
 
 
 @sanitize_exceptions("bigquery")
@@ -328,25 +346,41 @@ def execute_bounded(
     try:
         rows = [
             dict(row)
-            for row in query_job.result(timeout=_MAX_EXECUTION_WAIT_SECONDS, job_retry=None)
+            for row in query_job.result(
+                timeout=_MAX_EXECUTION_WAIT_SECONDS,
+                # Every RPC inside result() - jobs.get via done(), jobs.getQueryResults via
+                # _reload_query_results(), row paging - must carry the 30 s bound too: without
+                # retry= they inherit DEFAULT_RETRY's 600 s deadline, and the timeout above is
+                # only evaluated between those retried calls (issue #103). job_retry stays
+                # None: it alone decides whether the library re-submits the billed job.
+                retry=_API_RETRY,
+                job_retry=None,
+            )
         ]
     except GoogleAPICallError as exc:
         if _is_bytes_billed_limit_exceeded(exc):
             raise ProviderByteCapExceeded(max_bytes_billed) from None
         raise
-    except concurrent.futures.TimeoutError:
-        try:
-            # A cancel is a BigQuery API round-trip too: bound it like every other call,
-            # or an unreachable Google pins this worker thread (and its in-flight slot)
-            # for the library's 600 s DEFAULT_RETRY deadline.
-            query_job.cancel(retry=_API_RETRY, timeout=_MAX_API_WAIT_SECONDS)
-        except Exception:  # noqa: BLE001, S110 - best-effort cancel; the TimeoutError below is
-            # the message that matters to the caller, a failed cancel must not mask it
-            pass
+    except (concurrent.futures.TimeoutError, RetryError) as exc:
+        _cancel_best_effort(query_job)
         # The job id came back from the service, so it is remote text like any error
         # message: present it (one line, control characters escaped) before it reaches the
         # log or the exception, or a newline in it starts a prefix-free stderr record.
         presented_job_id = present_remote_text(str(query_job.job_id))
+        if isinstance(exc, RetryError):
+            # The polling RPCs exhausted their 30 s retry bound (a Google-side outage after
+            # submission). RetryError is a GoogleAPIError, not a GoogleAPICallError, so it
+            # used to skip this branch and the cancel: a getQueryResults 5xx storm does not
+            # mean jobs.cancel is unreachable, and one bounded cancel RPC is cheap against up
+            # to jobTimeoutMs of billing. Re-raised as-is: sanitize_exceptions presents the
+            # library's own "Timeout of 30.0s exceeded" text as quoted, labelled data.
+            logger.warning(
+                "engine=bigquery execute_bounded result polling retries exhausted after %ss, "
+                "cancelled job_id=%s",
+                _MAX_API_WAIT_SECONDS,
+                presented_job_id,
+            )
+            raise
         logger.warning(
             "engine=bigquery execute_bounded timed out after %ss, cancelled job_id=%s",
             _MAX_EXECUTION_WAIT_SECONDS,

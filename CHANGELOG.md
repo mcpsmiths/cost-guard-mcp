@@ -42,6 +42,12 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   LF on Databricks; LF on BigQuery and Snowflake, where a bare CR inside a comment is refused as
   ambiguous), and any of those eight code points inside a line comment, or a backslash before its
   terminator, is refused (`DECISIONS.md` #15; #104).
+- BigQuery `run_query_bounded`: the result-polling RPCs inside `query_job.result()` inherited the
+  library's 600 s default retry, so a Google-side outage that began after job submission pinned
+  the worker thread and one in-flight slot for ~10 min instead of surfacing within the documented
+  bound; they now carry the same 30 s retry bound as every other BigQuery call, and exhausted
+  polling retries issue the same bounded best-effort job cancel the 120 s watchdog does
+  (`DECISIONS.md` #14; #103).
 
 ## [0.4.0] - 2026-10-14
 
