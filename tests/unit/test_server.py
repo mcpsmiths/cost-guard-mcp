@@ -2,6 +2,7 @@ import asyncio
 import base64
 import functools
 import hashlib
+import json
 import logging
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -309,6 +310,33 @@ def test_call_tool_run_query_bounded_row_cap_refusal_delivers_binary_cells(
     assert result.structured_content["rows"] == [
         {"digest": base64.b64encode(_DIGEST).decode("ascii")}
     ]
+
+
+def _nested_cell(depth):
+    return json.loads('{"a":' * depth + "1" + "}" * depth)
+
+
+@patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+def test_call_tool_run_query_bounded_delivers_a_300_level_nested_cell(
+    mock_bq_module, _mock_capacity
+):
+    # Through the SDK's own result conversion (pydantic to_json for the text block and
+    # model_dump(mode="json") for structuredContent): at main (27b87e9) this exact call raised
+    # UnexpectedToolError "Error executing tool run_query_bounded" - pydantic_core's recursion
+    # guard tripped AFTER the billed job - so the result was lost (#105).
+    _bigquery_mocks_returning_rows(mock_bq_module, [Row((_nested_cell(300),), {"j": 0})])
+
+    result = _call_tool("run_query_bounded", {"engine": "bigquery", "sql": "SELECT 1"})
+
+    assert result.is_error is not True
+    assert result.structured_content["status"] == "ok"
+    cell = result.structured_content["rows"][0]["j"]
+    for _ in range(64):
+        cell = cell["a"]
+    assert cell == "<nested value omitted: deeper than 64 levels>"
+    assert "deeper than 64" in result.structured_content["hint"]
+    result.model_dump(mode="json")
 
 
 # Regression tests for the cooperative pre-dispatch cancellation check (audit fingerprint

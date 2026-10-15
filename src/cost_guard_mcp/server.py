@@ -283,7 +283,10 @@ async def run_query_bounded(
     why). NOTE: unlike estimate_query_cost, a successful call here has a real monetary/quota
     side effect — don't call this repeatedly without inspecting the result of each call.
     Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
-    more statements is refused before anything is estimated or run.
+    more statements is refused before anything is estimated or run. On an ok result, hint is
+    null unless the server replaced nested result values deeper than 64 levels with the
+    placeholder "<nested value omitted: deeper than 64 levels>" (hint then says how many cells);
+    status is the only refusal indicator.
 
     warehouse_size/edition (see estimate_query_cost) can only raise the estimate that
     max_estimated_cost_usd is checked against - it is priced at the observed warehouse, never

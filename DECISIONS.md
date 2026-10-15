@@ -513,7 +513,15 @@ normaliser is the fix and the config only a backstop.
 refusal. Documented behaviour change for consumers: valid-UTF-8 `BYTES` that used to arrive
 as plain text (type erased) now arrive base64-encoded, and `NaN`/`Inf` are strings rather
 than `null`. Row-size/row-count defaults are a separate hardening item, deliberately not
-folded in here.
+folded in here. Amended (#105): the normaliser also caps nesting depth at 64 container
+levels per cell, replacing the deeper remainder with the constant placeholder
+`<nested value omitted: deeper than 64 levels>` and reporting the count of capped cells in
+`hint` (and in one INFO record); pydantic_core's recursion guard (~250 levels including the
+`CallToolResult` envelope) otherwise failed the JSON-RPC response or the tool result after
+the billed execution, which no in-repo code saw. `hint` is therefore no longer refusal-only
+and `status` is the discriminator; a new field was rejected because decision #13 allows
+exactly one additive `outputSchema` property. 64 is far above BigQuery STRUCT's 15-level
+limit and an order of magnitude below the guard; raising it is a one-line change.
 
 ## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
 

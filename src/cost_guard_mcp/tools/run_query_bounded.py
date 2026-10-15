@@ -4,6 +4,7 @@ import logging
 import math
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from decimal import Decimal
 
 from cost_guard_mcp.engines import bigquery as bigquery_engine
@@ -70,7 +71,30 @@ def _json_safe_text(text: str) -> str:
     return text
 
 
-def _json_safe_value(value: object) -> object:
+# pydantic_core's serialiser has a fixed recursion guard (~250 levels, counting the
+# CallToolResult/structuredContent/rows/row envelope) and raises "Circular reference detected
+# (depth exceeded)" AFTER the billed execution (issue #105); 64 keeps the whole result an order
+# of magnitude below it while far exceeding any real JSON/STRUCT depth (BigQuery STRUCTs stop
+# at 15). A container at this depth is replaced by the placeholder and counted into `hint`.
+_MAX_CELL_NESTING_DEPTH = 64
+_NESTING_DEPTH_PLACEHOLDER = f"<nested value omitted: deeper than {_MAX_CELL_NESTING_DEPTH} levels>"
+
+
+@dataclass
+class _NormalisationTally:
+    """Per-call accumulator of what the normaliser had to replace - local to one
+    _normalise_rows call, never shared, so two calls never see each other's counts."""
+
+    depth_capped_cells: int = 0
+
+
+@dataclass(frozen=True)
+class _NormalisedRows:
+    rows: list[dict]
+    depth_capped_cells: int
+
+
+def _json_safe_value(value: object, depth: int, tally: _NormalisationTally) -> object:
     """Normalise one connector-native cell so the mcp SDK can always serialise it.
 
     Runs AFTER the billed query has executed, so it must never raise and must cover every
@@ -80,7 +104,10 @@ def _json_safe_value(value: object) -> object:
     function produces from a non-str value) pass through _json_safe_text so a lone surrogate
     cannot trip pydantic's strict UTF-8 str encoder; driver-specific types pydantic does not
     know (BigQuery INTERVAL -> dateutil relativedelta) are stringified instead of raising
-    "Unable to serialize unknown type". Returns new objects, never mutates.
+    "Unable to serialize unknown type"; a container nested _MAX_CELL_NESTING_DEPTH levels
+    below the cell (`depth` counts container levels from 0 at the cell itself) becomes the
+    constant placeholder so pydantic_core's recursion guard is never reached. Returns new
+    objects, never mutates its input.
     """
     if value is None or isinstance(value, bool | int):
         return value
@@ -90,26 +117,56 @@ def _json_safe_value(value: object) -> object:
         return value if math.isfinite(value) else str(value)
     if isinstance(value, bytes | bytearray | memoryview):
         return base64.b64encode(bytes(value)).decode("ascii")
-    if isinstance(value, dict):
-        return {
-            _json_safe_text(str(_json_safe_value(key))): _json_safe_value(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list | tuple | set | frozenset):
-        return [_json_safe_value(item) for item in value]
+    if isinstance(value, dict | list | tuple | set | frozenset):
+        if depth >= _MAX_CELL_NESTING_DEPTH:
+            tally.depth_capped_cells += 1
+            return _json_safe_text(_NESTING_DEPTH_PLACEHOLDER)
+        if isinstance(value, dict):
+            return {
+                _json_safe_text(str(_json_safe_value(key, depth, tally))): _json_safe_value(
+                    item, depth + 1, tally
+                )
+                for key, item in value.items()
+            }
+        return [_json_safe_value(item, depth + 1, tally) for item in value]
     if isinstance(value, _PYDANTIC_NATIVE_CELL_TYPES):
         return value
     return _json_safe_text(str(value))
 
 
-def _json_safe_rows(rows: list[dict]) -> list[dict]:
+def _normalise_rows(rows: list[dict]) -> _NormalisedRows:
     """The one choke point for all three engines and both return paths (ok and
     row_cap_exceeded): every value placed in BoundedQueryResult.rows - column names
-    included - is JSON-serialisable and UTF-8-encodable."""
-    return [
-        {_json_safe_text(str(key)): _json_safe_value(item) for key, item in row.items()}
+    included - is JSON-serialisable, UTF-8-encodable and nested no deeper than the SDK's
+    serialiser can take, with a count of the cells that had to be capped."""
+    tally = _NormalisationTally()
+    safe_rows = [
+        {_json_safe_text(str(key)): _json_safe_value(item, 0, tally) for key, item in row.items()}
         for row in rows
     ]
+    return _NormalisedRows(rows=safe_rows, depth_capped_cells=tally.depth_capped_cells)
+
+
+def _json_safe_rows(rows: list[dict]) -> list[dict]:
+    return _normalise_rows(rows).rows
+
+
+def _depth_note(engine: Engine, depth_capped_cells: int) -> str | None:
+    """The row-level caveat for capped cells, carried in `hint` (None when nothing was
+    capped, so every existing caller's output is byte-identical). Logs counts only."""
+    if depth_capped_cells == 0:
+        return None
+    logger.info(
+        "engine=%s run_query_bounded depth_capped_cells=%s max_depth=%s",
+        engine,
+        depth_capped_cells,
+        _MAX_CELL_NESTING_DEPTH,
+    )
+    return (
+        f"{depth_capped_cells} result cell(s) nested deeper than {_MAX_CELL_NESTING_DEPTH} "
+        f"levels were replaced by the placeholder {_NESTING_DEPTH_PLACEHOLDER!r}; project a "
+        "shallower path (a struct field, JSON_EXTRACT / GET_PATH) to read them."
+    )
 
 
 def run_query_bounded(
@@ -322,7 +379,12 @@ def run_query_bounded(
     # After dispatch and before either return path, so a billed execution always yields a
     # structured result (or an actionable refusal) and never a post-billing serialisation
     # error from a connector-native cell type.
-    rows = _json_safe_rows(rows)
+    normalised = _normalise_rows(rows)
+    rows = normalised.rows
+    # Carried in the existing nullable `hint` (None when nothing was capped): a new field
+    # would widen the published outputSchema beyond the one property decision #13 adds.
+    # `status` is and was the refusal discriminator, never `hint`.
+    depth_note = _depth_note(engine, normalised.depth_capped_cells)
 
     if row_cap_hit:
         logger.info(
@@ -332,16 +394,19 @@ def run_query_bounded(
             max_rows,
             row_count,
         )
+        row_cap_hint = (
+            f"Query returned more than max_rows={max_rows} rows; showing the first "
+            f"{row_count}. Add a LIMIT to your query or raise max_rows."
+        )
         return BoundedQueryResult(
             status="refused",
             reason=RefusalReason.ROW_CAP_EXCEEDED,
             estimate=estimate,
-            hint=(
-                f"Query returned more than max_rows={max_rows} rows; showing the first "
-                f"{row_count}. Add a LIMIT to your query or raise max_rows."
-            ),
+            hint=row_cap_hint if depth_note is None else f"{row_cap_hint} {depth_note}",
             rows=rows,
             row_count=row_count,
         )
 
-    return BoundedQueryResult(status="ok", estimate=estimate, rows=rows, row_count=row_count)
+    return BoundedQueryResult(
+        status="ok", estimate=estimate, rows=rows, row_count=row_count, hint=depth_note
+    )

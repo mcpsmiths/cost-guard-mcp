@@ -48,6 +48,13 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   bound; they now carry the same 30 s retry bound as every other BigQuery call, and exhausted
   polling retries issue the same bounded best-effort job cancel the 120 s watchdog does
   (`DECISIONS.md` #14; #103).
+- `run_query_bounded`: a result cell nested roughly 250 or more levels deep (BigQuery JSON,
+  Snowflake OBJECT/ARRAY) tripped the MCP SDK's serialiser after the billed execution, so the
+  host received a protocol error or `Error executing tool run_query_bounded` and the result was
+  lost; nested values are now capped at 64 levels with the placeholder
+  `<nested value omitted: deeper than 64 levels>` and a `hint` naming the affected cell count -
+  `hint` can therefore be set on an `ok` result; `status` remains the refusal discriminator
+  (`DECISIONS.md` #17; #105).
 
 ## [0.4.0] - 2026-10-14
 
