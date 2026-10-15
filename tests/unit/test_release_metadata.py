@@ -498,6 +498,26 @@ def test_release_build_install_step_fails_closed_on_a_wrong_or_missing_hash(tmp_
             assert installed == [], f"{label}: the fixture wheel was installed despite the failure"
 
 
+DEPENDABOT_PATH = REPO_ROOT / ".github" / "dependabot.yml"
+
+
+def _dependabot_entries() -> list[list[str]]:
+    """The lines of each ``updates:`` entry of .github/dependabot.yml, keys stripped of ``- ``."""
+    blocks = _step_blocks(DEPENDABOT_PATH.read_text(encoding="utf-8"), "package-ecosystem:")
+    return [[line.strip().removeprefix("- ") for line in block] for block in blocks]
+
+
+def test_dependabot_tracks_the_build_requirements_file():
+    # The hashed file moves through Dependabot's pip updater, which rewrites the version and the
+    # --hash lines together, not by hand: a weekly `pip` entry on /.github. The lockstep test
+    # above then turns each such PR into a prompt to bump pyproject.toml and uv.lock with it.
+    pip_entries = [entry for entry in _dependabot_entries() if 'package-ecosystem: "pip"' in entry]
+    assert len(pip_entries) == 1, f"expected one pip ecosystem entry, found {len(pip_entries)}"
+    (entry,) = pip_entries
+    assert 'directory: "/.github"' in entry, f"pip entry does not track /.github: {entry!r}"
+    assert 'interval: "weekly"' in entry, f"pip entry is not weekly: {entry!r}"
+
+
 # --- release-authority-tag-push-unbound-to-reviewed-main:.github/workflows/release.yml ------
 
 

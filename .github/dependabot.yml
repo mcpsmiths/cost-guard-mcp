@@ -17,3 +17,16 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+
+  # .github/requirements-build.txt - the hash-pinned backend the release build installs
+  # (DECISIONS.md #11, amended 2026-10-16). Dependabot rewrites the version and the --hash
+  # lines together; tests/unit/test_release_metadata.py then fails that PR until
+  # pyproject.toml's [build-system] pin, build-constraint-dependencies and uv.lock move
+  # with it - intended coupling, not a flake.
+  - package-ecosystem: "pip"
+    directory: "/.github"
+    schedule:
+      interval: "weekly"
+    groups:
+      build-requirements:
+        patterns: ["*"]
