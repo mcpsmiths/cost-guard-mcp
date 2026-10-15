@@ -6,77 +6,16 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
-### Security
+## [0.5.0] - 2026-10-15
 
-- **Breaking: read statements only by default.** `estimate_query_cost` and `run_query_bounded`
-  refuse any statement whose first keyword is not `SELECT`, `WITH` (followed by `SELECT`/`VALUES`;
-  CTEs nested more than 16 levels deep are refused too, so the walk stays bounded on
-  model-controlled text), `VALUES`, `SHOW`, `DESCRIBE`, `DESC` or `EXPLAIN`, before any estimate or
-  execution (`DECISIONS.md` #13; #93). Opt-out: `COST_GUARD_ALLOW_WRITE_STATEMENTS=1` (exactly). With
-  `COST_GUARD_ALLOW_MULTI_STATEMENT_SQL=1` every statement must be a read, so BigQuery scripts now
-  need both opt-outs. `run_query_bounded` results carry the constant
-  `rows_provenance: warehouse_data_untrusted` (additive `outputSchema` change, the intended
-  `tools/list` diff) and both tool descriptions changed. The authorisation boundary remains the
-  deployed credential's grants (read-only recommended; SECURITY.md, README).
-- **Read-only tools no longer wake a warehouse by default** (`check_credentials`,
-  `estimate_query_cost`; `DECISIONS.md` #20; #91, #92). Databricks: the configured SQL
-  warehouse's state is read through the Warehouses API first; unless it is `RUNNING` - also
-  when the state cannot be read - `check_credentials` returns `ok: false` and
-  `estimate_query_cost` returns no byte or dollar figure, with no session opened. Snowflake:
-  `SELECT CURRENT_REGION()`, the `QUERY_HISTORY` read and `check_credentials`' session-context
-  `SELECT` run only when the pinned warehouse's `SHOW WAREHOUSES` state is `STARTED` (skipped
-  when no warehouse is pinned or the state cannot be read; the `QUERY_HISTORY` read is also
-  skipped whenever `estimate_query_cost` gets no `warehouse` argument); the estimate then
-  prices at Gen1 rates at the observed size with the byte-tier heuristic and a caveat, and
-  `check_credentials` returns `ok: true` with a detail built from the `SHOW WAREHOUSES` row.
-  `USE WAREHOUSE`, `EXPLAIN USING JSON`, `SHOW WAREHOUSES` and `SELECT CURRENT_WAREHOUSE()`
-  still run. `run_query_bounded` is unchanged (its estimate and execution may wake the
-  warehouse). Opt-ins to waking the warehouse: `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true`,
-  `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true` (exactly those values). Behaviour change for
-  Databricks principals without `CAN_VIEW`/`CAN_USE` on the warehouse: the read-only tools now
-  refuse instead of pricing at the caller-asserted size. Tool descriptions changed
-  (description-only `tools/list` diff). The owner's per-statement attribution test is the
-  recorded follow-up in `DECISIONS.md` #20.
-
-### Added
-
-- `COST_GUARD_ALLOW_WRITE_STATEMENTS`, documented in `server.json`, `.mcp.json.example` and the README
-  (Setup, Known limitations, the Codex env block).
-- `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START` and `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME`,
-  documented in `server.json`, `.mcp.json.example` and the README (Setup, Known limitations).
-
-### Changed
-
-- Release process: the MCP Registry listing `io.github.mcpsmiths/cost-guard-mcp` is published by
-  `release.yml` from the tagged commit, after PyPI has the version, through the new `mcp-registry`
-  environment and GitHub OIDC with a pinned, SHA256-verified `mcp-publisher` (reusable workflow
-  `mcp-registry-publish.yml`; its `workflow_dispatch` dry run proves the registry grant without
-  publishing, and its re-publish path replaces the personal-token procedure). `DECISIONS.md` #12
-  is decided; the hosted release controls - the `v*` tag ruleset, the environment deployment
-  policies and the PyPI publisher binding - are recorded under #10 (#98, #99). No runtime change.
-
-### Fixed
-
-- Single-statement scanner: a line comment followed by a quote, backtick, `$$` or `/*` right
-  after U+000B, U+000C, U+001C, U+001D, U+001E, U+0085, U+2028 or U+2029 made the scanner end
-  the comment early, open a construct the engine never sees and swallow the engine's top-level
-  `;`, admitting two-statement text. Line comments now end where each dialect's lexer does (CR or
-  LF on Databricks; LF on BigQuery and Snowflake, where a bare CR inside a comment is refused as
-  ambiguous), and any of those eight code points inside a line comment, or a backslash before its
-  terminator, is refused (`DECISIONS.md` #15; #104).
-- BigQuery `run_query_bounded`: the result-polling RPCs inside `query_job.result()` inherited the
-  library's 600 s default retry, so a Google-side outage that began after job submission pinned
-  the worker thread and one in-flight slot for ~10 min instead of surfacing within the documented
-  bound; they now carry the same 30 s retry bound as every other BigQuery call, and exhausted
-  polling retries issue the same bounded best-effort job cancel the 120 s watchdog does
-  (`DECISIONS.md` #14; #103).
-- `run_query_bounded`: a result cell nested roughly 250 or more levels deep (BigQuery JSON,
-  Snowflake OBJECT/ARRAY) tripped the MCP SDK's serialiser after the billed execution, so the
-  host received a protocol error or `Error executing tool run_query_bounded` and the result was
-  lost; nested values are now capped at 64 levels with the placeholder
-  `<nested value omitted: deeper than 64 levels>` and a `hint` naming the affected cell count -
-  `hint` can therefore be set on an `ok` result; `status` remains the refusal discriminator
-  (`DECISIONS.md` #17; #105).
+The follow-up release to the 2026-10 audit remediation (#106, #107 and the registry-channel
+PR). **Breaking:** read statements only by default (opt-out
+`COST_GUARD_ALLOW_WRITE_STATEMENTS=1`) and read-only tools that no longer wake a warehouse
+(opt-ins `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true`,
+`COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME=true`). Plus the line-comment scanner fix, bounded
+BigQuery result polling, a 64-level cap on nested result cells, and the MCP Registry listing
+published by `release.yml` from the tag. Full detail:
+[`changelog/v0.5.0.md`](changelog/v0.5.0.md).
 
 ## [0.4.0] - 2026-10-14
 
@@ -130,7 +69,8 @@ Harness/governance docs, CI security tooling, and PyPI Trusted Publishing. Full 
 Initial release: BigQuery (`PRECISE`) + Snowflake (`UPPER_BOUND`) pre-flight cost
 guardrails. Full detail: [`changelog/v0.1.0.md`](changelog/v0.1.0.md).
 
-[Unreleased]: https://github.com/mcpsmiths/cost-guard-mcp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/mcpsmiths/cost-guard-mcp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.5.0
 [0.4.0]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.4.0
 [0.3.3]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.3.3
 [0.3.2]: https://github.com/mcpsmiths/cost-guard-mcp/releases/tag/v0.3.2
