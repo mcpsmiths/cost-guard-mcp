@@ -439,11 +439,14 @@ Preconditions, answered read-only on 2026-10-15:
 - *Validation and overwrite:* the registry verifies PyPI ownership at publish time by the
   `mcp-name: <name>` string in the PyPI description (README.md:3) and checks that the
   version exists on PyPI, on its own network path (a fresh upload can still 404 there for
-  about 30 s after PyPI's JSON API serves it). The publish step retries only the errors the
-  registry's PyPI validator labels transient - that not-yet-visible 404, a PyPI 429 or 5xx,
-  an inconclusive package probe, PyPI unreachable (`internal/validators/registries/pypi.go`
-  at v1.8.1) - and fails at once on everything else; `tests/unit/test_release_metadata.py`
-  pins that scope against the registry's own message texts.
+  about 30 s after PyPI's JSON API serves it; the first real run, v0.5.0 on 2026-10-15,
+  needed 2 attempts, ~60-70 s). The publish step retries only the errors the registry's
+  PyPI validator labels transient - that not-yet-visible 404, a PyPI 429 or 5xx, an
+  inconclusive package probe, PyPI unreachable (`internal/validators/registries/pypi.go`
+  at v1.8.1) - up to 8 attempts 30 s apart (raised from 5 after that run, #111: headroom
+  for a slower day while the job's designed worst case stays about 20 minutes) and fails at
+  once on everything else; `tests/unit/test_release_metadata.py` pins that scope against
+  the registry's own message texts and pins the 8 x 30 s budget.
   A version string must be unique and is immutable once published, so nothing is ever
   overwritten: a wrong entry is corrected by publishing a new version. Lifecycle is a status
   (`active`, `deprecated`, `deleted`, with an optional message) set with `mcp-publisher

@@ -1232,6 +1232,20 @@ def test_registry_publish_retries_only_the_registrys_transient_pypi_errors():
         assert not pattern.search(message), f"final registry error would be retried: {message!r}"
 
 
+def test_registry_publish_retry_budget_is_eight_attempts_30s_apart():
+    # #111 item 3: the first real run (v0.5.0, run 38774814418) used 2 of the original 5
+    # attempts waiting ~60-70 s for the registry's PyPI view to catch up with pypi.org; 8 x 30 s
+    # leaves headroom for a slower day while the designed worst case (PyPI poll 13.3 min, this
+    # loop 4 min, read-back 2.5 min) stays under the job's 30-minute timeout. The attempt text
+    # and the exhaustion message must say the same number as the loop.
+    script = _registry_step_script("Publish server.json to the MCP Registry")
+    assert "for attempt in $(seq 1 8); do" in script
+    assert "sleep 30" in script
+    assert 'echo "Attempt ${attempt}/8:' in script
+    assert "still failing after 8 attempts" in script
+    assert "seq 1 5" not in script
+
+
 @pytest.mark.parametrize(
     ("tag", "expected_exit"),
     [
