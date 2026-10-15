@@ -33,6 +33,16 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 - `COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START` and `COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME`,
   documented in `server.json`, `.mcp.json.example` and the README (Setup, Known limitations).
 
+### Fixed
+
+- Single-statement scanner: a line comment followed by a quote, backtick, `$$` or `/*` right
+  after U+000B, U+000C, U+001C, U+001D, U+001E, U+0085, U+2028 or U+2029 made the scanner end
+  the comment early, open a construct the engine never sees and swallow the engine's top-level
+  `;`, admitting two-statement text. Line comments now end where each dialect's lexer does (CR or
+  LF on Databricks; LF on BigQuery and Snowflake, where a bare CR inside a comment is refused as
+  ambiguous), and any of those eight code points inside a line comment, or a backslash before its
+  terminator, is refused (`DECISIONS.md` #15; #104).
+
 ## [0.4.0] - 2026-10-14
 
 The 2026-10 security-audit remediation (PR #86). **Breaking:** one SQL statement per call

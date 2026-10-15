@@ -425,12 +425,22 @@ deliberate false positives in the safe direction (`THEN'x'` without whitespace,
 `DATE'2020-01-01'`, raw strings ending in an odd run of backslashes, nested block comments)
 and the hint says how to rewrite them. Every scanner mistake must stay in the refuse
 direction: a new dialect construct is added only once its quoting rules are certain, and an
-uncertain construct is refused, never guessed. Two review findings against the first cut
-illustrate the rule: line comments now end at any `str.splitlines()` boundary (Spark ends a
-`--` comment at a bare `\r`; ending a comment earlier than an engine does is always the
-refuse direction), and the odd-backslash test runs on every candidate closing delimiter
+uncertain construct is refused, never guessed. One review finding against the first cut
+illustrates the rule: the odd-backslash test runs on every candidate closing delimiter
 before the doubled-delimiter skip, so `r'\''; DROP TABLE t; --'` is refused as ambiguous
-rather than read as a doubled quote.
+rather than read as a doubled quote. A second finding against the first cut shows the rule's
+limit: line comments were ended at any `str.splitlines()` boundary on the premise that ending
+a comment earlier than an engine does is always the refuse direction, and the 2026-10-14 audit
+re-run disproved that premise (#104) - a quote right after an early end opens a literal the
+engine never sees, and that literal swallows the engine's top-level `;`, so two-statement text
+was admitted. A line comment now ends where the dialect's lexer is known to end it: CR or LF
+on Databricks (Spark SQL's `SIMPLE_COMMENT : '--' ('\\\n' | ~[\r\n])* '\r'? '\n'?`), LF only
+on BigQuery and Snowflake (Snowflake's lexer is unpublished and ZetaSQL's rule could not be
+re-located for citation, so a bare CR inside a comment is refused there as ambiguous - flip
+`_BIGQUERY.line_comment_terminators` once it is), and a comment containing one of the eight
+other `str.splitlines()` code points, or a backslash before its terminator (Spark's
+continuation), is refused outright. Ending a comment too early is not always safe; refusing
+the text whose comment end is uncertain is.
 
 ## 16. BigQuery dollar caps are also enforced server-side, and the provider's refusal is a normal result
 
