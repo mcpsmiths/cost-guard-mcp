@@ -83,10 +83,10 @@ _NESTING_DEPTH_PLACEHOLDER = f"<nested value omitted: deeper than {_MAX_CELL_NES
 
 @dataclass
 class _NormalisationTally:
-    """Per-call accumulator of what the normaliser had to replace - local to one
-    _normalise_rows call, never shared, so two calls never see each other's counts."""
+    """Per-cell accumulator of what the normaliser had to replace - created afresh for every
+    cell by _normalise_cell, never shared, so counts never leak between cells or calls."""
 
-    depth_capped_cells: int = 0
+    depth_capped_containers: int = 0
 
 
 @dataclass(frozen=True)
@@ -120,7 +120,7 @@ def _json_safe_value(value: object, depth: int, tally: _NormalisationTally) -> o
         return base64.b64encode(bytes(value)).decode("ascii")
     if isinstance(value, dict | list | tuple | set | frozenset):
         if depth >= _MAX_CELL_NESTING_DEPTH:
-            tally.depth_capped_cells += 1
+            tally.depth_capped_containers += 1
             return _json_safe_text(_NESTING_DEPTH_PLACEHOLDER)
         if isinstance(value, dict):
             return {
@@ -140,12 +140,21 @@ def _normalise_rows(rows: list[dict]) -> _NormalisedRows:
     row_cap_exceeded): every value placed in BoundedQueryResult.rows - column names
     included - is JSON-serialisable, UTF-8-encodable and nested no deeper than the SDK's
     serialiser can take, with a count of the cells that had to be capped."""
-    tally = _NormalisationTally()
-    safe_rows = [
-        {_json_safe_text(str(key)): _json_safe_value(item, 0, tally) for key, item in row.items()}
+    normalised = [
+        {_json_safe_text(str(key)): _normalise_cell(item) for key, item in row.items()}
         for row in rows
     ]
-    return _NormalisedRows(rows=safe_rows, depth_capped_cells=tally.depth_capped_cells)
+    safe_rows = [{key: safe for key, (safe, _) in row.items()} for row in normalised]
+    depth_capped_cells = sum(capped for row in normalised for _, capped in row.values())
+    return _NormalisedRows(rows=safe_rows, depth_capped_cells=depth_capped_cells)
+
+
+def _normalise_cell(value: object) -> tuple[object, bool]:
+    """One cell normalised, and whether anything inside it was depth-capped. The count the
+    caller reports is of cells, as hint, README and the log field say: a cell with two
+    over-deep branches is one cell to re-project, not two."""
+    tally = _NormalisationTally()
+    return _json_safe_value(value, 0, tally), tally.depth_capped_containers > 0
 
 
 def _json_safe_rows(rows: list[dict]) -> list[dict]:

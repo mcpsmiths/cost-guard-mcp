@@ -94,6 +94,16 @@ def test_capped_cells_are_counted_across_rows_and_per_call():
     assert _normalise_rows([{"a": 1}]).depth_capped_cells == 0
 
 
+def test_a_cell_with_several_capped_branches_counts_once():
+    # hint, README and the log field promise a CELL count ("project a shallower path" is
+    # per cell); a cell whose nested value has two over-deep branches is one cell, not two.
+    deep = _nested(_MAX_CELL_NESTING_DEPTH + 1)
+    assert _normalise_rows([{"j": {"x": deep, "y": deep}}]).depth_capped_cells == 1
+    assert _normalise_rows([{"l": [deep, deep, deep]}]).depth_capped_cells == 1
+    # Distinct cells still count separately.
+    assert _normalise_rows([{"j": {"x": deep}, "k": [deep, deep]}]).depth_capped_cells == 2
+
+
 def test_scalars_and_shallow_cells_are_untouched():
     normalised = _normalise_rows([{"n": 1, "s": "x", "j": _nested(3), "l": [1, [2, [3]]]}])
     assert normalised.rows == [{"n": 1, "s": "x", "j": _nested(3), "l": [1, [2, [3]]]}]
