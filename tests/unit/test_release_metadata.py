@@ -960,8 +960,8 @@ _REGISTRY_FINAL_ERRORS = [
         "PyPI package 'cost-guard-mcp' ownership validation failed. The server name "
         "'io.github.mcpsmiths/cost-guard-mcp' must appear as 'mcp-name: ...' in the package README"
     ),
-    "PyPI package 'someone-elses-package' not found (status: 404)",
-    "registry validation failed for package 0 (pypi): version string must be unique",
+    "PyPI package 'someone-elses-package' not found (status: 404)",  # pypi.go:153
+    "PyPI package 'cost-guard-mcp' version '9.9.9' not found (status: 404)",  # pypi.go:160
 ]
 
 

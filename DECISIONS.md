@@ -251,15 +251,25 @@ workflow.
    (also `actions: read`, `checks`/`pull_requests`/`statuses`/`issues`: write) and
    `pre-commit-ci` (also `workflows: write`, `pull_requests`/`statuses`: write); `codecov`
    and `m8ven-verify` hold `contents: read`; Dependabot is GitHub-native. `main` carries
-   classic branch protection with one required status check, no force pushes, no
-   deletions. This meets step 2's literal trigger (third-party Apps with `contents:
-   write`) - the deviation: reviewers were not added because none of these principals can
-   reach a deployment. The `release-tags` bypass list names only the Organization admin
-   role (no `Integration` actor), so neither App can create a `refs/tags/v*` ref, and
-   `release.yml`'s only trigger is that tag push; neither App holds `actions: write`, so
-   neither can call the workflow-dispatch API that `live-integration` and `mcp-registry`
-   admit from `main`. Reviewers become required the day an App gains `actions: write` or a
-   ruleset bypass, or a second human gets write access.
+   classic branch protection with one required status check, no force pushes and no
+   deletions - but no required pull-request reviews and `enforce_admins` off, so an App with
+   `contents: write` and `pull_requests: write` could land a commit on `main` without a
+   human (the status check only requires CI to have passed on that commit). This meets step
+   2's literal trigger (third-party Apps with `contents: write`) - the deviation: reviewers
+   were not added because none of these principals can reach a deployment. The
+   `release-tags` bypass list names only the Organization admin role (no `Integration`
+   actor), so neither App can create a `refs/tags/v*` ref, and `release.yml`'s only trigger
+   is that tag push; neither App holds `actions: write`, so neither can call the
+   workflow-dispatch API that `live-integration` and `mcp-registry` admit from `main`. What
+   the inventory does not close is `main` itself: the "reviewed `main` history" this
+   decision binds releases to is the maintainer's practice, enforced by the tag ruleset
+   (only the maintainer can release) rather than by `main`'s protection, and a dispatch the
+   maintainer later runs from `main` runs whatever `main` holds. Closing that - a `main`
+   ruleset that requires a pull request and restricts updates to the Organization admin
+   bypass, which also stops the two Apps pushing or merging to `main` - changes how every
+   merge is done and is left to the maintainer, recorded as open in #98. Reviewers become
+   required the day an App gains `actions: write` or a ruleset bypass, or a second human
+   gets write access.
 3. PyPI's Trusted Publisher row for `cost-guard-mcp` names workflow `release.yml` and
    environment `pypi`; the 0.4.0 distributions' PEP 740 provenance (served at
    `https://pypi.org/integrity/cost-guard-mcp/0.4.0/<file>/provenance`) records that

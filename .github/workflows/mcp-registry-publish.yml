@@ -15,7 +15,7 @@
 # satisfy PyPI's environment claim (decision #8's blast-radius split). Its deployment-branch
 # policy admits tags `v*` (the workflow_call path - evaluated against the caller's ref,
 # the pushed tag) and `main` (a workflow_dispatch is admitted only when dispatched from
-# main, so it runs main's reviewed copy of this file; a dispatch from any other ref is
+# main, so it runs main's copy of this file; a dispatch from any other ref is
 # refused before the first step; the checkout below is pinned to the tag regardless). The
 # registry's github-oidc grant for
 # io.github.mcpsmiths/* (the OIDC token's repository_owner claim; registry source
@@ -199,7 +199,8 @@ jobs:
           echo "mcp-publisher publish still failing after 5 attempts"
           exit 1
       # Read back the entry the registry now serves for this version and check that it names
-      # this PyPI project at the tag's version - the fields a registry consumer installs from.
+      # this PyPI project at the tag's version - the fields a registry consumer installs from -
+      # and that its status is active (a deprecated or deleted entry at this version is a failure).
       - name: Confirm the published entry
         if: ${{ inputs.dry_run != true }}
         run: |
@@ -220,5 +221,5 @@ jobs:
           fi
           printf '%s' "$body" | jq '{name: (.server // .).name, version: (.server // .).version, package: (.server // .).packages[0], meta: ._meta}'
           printf '%s' "$body" | jq -e --arg v "$version" --arg id "$(jq -r '.packages[0].identifier' server.json)" \
-            '(.server // .) as $s | $s.version == $v and $s.packages[0].registryType == "pypi" and $s.packages[0].identifier == $id and $s.packages[0].version == $v' >/dev/null
-          echo "Registry serves ${name} ${version} with package record pypi/$(jq -r '.packages[0].identifier' server.json)/${version}"
+            '(.server // .) as $s | $s.version == $v and $s.packages[0].registryType == "pypi" and $s.packages[0].identifier == $id and $s.packages[0].version == $v and ._meta["io.modelcontextprotocol.registry/official"].status == "active"' >/dev/null
+          echo "Registry serves ${name} ${version} (status active) with package record pypi/$(jq -r '.packages[0].identifier' server.json)/${version}"
