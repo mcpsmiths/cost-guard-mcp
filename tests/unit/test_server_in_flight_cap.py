@@ -34,6 +34,7 @@ _ARGS = ("bigquery", "SELECT 1", None, None, None, None, None, None)
 def _ok_result() -> BoundedQueryResult:
     return BoundedQueryResult(
         status="ok",
+        executed=True,
         estimate=CostEstimate(
             engine="bigquery",
             accuracy_tier=AccuracyTier.PRECISE,

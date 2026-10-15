@@ -714,10 +714,10 @@ def test_bounded_query_result_with_normalised_surrogate_rows_serialises_through_
     # Negative control: the un-normalised row still trips the real pydantic path, so the
     # assertion below exercises the normaliser and not a serialiser that turned lenient.
     with pytest.raises(PydanticSerializationError, match="utf-8"):
-        BoundedQueryResult(status="ok", rows=raw_rows, row_count=1).model_dump_json()
+        BoundedQueryResult(status="ok", executed=True, rows=raw_rows, row_count=1).model_dump_json()
 
     dumped = BoundedQueryResult(
-        status="ok", rows=_json_safe_rows(raw_rows), row_count=1
+        status="ok", executed=True, rows=_json_safe_rows(raw_rows), row_count=1
     ).model_dump_json()
 
     assert json.loads(dumped)["rows"] == [{"a\\udc80": "ok\\udcffend"}]
@@ -1065,3 +1065,98 @@ def test_row_cap_refusal_with_fewer_rows_than_max_rows_says_the_fetch_stopped_ea
     warnings = [r for r in caplog.records if r.levelname == "WARNING"]
     assert len(warnings) == 1
     assert "rows_fetched=7 max_rows=1000" in warnings[0].message
+
+
+# --- #101: `executed` on every return path ---------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "estimate", "engine_result", "expected_reason", "expected_executed"),
+    [
+        (
+            {"max_estimated_cost_usd": 1.0},
+            _estimate(cost=10.0),
+            None,
+            RefusalReason.COST_CAP_EXCEEDED,
+            False,
+        ),
+        (
+            {"max_estimated_cost_usd": 1.0},
+            _estimate(cost=None),
+            None,
+            RefusalReason.COST_CAP_EXCEEDED,
+            False,
+        ),
+        (
+            {"max_bytes_billed": 10},
+            _estimate(bytes_=100),
+            None,
+            RefusalReason.BYTE_CAP_EXCEEDED,
+            False,
+        ),
+        (
+            {"max_bytes_billed": 10},
+            _estimate(bytes_=None),
+            None,
+            RefusalReason.BYTE_CAP_EXCEEDED,
+            False,
+        ),
+        (
+            {"max_bytes_billed": 10},
+            _estimate(bytes_=5),
+            ProviderByteCapExceeded(10),
+            RefusalReason.BYTE_CAP_EXCEEDED,
+            False,
+        ),
+        (
+            {"max_rows": 1},
+            _estimate(cost=0.01),
+            ([{"a": 1}], 1, True),
+            RefusalReason.ROW_CAP_EXCEEDED,
+            True,
+        ),
+        (
+            {},
+            _estimate(cost=0.01),
+            ([{"s": "x" * 9_000_000}], 1, True),
+            RefusalReason.RESULT_SIZE_EXCEEDED,
+            True,
+        ),
+        ({}, _estimate(cost=0.01), ([{"a": 1}], 1, False), None, True),
+    ],
+    ids=[
+        "cost_cap",
+        "cost_cap_no_estimate",
+        "byte_cap",
+        "byte_cap_no_estimate",
+        "provider_byte_cap",
+        "row_cap",
+        "result_size",
+        "ok",
+    ],
+)
+@patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_executed_states_whether_the_warehouse_ran_the_statement_on_every_path(
+    mock_estimate, mock_execute, kwargs, estimate, engine_result, expected_reason, expected_executed
+):
+    # #101: "refused" used to be described as "did NOT run" while row_cap_exceeded (and now
+    # result_size_exceeded) follow a billed execution. The provider byte-cap refusal is False:
+    # BigQuery evaluates maximumBytesBilled before running the job (DECISIONS.md #16).
+    mock_estimate.return_value = estimate
+    if isinstance(engine_result, BaseException):
+        mock_execute.side_effect = engine_result
+    elif engine_result is not None:
+        mock_execute.return_value = engine_result
+
+    result = run_query_bounded("bigquery", "SELECT 1", **kwargs)
+
+    assert result.reason == expected_reason
+    assert result.status == ("ok" if expected_reason is None else "refused")
+    assert result.executed is expected_executed
+    assert result.model_dump(mode="json")["executed"] is expected_executed
+    if not expected_executed:
+        if engine_result is None:
+            mock_execute.assert_not_called()
+    else:
+        mock_execute.assert_called_once()

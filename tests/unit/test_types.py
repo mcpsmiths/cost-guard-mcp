@@ -47,6 +47,7 @@ def test_engine_capabilities_round_trip():
 def test_bounded_query_result_refused_shape():
     result = BoundedQueryResult(
         status="refused",
+        executed=False,
         reason=RefusalReason.COST_CAP_EXCEEDED,
         estimate=CostEstimate(
             engine="bigquery", accuracy_tier=AccuracyTier.PRECISE, estimated_cost_usd=12.50
@@ -61,11 +62,11 @@ def test_bounded_query_result_refused_shape():
 
 
 def test_bounded_query_result_rows_provenance_is_a_constant_nobody_sets():
-    ok = BoundedQueryResult(status="ok", rows=[{"a": 1}], row_count=1)
+    ok = BoundedQueryResult(status="ok", executed=True, rows=[{"a": 1}], row_count=1)
     assert ok.rows_provenance == "warehouse_data_untrusted"
     assert ok.model_dump(mode="json")["rows_provenance"] == "warehouse_data_untrusted"
     with pytest.raises(ValidationError):
-        BoundedQueryResult(status="ok", rows_provenance="anything_else")
+        BoundedQueryResult(status="ok", executed=True, rows_provenance="anything_else")
     # The schema sentence is a property description, not a model docstring (which pydantic
     # would emit as a top-level outputSchema description - a wider tools/list diff).
     schema = BoundedQueryResult.model_json_schema()
@@ -81,7 +82,9 @@ def test_bounded_query_result_serialises_bytes_as_base64_and_non_finite_floats_a
     # pydantic's base64 mode uses the URL-safe alphabet ("_w==" for 0xff, where standard
     # base64 gives "/w=="); it is only the backstop - the normaliser's standard base64 is what
     # clients see on every real path.
-    result = BoundedQueryResult(status="ok", rows=[{"b": b"\xff", "n": float("nan")}])
+    result = BoundedQueryResult(
+        status="ok", executed=True, rows=[{"b": b"\xff", "n": float("nan")}]
+    )
     dumped = result.model_dump_json()
     assert '"b":"_w=="' in dumped
     assert '"n":"NaN"' in dumped
@@ -97,3 +100,24 @@ def test_refusal_reason_has_the_four_documented_values_in_declaration_order():
     ]
     # AccuracyTier must never grow: it is the project's three-value contract.
     assert len(AccuracyTier) == 3
+
+
+def test_bounded_query_result_executed_is_required_boolean_with_a_schema_description():
+    # #101: every result states whether the warehouse ran the statement. Required (no
+    # default) so a forgotten path fails at construction instead of silently claiming
+    # "did not run"; the sentence is a property description, never a class docstring.
+    with pytest.raises(ValidationError):
+        BoundedQueryResult(status="ok", rows=[], row_count=0)
+    with pytest.raises(ValidationError):
+        BoundedQueryResult(status="refused", executed="maybe")  # lax mode coerces "yes"
+    schema = BoundedQueryResult.model_json_schema()
+    assert schema["required"] == ["status", "executed"]
+    assert "description" not in schema
+    executed = schema["properties"]["executed"]
+    assert executed["type"] == "boolean"
+    assert "default" not in executed
+    assert "ran the statement" in executed["description"]
+    assert "row_cap_exceeded" in executed["description"]
+    assert "result_size_exceeded" in executed["description"]
+    ran = BoundedQueryResult(status="refused", executed=True, reason=RefusalReason.ROW_CAP_EXCEEDED)
+    assert ran.model_dump(mode="json")["executed"] is True

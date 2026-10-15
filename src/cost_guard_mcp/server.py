@@ -282,9 +282,13 @@ async def run_query_bounded(
     edition: str | None = None,
 ) -> BoundedQueryResult:
     """Run a query only if its pre-flight cost estimate is within your given bounds; refuses
-    otherwise (check result.status — "refused" means it did NOT run and result.hint explains
-    why). NOTE: unlike estimate_query_cost, a successful call here has a real monetary/quota
-    side effect — don't call this repeatedly without inspecting the result of each call.
+    otherwise. Check result.status and result.executed: "refused" with reason
+    "cost_cap_exceeded" or "byte_cap_exceeded" means the query did NOT run (executed=false) and
+    result.hint explains why; "refused" with reason "row_cap_exceeded" or
+    "result_size_exceeded" means the query RAN and was billed (executed=true) and rows holds a
+    truncated prefix of its result - do not re-run it to get more rows, narrow it instead.
+    NOTE: unlike estimate_query_cost, any call with executed=true has a real monetary/quota
+    side effect - don't call this repeatedly without inspecting the result of each call.
     Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
     more statements is refused before anything is estimated or run. This tool accepts
     only read statements (first keyword SELECT, WITH, VALUES, SHOW, DESCRIBE, DESC or EXPLAIN;

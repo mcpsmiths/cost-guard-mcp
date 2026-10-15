@@ -127,6 +127,7 @@ def run_query_bounded(
             )
             return BoundedQueryResult(
                 status="refused",
+                executed=False,
                 reason=RefusalReason.COST_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
@@ -146,6 +147,7 @@ def run_query_bounded(
             )
             return BoundedQueryResult(
                 status="refused",
+                executed=False,
                 reason=RefusalReason.COST_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
@@ -165,6 +167,7 @@ def run_query_bounded(
             )
             return BoundedQueryResult(
                 status="refused",
+                executed=False,
                 reason=RefusalReason.BYTE_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
@@ -183,6 +186,7 @@ def run_query_bounded(
             )
             return BoundedQueryResult(
                 status="refused",
+                executed=False,
                 reason=RefusalReason.BYTE_CAP_EXCEEDED,
                 estimate=estimate,
                 hint=(
@@ -264,8 +268,11 @@ def run_query_bounded(
             if byte_cap_derived_from_cost_cap and max_estimated_cost_usd is not None
             else f"your max_bytes_billed={max_bytes_billed}"
         )
+        # executed=False: BigQuery evaluates maximumBytesBilled before running the job, so the
+        # statement never ran even when a (failed) job id exists - DECISIONS.md #16.
         return BoundedQueryResult(
             status="refused",
+            executed=False,
             reason=reason,
             estimate=estimate,
             hint=(
@@ -314,6 +321,7 @@ def run_query_bounded(
         )
         return BoundedQueryResult(
             status="refused",
+            executed=True,
             reason=RefusalReason.RESULT_SIZE_EXCEEDED,
             estimate=estimate,
             hint=_with_depth_note(
@@ -350,6 +358,7 @@ def run_query_bounded(
         )
         return BoundedQueryResult(
             status="refused",
+            executed=True,
             reason=RefusalReason.ROW_CAP_EXCEEDED,
             estimate=estimate,
             hint=_with_depth_note(row_cap_hint(max_rows=max_rows, row_count=row_count), depth_note),
@@ -358,7 +367,12 @@ def run_query_bounded(
         )
 
     return BoundedQueryResult(
-        status="ok", estimate=estimate, rows=rows, row_count=row_count, hint=depth_note
+        status="ok",
+        executed=True,
+        estimate=estimate,
+        rows=rows,
+        row_count=row_count,
+        hint=depth_note,
     )
 
 

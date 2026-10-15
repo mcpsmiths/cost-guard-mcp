@@ -54,7 +54,7 @@ def test_normalise_rows_caps_a_300_level_cell_and_counts_it():
     # Serialisable through BOTH SDK steps (to_json for the text block, model_dump(mode="json")
     # for structuredContent) and through the runner's envelope dump, which at main failed at
     # depth 252 with "Circular reference detected".
-    result = BoundedQueryResult(status="ok", rows=normalised.rows, row_count=1)
+    result = BoundedQueryResult(status="ok", executed=True, rows=normalised.rows, row_count=1)
     dumped = result.model_dump(mode="json")
     assert dumped["rows"] == normalised.rows
     pydantic_core.to_json(result)
