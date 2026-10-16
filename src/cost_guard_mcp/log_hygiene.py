@@ -28,7 +28,8 @@ from typing import Final
 
 from cost_guard_mcp.errors import redact_secrets
 
-# Logger names pinned to WARNING at server start. Exactly these; one reason per line.
+# Logger names pinned to WARNING when the server module is imported. Exactly these; one
+# reason per line.
 THIRD_PARTY_LOGGERS: Final[tuple[str, ...]] = (
     # Confirmed history of credential text in connector exceptions (snowflake-connector-python
     # #1323); logs every login and statement at INFO.
@@ -50,11 +51,17 @@ THIRD_PARTY_LOGGERS: Final[tuple[str, ...]] = (
     # whose request line ("HTTP Request: GET https://...") logs under the logger name
     # "httpx2" (httpx2/_client.py), and databricks-sdk uses requests over urllib3. Kept as a
     # guard for a future transitive dependency that brings httpx in: pinning a logger no
-    # library writes to costs nothing. Whether to add "httpx2"/"httpcore2" is the owner's call.
+    # library writes to costs nothing. "httpx2"/"httpcore2" are pinned below.
     "httpx",
     # httpx's transport (connection-level trace lines); same standing as httpx - a guard, not a
     # current dependency (the SDK's transport logs under "httpcore2.*").
     "httpcore",
+    # The mcp SDK (2.3.0) itself: its HTTP client httpx2 logs every request line
+    # ("HTTP Request: GET https://...", httpx2/_client.py) under "httpx2", and its
+    # transport layer under "httpcore2" - the names the SDK's streamable-HTTP and SSE
+    # clients would chatter under if a host ever drove this server over HTTP.
+    "httpx2",
+    "httpcore2",
 )
 
 # Replaces a record's text when msg % args cannot be rendered (a format/args mismatch in some

@@ -245,7 +245,7 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
     chain that produces what a tool caller sees is applied before anything is logged.
   - The warehouse-client libraries' own loggers (`snowflake.connector`, `databricks`,
     `databricks.sql`, `databricks.sdk`, `google`, `urllib3`, `httpx`, `httpcore`) are pinned
-    to WARNING at server start: their per-connection and per-request INFO chatter — the
+    to WARNING when the server module is imported (before any backend call): their per-connection and per-request INFO chatter — the
     volume an embedded credential would hide in — never reaches stderr, while their WARNING
     and ERROR records (the ones that carry an exception's text) still do. The project's own
     loggers are not touched by this pin. Two Google-library mechanisms interact with it:

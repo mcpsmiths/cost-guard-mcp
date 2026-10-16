@@ -19,7 +19,7 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ### Added
 
-- Redacting log filter and pinned third-party loggers: at server start the
+- Redacting log filter and pinned third-party loggers: when the server module is imported the
   `snowflake.connector`, `databricks`, `databricks.sql`, `databricks.sdk`, `google`, `urllib3`,
   `httpx` and `httpcore` loggers are set to WARNING, and every record that reaches the stderr
   handler — the `mcp` SDK's and the client libraries' included — has its message, exception

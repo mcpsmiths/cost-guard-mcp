@@ -196,8 +196,10 @@ jobs:
               fi
               exit 1
             fi
-            echo "Attempt ${attempt}/8: registry has not yet confirmed this PyPI release, waiting 30s..."
-            sleep 30
+            if [ "$attempt" -lt 8 ]; then
+              echo "Attempt ${attempt}/8: registry has not yet confirmed this PyPI release, waiting 30s..."
+              sleep 30
+            fi
           done
           echo "mcp-publisher publish still failing after 8 attempts"
           exit 1

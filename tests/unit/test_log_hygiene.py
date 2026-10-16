@@ -71,6 +71,8 @@ def test_third_party_loggers_is_exactly_the_reviewed_list():
         "urllib3",
         "httpx",
         "httpcore",
+        "httpx2",
+        "httpcore2",
     )
 
 

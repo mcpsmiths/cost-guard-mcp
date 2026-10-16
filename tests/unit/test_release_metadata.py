@@ -1253,6 +1253,8 @@ def test_registry_publish_retry_budget_is_eight_attempts_30s_apart():
     assert 'echo "Attempt ${attempt}/8:' in script
     assert "still failing after 8 attempts" in script
     assert "seq 1 5" not in script
+    # No 30 s wait after the final attempt: the exhaustion message follows it directly.
+    assert 'if [ "$attempt" -lt 8 ]; then' in script
 
 
 @pytest.mark.parametrize(
