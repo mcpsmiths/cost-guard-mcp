@@ -656,6 +656,12 @@ signatures untouched). Residual, documented in README: BigQuery's 10 MiB-per-ref
 minimum means a tight cap on a many-table query can still be provider-rejected after passing
 the gate - it now surfaces as the structured refusal rather than a provider error string. A
 caller-supplied `max_bytes_billed=0` is passed through unchanged, as before.
+Amended (#96, 2026-10): the RLS-shaped and `LOWER_BOUND` dry runs no longer carry a dollar figure
+and are refused under a dollar cap before dispatch (#22), so "RLS queries still run, now
+server-bounded" holds only for a byte cap; the derived `maximumBytesBilled` remains the second
+layer for the figures that pass (`UNKNOWN`/unrecognised accuracy, a statement that references no
+table, the dry-run-versus-run gap). `+inf` means "no dollar cap" for the comparison and the
+derivation; with no dollar figure at all it is still a requested cap and refuses (#22).
 
 ## 17. Result rows are normalised to JSON-safe values at one choke point, after execution
 
@@ -1054,3 +1060,116 @@ tell it from a result with more pages. `tests/unit/test_result_bounds.py`'s prop
 guard on the estimator; the hit-on-size-stop rule is the fail-closed fallback behind it. Ships in
 0.5.1
 (additive schema; a default change on a 0.x line that already moved defaults in 0.5.0).
+
+## 22. BigQuery estimates without a usable byte figure produce no dollar figure, so a dollar cap refuses
+
+**Context:** Issue #96 (post-remediation triage; PR #86's "accepted for now" bullet 5). Three
+provider facts reached `run_query_bounded`'s dollar gate as if they were estimates. (1) BigQuery's
+dry run reports 0 bytes processed for any query against a table protected by row-level security -
+Google's cost documentation: "dry runs always return 0 bytes to prevent side-channel attacks"; its
+RLS best practices: BigQuery "hides sensitive statistics on all queries against tables with
+row-level security", including "the number of bytes ... processed" and "the number of bytes
+billed" - and `dry_run` tagged that 0 `PRECISE`, priced it at $0.00 and added a caveat, so the
+figure passed every `max_estimated_cost_usd`. (2) `totalBytesProcessedAccuracy: LOWER_BOUND`, which
+the REST reference (`JobStatistics2.totalBytesProcessedAccuracy`) defines as "estimate is lower
+bound of what the query would cost", was relabelled `UPPER_BOUND` and priced: a floor presented as
+a cap. (3) `is_capacity_billed` searched reservation assignments in `US` only, so a project whose
+reservation lives elsewhere was priced on-demand. #16's derived `maximumBytesBilled` bounded the
+run server-side, which is why #86 accepted (1) and (2). Owner decision 2026-10-16: fail closed when
+a dollar cap is requested (AGENTS.md: a requested cap must never go silently unenforced) and look
+the billing model up at the job's location.
+
+**Decision:**
+
+- *The RLS shape.* `dry_run` treats `totalBytesProcessed` of 0 - or absent, coerced to 0 as
+  before - on a statement whose `referencedTables` is non-empty as the row-level-security shape:
+  `estimated_bytes` stays `0` as reported, `accuracy_tier` becomes `HEURISTIC`,
+  `estimated_cost_usd` is `None`, and the caveat keeps the facts (always 0 bytes, by design, to
+  prevent a side-channel; the $0.00 must not be trusted) and names the remedy. A statement that
+  references no table (`SELECT 1`) legitimately prices at $0.00 `PRECISE` and is unchanged. The
+  predicate is deliberately coarse: `totalBytesProcessed` and `referencedTables` are the only
+  fields the dry-run response offers, and they cannot tell a hidden figure from a genuinely free
+  one (Consequences, below), so the caveat describes what was observed (0 bytes on a statement
+  that references a table) and lists row-level security among the known causes of that shape
+  instead of asserting it.
+- *LOWER_BOUND.* Mapped to `HEURISTIC` - the only one of #3's three tiers that promises no bound
+  in either direction - with `estimated_bytes` the reported floor and `estimated_cost_usd=None`;
+  the caveat names the accuracy and says floor-not-cap. `UNKNOWN` ("accuracy of the estimate is
+  unknown"), `UPPER_BOUND` and unrecognised values keep today's `UPPER_BOUND` label and their
+  dollar figure: nothing shows UNKNOWN to be a floor, and #16's derived cap bounds those runs.
+- *The gate.* Nothing new in the tool: both shapes arrive at #5's existing
+  `estimated_cost_usd is None` branch and are refused before dispatch (`reason:
+  cost_cap_exceeded`, `executed: false`, INFO `detail=no_cost_estimate_available`); the hint now
+  names the two BigQuery shapes and the remedy (in its BigQuery-only sentence; the generic
+  sentence stays engine-neutral). `estimate_query_cost` shares `dry_run`, so the read-only
+  estimate shows the same facts; `describe_engine_capabilities` says so in `known_gaps`.
+  `max_estimated_cost_usd=+inf` reaches this branch too: #16's sentinel compares as "no dollar
+  cap" against any dollar figure and derives no server-side byte cap, but the parameter was
+  given, so with no dollar figure to compare the call is refused like any other dollar cap -
+  omit the parameter, or use `max_bytes_billed`. That was already the branch's behaviour for a
+  capacity-billed project; #22 widens the set of estimates it applies to, and the README's
+  sentinel sentence now says so. Making `+inf` skip the branch instead is a one-line change
+  (`math.isfinite` before refusing, mirroring the derivation) left to the owner.
+- *Why `estimated_bytes` stays as reported, so `max_bytes_billed` keeps working.* The byte gate
+  refuses only on `estimated_bytes is None`; with 0 (or the floor) it admits, and the job carries
+  `maximumBytesBilled = max_bytes_billed` (#16), which BigQuery evaluates before running the job.
+  The byte cap's promise ("never bill more than N bytes") is delivered by the provider in its own
+  unit; the pre-flight comparison being uninformative does not make the cap unenforced. The dollar
+  cap's promise ("refuse if the estimated cost exceeds $X") presupposes an estimate, and a $0.00
+  built from a hidden statistic is not one - reporting it as compared is the condition #5 forbids.
+  `0` is also the true datum: it is what the API returned; the caveat says it is not the bytes the
+  query would read.
+- *Location.* `is_capacity_billed(project, location="US")` keeps its signature; `dry_run` passes
+  `QueryJob.location` (`jobReference.location` - the location whose slots the query would consume;
+  the installed `google-cloud-bigquery` 3.46.1 returns `None` when the service sent none) and falls
+  back to `US` only then, adding a caveat. `SearchAllAssignments` is per region (the installed
+  `google-cloud-bigquery-reservation` 1.28.0 documents it as a lookup "for a particular region";
+  the parent's only wildcard is the project), so there is no all-locations call. The location is
+  service-returned text entering a hand-built resource path, so it is allowlisted
+  (`^[A-Za-z][A-Za-z0-9-]{0,63}$`) like the project id (#6) before interpolation; a failure
+  surfaces through `@sanitize_exceptions` as the existing "could not verify billing model" path (no
+  dollar figure). Every dry run logs one INFO record `engine=bigquery dry_run billing_model_check
+  location=<presented> location_source=job|fallback outcome=capacity_billed|on_demand|check_failed`,
+  and the capacity-billed, check-failed and fallback caveats carry the location.
+- *Placement.* The pure rules (accuracy table, location allowlist, job-location resolution, the
+  remote-billing text heuristic) live in `engines/bigquery_estimate_rules.py` so
+  `engines/bigquery.py` stays under the 500-line guideline; every SDK-calling function stays where
+  the tests patch it.
+
+**Rejected / deferred:** a fourth `AccuracyTier.LOWER_BOUND` value (#3's structural three-value
+contract, pinned by `tests/unit/test_types.py`, and a published `outputSchema` enum - an intended
+`tools/list` diff for no gain: the consumer's action is the same as for HEURISTIC); keeping the
+pass-through with #16's server-side cap as the only control (the gate would keep reporting a
+fictitious $0.00 / floor as if it had been compared - the condition #5 forbids - and the issue's
+own alternative (b)); `estimated_bytes=None` for the RLS shape (would make `max_bytes_billed`
+refuse too, leaving RLS users no cap to run under); keeping `UPPER_BOUND` for LOWER_BOUND with the
+figure dropped (still a label promising `actual <= figure` about a documented floor); relabelling
+`UNKNOWN` as HEURISTIC or dropping its figure (not shown to be a floor; owner's call, deferred);
+failing closed on the location fallback (the check still ran, for the pre-#96 location; the caveat
+records the doubt); querying every location (no such API call; N round-trips per estimate); a text
+heuristic exempting `COUNT(*)`-style aggregates from the RLS shape (a second guess layered on the
+first, in the admit direction - an RLS-protected table's `COUNT(*)` dry run reports the same 0 -
+when the byte cap already runs them).
+
+**Consequences:** behaviour change for BigQuery callers whose queries touch RLS-protected tables or
+produce `LOWER_BOUND` estimates: `max_estimated_cost_usd` now refuses them (`executed: false`,
+nothing billed) where it used to admit a $0.00 / floor figure - bound such runs with
+`max_bytes_billed`, which BigQuery enforces server-side; the read-only estimate shows
+`estimated_cost_usd: null`, `accuracy_tier: HEURISTIC` and the caveat. Accepted false positives,
+in the safe direction: any dry run reporting 0 bytes on a statement that references a table is
+treated as this shape, including aggregates BigQuery answers from table metadata such as an
+unfiltered `COUNT(*)`, a `SELECT` over an empty table and a partition filter that prunes every
+partition - base ran those at $0.00 under a dollar cap; a dollar cap now refuses them too, and
+`max_bytes_billed` runs them. The caveat therefore describes the shape and lists these causes
+alongside row-level security rather than asserting it (pinned by
+`test_dry_run_zero_byte_aggregate_answered_from_metadata_is_treated_as_the_rls_shape`). No schema
+change (`AccuracyTier` and every tool description unchanged, so `tools/list` is byte-identical); the
+`describe_engine_capabilities` result text for BigQuery changed. Capacity-billed projects whose
+reservation is assigned in the query's own location are now detected there (before: only `US`); a
+project with a reservation in a location other than the one the query runs in is priced on-demand
+for that query, which is what that query is. The `US` fallback is observable (caveat and
+`location_source=fallback`). Unit tests drive the real `dry_run` through both tools for each shape
+(`tests/unit/test_engines_bigquery.py`, `test_tools_run_query_bounded.py`,
+`test_tools_estimate_query_cost.py`); the runtime probes against the real stdio server with the
+fake SDK are recorded in `scratch-pad/bq-cap-gate-2026-10/evidence/`. Ships in 0.5.1 (with #21;
+the same 0.x reasoning - the release PR fixes the number for both).

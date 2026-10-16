@@ -68,7 +68,9 @@ def run_query_bounded(
 
     # `estimate > nan` is False for every estimate, so a NaN cap would admit anything with
     # no cap at all - and the mcp SDK's JSON parser accepts a bare NaN literal. +inf is
-    # left alone: it compares correctly and simply means "no dollar cap".
+    # left alone: it compares correctly ("no dollar cap" against any figure) and derives no
+    # server-side byte cap below; it is still a requested dollar cap, so with no dollar figure
+    # to compare the fail-closed branch below refuses it like any other (DECISIONS.md #22).
     if max_estimated_cost_usd is not None and math.isnan(max_estimated_cost_usd):
         raise UserVisibleError("max_estimated_cost_usd must be a finite number, not NaN.")
 
@@ -132,16 +134,29 @@ def run_query_bounded(
                 engine,
                 RefusalReason.COST_CAP_EXCEEDED.value,
             )
+            hint = (
+                "Could not produce a dollar cost estimate for this query - the estimate's "
+                "caveats say why - refusing rather than running with no cost-cap enforcement."
+            )
+            if engine == "bigquery":
+                # The BigQuery shapes that carry no dollar figure, and the documented way to
+                # run them under a cap (#96, DECISIONS.md #22). Engine-specific text stays in
+                # this branch so a Snowflake/Databricks refusal says nothing about dry runs.
+                hint += (
+                    " On BigQuery that is a capacity-billed project, a failed billing-model "
+                    "check, or a dry run whose byte figure is not usable for pricing: 0 bytes "
+                    "on a statement that references a table (the shape row-level security "
+                    "produces, shared by aggregates answered from table metadata and by empty "
+                    "data) or "
+                    "LOWER_BOUND accuracy. Bound the run with max_bytes_billed instead; it is "
+                    "enforced server-side as maximumBytesBilled."
+                )
             return BoundedQueryResult(
                 status="refused",
                 executed=False,
                 reason=RefusalReason.COST_CAP_EXCEEDED,
                 estimate=estimate,
-                hint=(
-                    "Could not produce a dollar cost estimate for this query (e.g. a "
-                    "capacity-billed project) — refusing rather than running with no "
-                    "cost-cap enforcement."
-                ),
+                hint=hint,
             )
         if estimate.estimated_cost_usd > max_estimated_cost_usd:
             logger.info(
@@ -202,13 +217,15 @@ def run_query_bounded(
                 ),
             )
 
-    # BigQuery only: make the provider enforce the dollar cap too. The gate above trusts
-    # the dry-run figure, which BigQuery itself flags as uninformative for row-level-
-    # security-protected tables (always 0 bytes), LOWER_BOUND estimates and absent
-    # statistics - so attach a maximumBytesBilled derived from the cap. A caller-supplied
-    # byte cap is only ever lowered, never raised; +inf means "no cap" and derives nothing.
-    # (The dollar gate above has already refused a finite cap with no dollar estimate, so a
-    # dollar estimate is guaranteed to exist whenever this derivation runs.)
+    # BigQuery only: make the provider enforce the dollar cap too. The gate above trusts the
+    # dry-run figure. Since #96 the shapes BigQuery itself flags as uninformative - row-level-
+    # security-protected tables (always 0 bytes) and LOWER_BOUND accuracy - carry no dollar
+    # figure and were refused above; the maximumBytesBilled derived here is the second layer
+    # for the figures that do pass (UNKNOWN or unrecognised accuracy, absent statistics on a
+    # statement that references no table, and the dry-run-versus-run gap in general). A
+    # caller-supplied byte cap is only ever lowered, never raised; +inf means "no cap" and
+    # derives nothing. (The dollar gate above has already refused a finite cap with no dollar
+    # estimate, so a dollar estimate is guaranteed to exist whenever this derivation runs.)
     effective_max_bytes_billed = max_bytes_billed
     byte_cap_derived_from_cost_cap = False
     if (

@@ -6,6 +6,15 @@ from google.api_core.exceptions import GoogleAPICallError, RetryError
 from google.cloud import bigquery, bigquery_reservation_v1
 from google.cloud.bigquery.retry import DEFAULT_RETRY
 
+from cost_guard_mcp.engines.bigquery_estimate_rules import (
+    BQ_ACCURACY_TO_TIER,
+    BQ_LOWER_BOUND,
+    DEFAULT_RESERVATION_LOCATION,
+    USE_BYTE_CAP_INSTEAD,
+    job_location,
+    references_remote_billing,
+    validate_location,
+)
 from cost_guard_mcp.errors import (
     SanitizedEngineError,
     present_remote_text,
@@ -33,16 +42,18 @@ def _validate_project_id(project: str) -> str:
 
 
 @sanitize_exceptions("bigquery")
-def is_capacity_billed(project: str, location: str = "US") -> bool:
-    """Return True if `project` has a BigQuery Reservation assignment (Editions/capacity billing).
+def is_capacity_billed(project: str, location: str = DEFAULT_RESERVATION_LOCATION) -> bool:
+    """Return True if `project` has a BigQuery Reservation assignment (Editions/capacity billing)
+    in `location`.
 
-    LIMITATION: this checks only the given location (default "US" multi-region). A project
-    could have assignments in other locations not covered by a single check — acceptable for
-    v1 since most Sandbox/trial usage is US multi-region; revisit if this causes a
-    false-negative (silently applying on-demand pricing logic to a capacity-billed query
-    running against a differently-located reservation).
+    SearchAllAssignments is per location (the installed client documents it as a lookup "for a
+    particular region"; the parent's only wildcard is the project), so no single call covers
+    every location. dry_run passes the location of the dry-run job - the location whose slots
+    the query would consume - instead of the fixed "US" it used before #96.
     """
     project = _validate_project_id(project)
+    # Service-returned text entering a hand-built resource path: allowlisted like the project id.
+    location = validate_location(location)
     client = bigquery_reservation_v1.ReservationServiceClient()
     parent = f"projects/{project}/locations/{location}"
     # `query` is not optional in practice: proto3 can't distinguish "omitted" from "empty
@@ -56,48 +67,24 @@ def is_capacity_billed(project: str, location: str = "US") -> bool:
     return any(assignments)
 
 
-_BQ_ACCURACY_TO_TIER = {
-    "PRECISE": AccuracyTier.PRECISE,
-    "LOWER_BOUND": AccuracyTier.UPPER_BOUND,
-    "UPPER_BOUND": AccuracyTier.UPPER_BOUND,
-    "UNKNOWN": AccuracyTier.UPPER_BOUND,
-}
-
-
-def _references_remote_billing(sql: str) -> bool:
-    """Conservative textual heuristic for queries that likely trigger BigQuery remote
-    functions or BigQuery ML remote-model inference (`ML.GENERATE_TEXT`), both of which
-    incur separate Cloud Run/Vertex AI billing that a byte-based dollar estimate cannot
-    see.
-
-    Deliberately unconditional and text-based rather than derived from the dry-run
-    response's `statistics.query.referencedRoutines` field (researched 2026-09-18):
-    that field is real and documented (BigQuery's own v2 Discovery Document -
-    googleapis.com/discovery/v1/apis/bigquery/v2/rest - `JobStatistics2.referencedRoutines`,
-    an array of `{projectId, datasetId, routineId}`), but no Google source states whether
-    it populates on a *dry run* specifically, only that `referencedTables` (its sibling
-    field, already read above for the RLS caveat) does. More importantly,
-    `referencedRoutines` can NEVER detect `ML.GENERATE_TEXT` at all - BQML remote-model
-    inference references a `ModelReference`, and `JobStatistics2` has no
-    `referencedModels`-equivalent field - so a structured read could only ever supplement,
-    never replace, this text check for the remote-function half. Next concrete step for a
-    maintainer with real BigQuery credentials: run a dry-run query that invokes an
-    existing remote function (no `CREATE FUNCTION` DDL) and inspect
-    `query_job._properties["statistics"]["query"].get("referencedRoutines")` - if it's
-    populated, add a supplemental read there (each returned routine still needs a
-    `routines.get` call, since the reference alone carries no `remoteFunctionOptions`),
-    OR'd with this text check rather than replacing it.
-    """
-    upper_sql = sql.upper()
-    if "ML.GENERATE_TEXT" in upper_sql:
-        return True
-    return "CREATE FUNCTION" in upper_sql and "REMOTE" in upper_sql
+def _log_billing_model_check(location: str, location_source: str, outcome: str) -> None:
+    # The location is service-returned text (DECISIONS.md #18): presented, never raw.
+    logger.info(
+        "engine=bigquery dry_run billing_model_check location=%s location_source=%s outcome=%s",
+        present_remote_text(location),
+        location_source,
+        outcome,
+    )
 
 
 @sanitize_exceptions("bigquery")
 def dry_run(sql: str, project: str | None = None) -> CostEstimate:
     """Estimate BigQuery query cost via a dry run. Tagged PRECISE unless BigQuery's own
-    totalBytesProcessedAccuracy says otherwise, or the project is capacity-billed."""
+    totalBytesProcessedAccuracy says otherwise. No dollar figure when the byte figure cannot
+    be priced - a LOWER_BOUND accuracy, the row-level-security shape (0 bytes on a statement
+    that references a table), a capacity-billed project or a failed billing-model check - so a
+    dollar cap in run_query_bounded refuses (DECISIONS.md #5, #22; #96). The byte figure is
+    always returned as reported: max_bytes_billed is enforced by BigQuery itself."""
     client = bigquery.Client(project=project)
     job_config = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
     query_job = client.query(
@@ -114,73 +101,109 @@ def dry_run(sql: str, project: str | None = None) -> CostEstimate:
         .get("query", {})
         .get("totalBytesProcessedAccuracy", "UNKNOWN")
     )
-    tier = _BQ_ACCURACY_TO_TIER.get(raw_accuracy, AccuracyTier.UPPER_BOUND)
+    tier = BQ_ACCURACY_TO_TIER.get(raw_accuracy, AccuracyTier.UPPER_BOUND)
+    # Service-returned text: bounded and repr-quoted like every other remote string that
+    # reaches the model (PR #86 verification, group-B review).
+    presented_accuracy = present_remote_text(str(raw_accuracy))
 
     caveats: list[str] = []
-    if tier != AccuracyTier.PRECISE:
+    has_priceable_bytes = True
+    if raw_accuracy == BQ_LOWER_BOUND:
+        has_priceable_bytes = False
         caveats.append(
-            # Service-returned text: bounded and repr-quoted like every other remote string
-            # that reaches the model (PR #86 verification, group-B review).
-            f"BigQuery reported this estimate's own accuracy as "
-            f"{present_remote_text(str(raw_accuracy))}, not "
+            f"BigQuery reported this estimate's own accuracy as {presented_accuracy}: the byte "
+            "figure is a floor on what the query would process, not a cap, so it is tagged "
+            "HEURISTIC and no dollar figure is returned (estimated_cost_usd is null); a "
+            f"max_estimated_cost_usd cap refuses. {USE_BYTE_CAP_INSTEAD}"
+        )
+    elif tier != AccuracyTier.PRECISE:
+        caveats.append(
+            f"BigQuery reported this estimate's own accuracy as {presented_accuracy}, not "
             "PRECISE — treating it conservatively as UPPER_BOUND."
         )
 
     # BigQuery's dry-run response always reports 0 bytes processed for tables protected by
     # row-level security, by design, to prevent a side-channel that would let a query's byte
-    # cost reveal information about rows the caller can't see. Without this caveat, an
-    # RLS-protected query would get tagged PRECISE with a $0.00 estimate and sail through any
-    # cost cap in run_query_bounded (which only fail-closes on a None estimate, never a
-    # suspiciously-low one) before running for real.
+    # cost reveal information about rows the caller can't see (Google: "dry runs always return
+    # 0 bytes to prevent side-channel attacks"). Until #96 that 0 was tagged PRECISE and priced
+    # at $0.00, which passed any dollar cap. The shape - 0 (or absent) bytes on a statement that
+    # references at least one table - now keeps the reported 0 bytes, is tagged HEURISTIC (the
+    # hidden figure is no estimate of the bytes the query would read) and carries no dollar
+    # figure, so the dollar gate refuses. A statement that references no table (SELECT 1)
+    # legitimately processes 0 bytes and is left alone. Accepted false positives, in the safe
+    # direction (DECISIONS.md #22): the two fields read here cannot tell the RLS shape from a
+    # 0-byte dry run that is genuinely free - an unfiltered COUNT(*) BigQuery answers from table
+    # metadata, an empty table, a partition filter that prunes every partition - so those are
+    # treated the same way (a dollar cap refuses; max_bytes_billed runs them), and the caveat
+    # states the shape and lists the known causes instead of asserting row-level security.
     if total_bytes_processed == 0 and query_job.referenced_tables:
+        has_priceable_bytes = False
+        tier = AccuracyTier.HEURISTIC
         caveats.append(
-            "BigQuery dry runs always report 0 bytes processed for tables protected by "
-            "row-level security, by design, to prevent a side-channel — a $0.00 estimate "
-            "here must NOT be trusted as proof this query is free to run."
+            "This dry run reported 0 bytes processed on a statement that references a table — "
+            "the shape BigQuery produces by design for tables protected by row-level security "
+            "(dry runs always report 0 bytes there, to prevent a side-channel), and also for "
+            "statements it answers from table metadata, such as an unfiltered COUNT(*), or over "
+            "no data (an empty table, a partition filter that prunes every partition) — so the "
+            "$0.00 it implies must not be trusted as proof the query is free to run: no dollar "
+            "figure is returned (estimated_cost_usd is null) and a max_estimated_cost_usd cap "
+            f"refuses. {USE_BYTE_CAP_INSTEAD}"
         )
 
-    if _references_remote_billing(sql):
+    if references_remote_billing(sql):
         caveats.append(
             "This query appears to invoke a BigQuery remote function or ML.GENERATE_TEXT "
             "(BigQuery ML remote-model inference) — both incur separate Cloud Run/Vertex AI "
             "billing that this byte-based dollar estimate does not include."
         )
 
-    try:
-        capacity_billed = is_capacity_billed(client.project)
-    except SanitizedEngineError:
+    # #96: the billing model is looked up for the location the job would run in. The log
+    # record and the caveats below say which location was checked and why.
+    location, location_source = job_location(query_job)
+    if location_source == "fallback":
         caveats.append(
-            "Could not verify BigQuery billing model (Reservations API call failed) - "
-            "returning a byte estimate only, no dollar figure, to avoid reporting a "
-            "possibly-wrong-billing-model dollar amount."
+            "BigQuery did not report a location for this dry-run job, so the billing-model "
+            "check used the US multi-region; a reservation assignment in another location "
+            "would not have been seen, and any on-demand dollar figure in this estimate rests "
+            "on that assumption."
         )
-        return CostEstimate(
-            engine="bigquery",
-            accuracy_tier=tier,
-            estimated_bytes=total_bytes_processed,
-            estimated_cost_usd=None,
-            caveats=caveats,
+    capacity_billed: bool | None
+    try:
+        # Coerced: the function returns any(...) today, but the logged outcome and the pricing
+        # decision below must agree for whatever truthy/falsy value a patched or changed
+        # implementation returns, instead of a lookup failure failing the whole dry run.
+        capacity_billed = bool(is_capacity_billed(client.project, location))
+    except SanitizedEngineError:
+        capacity_billed = None
+        caveats.append(
+            "Could not verify BigQuery billing model (Reservations API call failed for "
+            f"location {present_remote_text(location)}) - returning a byte estimate only, no "
+            "dollar figure, to avoid reporting a possibly-wrong-billing-model dollar amount."
         )
-
+    if capacity_billed is None:
+        outcome = "check_failed"
+    elif capacity_billed:
+        outcome = "capacity_billed"
+    else:
+        outcome = "on_demand"
+    _log_billing_model_check(location, location_source, outcome)
     if capacity_billed:
         caveats.append(
-            "This project is on BigQuery Editions/capacity billing (slot-hours), which has "
-            "no fixed $/byte rate — no dollar estimate is possible from bytes alone."
-        )
-        return CostEstimate(
-            engine="bigquery",
-            accuracy_tier=tier,
-            estimated_bytes=total_bytes_processed,
-            estimated_cost_usd=None,
-            caveats=caveats,
+            "This project is on BigQuery Editions/capacity billing (slot-hours) — a reservation "
+            f"assignment was found in location {present_remote_text(location)} — which has no "
+            "fixed $/byte rate, so no dollar estimate is possible from bytes alone."
         )
 
-    estimated_cost_usd = (total_bytes_processed / TIB_IN_BYTES) * ON_DEMAND_USD_PER_TIB
+    estimated_cost_usd: float | None = None
+    if has_priceable_bytes and capacity_billed is False:
+        estimated_cost_usd = round(
+            (total_bytes_processed / TIB_IN_BYTES) * ON_DEMAND_USD_PER_TIB, 6
+        )
     return CostEstimate(
         engine="bigquery",
         accuracy_tier=tier,
         estimated_bytes=total_bytes_processed,
-        estimated_cost_usd=round(estimated_cost_usd, 6),
+        estimated_cost_usd=estimated_cost_usd,
         caveats=caveats,
     )
 

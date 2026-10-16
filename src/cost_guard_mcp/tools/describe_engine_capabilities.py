@@ -9,13 +9,26 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
         default_accuracy_tier=AccuracyTier.PRECISE,
         known_gaps=[
             (
-                "Estimate downgrades to UPPER_BOUND when BigQuery's own "
-                "totalBytesProcessedAccuracy is not PRECISE (e.g. federated or wildcard tables, "
-                "or tables with a pending streaming buffer)."
+                "Estimate is tagged UPPER_BOUND when BigQuery's own totalBytesProcessedAccuracy "
+                "is UNKNOWN or UPPER_BOUND (e.g. federated or wildcard tables, or tables with a "
+                "pending streaming buffer); a LOWER_BOUND accuracy is a floor, not a cap - the "
+                "byte figure is tagged HEURISTIC and no dollar figure is derived from it, so a "
+                "max_estimated_cost_usd cap refuses."
+            ),
+            (
+                "Dry runs against tables protected by row-level security always report 0 bytes "
+                "(by design, to prevent a side-channel): 0 bytes on a statement that references "
+                "a table yields no dollar figure (HEURISTIC), so a max_estimated_cost_usd cap "
+                "refuses - bound such runs with max_bytes_billed, which BigQuery enforces "
+                "server-side as maximumBytesBilled. Genuinely free 0-byte dry runs share the "
+                "shape and the outcome: an unfiltered COUNT(*) answered from table metadata, an "
+                "empty table, a partition filter that prunes every partition."
             ),
             (
                 "Projects on BigQuery Editions/capacity billing get a byte estimate only, no "
-                "dollar figure — capacity billing has no fixed $/byte rate."
+                "dollar figure — capacity billing has no fixed $/byte rate. The check looks up "
+                "reservation assignments in the dry-run job's own location (US only when the "
+                "job reports none)."
             ),
         ],
     ),
