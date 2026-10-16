@@ -248,7 +248,13 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
     to WARNING at server start: their per-connection and per-request INFO chatter — the
     volume an embedded credential would hide in — never reaches stderr, while their WARNING
     and ERROR records (the ones that carry an exception's text) still do. The project's own
-    loggers are not touched by this pin.
+    loggers are not touched by this pin. Two Google-library mechanisms interact with it:
+    google-auth leaves propagation on for a `google` logger that already has a level, so
+    `google.*` WARNING and ERROR records now reach stderr (through the filter below) where
+    google-auth would otherwise have cut them off at the `google` logger; and the Google
+    client libraries' opt-in `GOOGLE_SDK_PYTHON_LOGGING_SCOPE` gives the named `google.*`
+    logger its own DEBUG stderr handler with propagation off — outside both the pin and the
+    filter — so do not set it for this server.
   - Defence in depth behind both of the above: every record that reaches the stderr handler,
     whichever logger produced it (this project's, the `mcp` SDK's or a client library's), has
     its message, its exception traceback (`exc_info=True` / `logger.exception`) and its stack
