@@ -334,8 +334,8 @@ generated from the single input `hatchling==1.32.4` with
 .github/requirements-build.txt -` (the `--universal` and linux/3.12 resolutions are identical;
 hatchling has no marker-gated dependency at >=3.12; pass that command text to
 `--custom-compile-command` when regenerating so the header stays stable). The `build` job of
-`release.yml` creates a venv under `$RUNNER_TEMP` - outside the checkout, so hatchling's sdist and
-`uv export` never see it - installs the file with
+`release.yml` creates a venv under `$RUNNER_TEMP` - outside the checkout, so hatchling's sdist, which
+includes non-ignored untracked files, never picks it up - installs the file with
 `uv pip install --require-hashes --only-binary :all: --no-deps`, and runs
 `uv build --no-build-isolation --python <that venv>`: the backend comes from the interpreter's
 installed packages, `--no-deps` keeps the installed set to exactly the reviewed file, and
@@ -356,7 +356,7 @@ version and `--hash` lines, and the lockstep test fails that PR until `[build-sy
 as the pre-commit autoupdate above.
 
 Still unbound, deliberately: the uv binary (`setup-uv` is SHA-pinned with `version: "0.12.23"`;
-its integrity rests on the action's release download, not on a digest in this repository), the
+the action verifies the archive it downloads against a checksum table compiled into its own SHA-pinned source, so uv's integrity rests on that pinned action rather than on a digest in this repository), the
 runner's interpreter and image, and the editable builds in `tests.yml`, `integration.yml` and the
 Dockerfile, which keep resolving hatchling by version through `build-constraint-dependencies`
 because nothing they build is signed or published. `uv build --build-constraints <file>

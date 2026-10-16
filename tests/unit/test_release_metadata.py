@@ -301,6 +301,16 @@ def test_ci_uv_version_matches_lock_producer():
 BUILD_REQUIREMENTS_PATH = REPO_ROOT / ".github" / "requirements-build.txt"
 PYTHON_VERSION_PATH = REPO_ROOT / ".python-version"
 _BUILD_REQUIREMENTS_REL = ".github/requirements-build.txt"
+# hatchling 1.32.4 and its runtime closure as `uv pip compile --generate-hashes` resolved it on
+# 2026-10-16; sorted. Changing the backend version regenerates the file and updates this list.
+_BUILD_REQUIREMENTS_CLOSURE = [
+    "hatchling",
+    "packaging",
+    "pathspec",
+    "pluggy",
+    "tomlkit",
+    "trove-classifiers",
+]
 _INSTALL_STEP_NAME = "Install the hash-pinned build backend"
 _BUILD_STEP_NAME = "Build sdist and wheel with the pinned backend"
 _EXACT_PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][A-Za-z0-9.!+]*)$")
@@ -402,8 +412,13 @@ def test_build_requirements_are_exact_pins_with_sha256_hashes_only():
     # member missing from the file is a build failure, not a silent resolution from the index.
     entries = _build_requirement_entries()
     names = [name for name, _, _ in entries]
-    assert "hatchling" in names, f"{_BUILD_REQUIREMENTS_REL} does not list hatchling: {names!r}"
-    assert len(entries) >= 2, f"hatchling's closure is missing from {_BUILD_REQUIREMENTS_REL}"
+    # The install runs with --no-deps, so the file IS the closure: a member dropped by a hand
+    # edit, or a backend bump that adds or removes a dependency, must fail here until the file is
+    # regenerated and this list is updated in the same reviewed PR (DECISIONS.md #11, amended).
+    assert sorted(names) == _BUILD_REQUIREMENTS_CLOSURE, (
+        f"{_BUILD_REQUIREMENTS_REL} members {sorted(names)!r} != the recorded closure "
+        f"{_BUILD_REQUIREMENTS_CLOSURE!r}; regenerate the file and update the list together"
+    )
     assert len(set(names)) == len(names), f"duplicate entries: {names!r}"
     unhashed = [name for name, _, hashes in entries if not hashes]
     assert unhashed == [], f"entries without a --hash: {unhashed!r}"
@@ -462,6 +477,10 @@ def test_release_build_install_step_fails_closed_on_a_wrong_or_missing_hash(tmp_
     env = {
         "PATH": os.environ["PATH"],
         "HOME": os.environ.get("HOME", str(tmp_path)),
+        # HOME stays real so uv finds its managed interpreters, but uv must not read the
+        # developer's ~/.config/uv/uv.toml (an index or [pip] setting there would change what
+        # this offline step sees); the release runner has no such file.
+        "UV_NO_CONFIG": "1",
         "UV_OFFLINE": "1",
         "UV_PYTHON_DOWNLOADS": "never",
         "UV_FIND_LINKS": str(links),
