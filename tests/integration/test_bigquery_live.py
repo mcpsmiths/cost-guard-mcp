@@ -75,36 +75,45 @@ def test_run_query_bounded_succeeds_under_generous_cap():
     assert len(result.rows) == 5
 
 
-def test_run_query_bounded_default_limit_wrap_rejects_duplicate_output_columns():
-    """#94: with max_rows omitted a single SELECT runs inside `SELECT * FROM (...) AS
-    cost_guard_row_cap LIMIT 1001`, so it must be valid as a derived table. BigQuery accepts
-    duplicate output column names at the top level (the dry run prices the unwrapped text and
-    passes) but rejects them inside a subquery with "Duplicate column names in the result are
-    not supported"; the job fails at compile time, nothing is billed. This pins the real provider
-    behaviour behind the README / tool-description remedy (alias colliding output columns). If
-    BigQuery ever accepts the wrapped form, this test fails and the remedy text comes out."""
-    from cost_guard_mcp.errors import SanitizedEngineError
+def test_run_query_bounded_default_limit_wrap_accepts_duplicate_output_columns():
+    """#94 / #124: with max_rows omitted a single SELECT runs inside `SELECT * FROM (...) AS
+    cost_guard_row_cap LIMIT 1001`, so it must be valid as a derived table. The 0.6.0 pre-tag live
+    gate (integration.yml run 39275182240) showed BigQuery ACCEPTS a duplicate output column name
+    inside the wrap: the earlier expectation of "Duplicate column names in the result are not
+    supported" reported DID NOT RAISE, and the remedy "alias them" was withdrawn from the README,
+    the tool description and the release notes (DECISIONS.md #21, amended 2026-10-19). This pins
+    the observed behaviour; every assertion message prints the rows so the next run records which
+    column names BigQuery returns for the wrapped form (not observed in that run). If BigQuery ever
+    refuses the wrapped form, this fails and the remedy comes back - with evidence this time."""
     from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 
     _require_env("BIGQUERY_PROJECT")
     _require_env("GOOGLE_APPLICATION_CREDENTIALS")
 
-    with pytest.raises(SanitizedEngineError, match="(?i)duplicate column"):
-        run_query_bounded("bigquery", "SELECT 1 AS a, 2 AS a")
+    result = run_query_bounded("bigquery", "SELECT 1 AS a, 2 AS a")
 
-    # The remedy, under the same default wrap.
+    assert result.status == "ok", (
+        f"status={result.status!r} reason={result.reason!r} rows={result.rows!r}"
+    )
+    assert result.executed is True, f"executed={result.executed!r} rows={result.rows!r}"
+    assert result.row_count == 1, f"row_count={result.row_count!r} rows={result.rows!r}"
+    assert len(result.rows) == 1, f"rows={result.rows!r}"
+
+    # Control: distinct names under the same default wrap.
     result = run_query_bounded("bigquery", "SELECT 1 AS a, 2 AS b")
-    assert result.status == "ok"
-    assert result.rows == [{"a": 1, "b": 2}]
+    assert result.status == "ok", f"status={result.status!r} rows={result.rows!r}"
+    assert result.rows == [{"a": 1, "b": 2}], f"rows={result.rows!r}"
 
 
 def test_run_query_bounded_default_limit_wrap_accepts_a_recursive_cte():
-    """#94 fix-up: is_single_query_statement admits WITH RECURSIVE, so with max_rows omitted the
-    whole query runs inside `SELECT * FROM (WITH RECURSIVE ...) AS cost_guard_row_cap LIMIT 1001`.
-    Whether BigQuery accepts a recursive CTE inside a derived table is a provider fact the unit
-    suite cannot pin; this case does (unverified at merge time - flagged by the fix-up review).
-    If it fails with a compile-time error (nothing billed), the wrap rule must exclude recursive
-    CTEs or the README / tool description must say to put the LIMIT inside such a query."""
+    """#124: in the 0.6.0 pre-tag live gate (integration.yml run 39275182240) this query, wrapped as
+    `SELECT * FROM (WITH RECURSIVE ...) AS cost_guard_row_cap LIMIT 1001`, was refused by BigQuery
+    at compile time, nothing billed: "400 WITH RECURSIVE is only allowed at the top level of the
+    SELECT, CREATE TABLE AS SELECT, CREATE VIEW, INSERT, EXPORT DATA statements." The wrap rule
+    (sql_scope_keywords.is_single_query_statement) now excludes a recursive main WITH, so the text
+    reaches BigQuery unchanged and the paged fetch (max_rows + 1 sentinel) is its row cap, as for
+    SHOW and scripts. This pins that the unwrapped run succeeds under the default cap with the full
+    result; if it fails with that 400 again, the wrap rule has regressed."""
     from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 
     _require_env("BIGQUERY_PROJECT")
@@ -115,8 +124,9 @@ def test_run_query_bounded_default_limit_wrap_accepts_a_recursive_cte():
         "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5) "
         "SELECT n FROM t",
     )
-    assert result.status == "ok"
+    assert result.status == "ok", f"status={result.status!r} reason={result.reason!r}"
     assert result.executed is True
+    assert result.row_count == 5
     assert sorted(row["n"] for row in result.rows) == [1, 2, 3, 4, 5]
 
 
