@@ -1218,3 +1218,37 @@ for that query, which is what that query is. The `US` fallback is observable (ca
 `test_tools_estimate_query_cost.py`); the runtime probes against the real stdio server with the
 fake SDK are recorded in `scratch-pad/bq-cap-gate-2026-10/evidence/`. Ships in 0.5.1 (with #21;
 the same 0.x reasoning - the release PR fixes the number for both).
+
+## 23. `snowflake-connector-python` is capped below 5 until Snowflake ships a GA 5.x
+
+**Context:** Issue #121. `snowflake-connector-python` 5.0.0 reached PyPI on 2026-10-15 under a plain
+version number (classifier `Development Status :: 5 - Production/Stable`), while its own long
+description opens with a caution that the version is a public preview, not ready for use with
+production data and may be unstable; the project's GitHub repository has no release or tag for it
+(latest: v4.8.0). It is an FFI-based rewrite. Any resolver satisfying the `>=4.7.1` floor picked it
+from that day, including a fresh `uvx cost-guard-mcp` of 0.5.0. Against this codebase it fails
+`mypy` (the base cursor types `fetchone()` as `Row | DictRow | None`) and the three pins in
+`tests/unit/test_snowflake_dependency_contract.py`, which exist for exactly this case: the
+`DEFAULT_CONFIGURATION` table the pins read is empty in 5.0.0 (connection options moved to a
+`ConnectionConfig` dataclass; `secondary_roles` and `session_parameters` still exist there), and
+`execute_async` gained its own `num_statements` parameter instead of forwarding `**kwargs` to
+`execute`. The security controls those pins protect (#7's role pin via `secondary_roles`, the
+single-statement pin via `session_parameters` and `num_statements`) have not been verified on the
+new layout, and the unit suite with fake SDKs cannot verify them.
+
+**Decision:** Owner decision 2026-10-19: `snowflake-connector-python>=4.7.1,<5` in `pyproject.toml`
+from 0.6.0, and a Dependabot `ignore` of the connector's semver-major updates so the grouped
+`python-dependencies` PR stays green. The cap is lifted only after: a GitHub release exists for the
+5.x line and the PyPI caution is gone; the login-time `secondary_roles` / `session_parameters` path
+and the unknown-kwarg handling are re-verified in 5.x source; the contract tests are rewritten for
+both layouts; the six `fetchone()` results in `engines/snowflake.py` are narrowed so `mypy` passes
+under both stubs; and the live Snowflake gate (#100) has run on 5.x. Alternatives rejected: making
+0.6.0 compatible with 5.0.0 now (ships against a driver its vendor calls unstable, for a
+compatibility that cannot be live-tested in this programme); leaving the range open (fresh installs
+keep resolving the preview driver); a 0.5.1 hotfix carrying only the cap (two releases a few days
+apart for one line - 0.6.0 is days away and carries the same line).
+
+**Consequences:** Users on the 4.x line see no change; a user who already installed 5.0.0 moves back
+to 4.8.x on upgrade. The cap is visible in the published `Requires-Dist` and recorded in
+`changelog/v0.6.0.md`. The checklist for lifting it lives on #121; this entry is amended when the
+range changes.

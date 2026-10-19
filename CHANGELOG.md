@@ -65,6 +65,12 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   honour the remaining 120 s budget, checked before each page that follows a full page, so a
   complete result that fits in one page is never discarded for a deadline its only page overran
   (`DECISIONS.md` #21; #94).
+- Dependency range: `snowflake-connector-python>=4.7.1,<5`. The connector's 5.0.0 reached PyPI on
+  2026-10-15 under a plain version number although its own description calls it a public preview
+  that is not ready for production data; it also empties the `DEFAULT_CONFIGURATION` table and
+  changes `execute_async`'s signature, so this project's dependency-contract tests fail on it by
+  design. The cap keeps fresh installs on the 4.x line until a GA 5.x is verified; Dependabot
+  ignores the connector's major updates meanwhile (`DECISIONS.md` #23; #121).
 
 ### Fixed
 
