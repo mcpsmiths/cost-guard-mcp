@@ -61,7 +61,11 @@ worktree has no `scratch-pad/`, and the archive must not be copied into one. It 
 its `install()` and then its `install_network_guard()` (the fake's own guard, stacked on the launcher's):
 
 ```bash
-A=$M/scratch-pad/security-verification-2026-10/verify/harness/lead   # fake_backends.py + launch_server.py + mcp_client.py
+A=$M/scratch-pad/bq-cap-gate-2026-10/harness                          # fake_backends.py: the newest copy; the only one
+                                                                      # whose FakeQueryJob has `location` (#96) - BigQuery
+                                                                      # probes need it (section 5). Older copies:
+                                                                      # security-verification-2026-10/verify/harness/lead
+                                                                      # (+ launch_server.py, mcp_client.py), rq-caps-2026-10
 ls "$A/fake_backends.py"                                              # must exist BEFORE any fake-backed probe
 --env CG_VERIFY_FAKE_PATH=$A --env CG_VERIFY_FAKE_MODULE=fake_backends --env CG_FAKE_RECORD_FILE=$E/<probe>.fake-calls.json
 ```
@@ -143,6 +147,12 @@ git -C $W check-ignore -v .env .mcp.json service-account.json .cursor/mcp.json  
 
 ## 5. Gotchas (all bitten before)
 
+- Fakes older than #96 (`security-verification-2026-10/.../lead`, `rq-caps-2026-10`) have no `FakeQueryJob.location`;
+  since #112 the BigQuery engine reads it on the dry-run job (`engines/bigquery_estimate_rules.py`), so every BigQuery
+  `run_query_bounded` / `estimate_query_cost` probe dies with `isError: true` "'FakeQueryJob' object has no attribute
+  'location'" right after the dry run, before any wrap or cap evidence is recorded. Use the `bq-cap-gate-2026-10` fake
+  (knob `CG_FAKE_BQ_DRY_RUN_LOCATION`, default `US`, `absent` -> `None`), or shim a `FakeQueryJob` subclass with it
+  (bitten by the #124 verification, 2026-10-19).
 - The workstation's SecretScan hook blocks Bash command TEXT and Write CONTENTS that contain bearer-style
   token literals or `NAME=<secret-looking literal>` - generate dummies with `openssl rand -hex` into a 0600 file,
   pass `--env-file`, build names with `printf '%s_%s=%s'`. It also blocked `DROP TABLE` in a command line once: put

@@ -109,7 +109,8 @@ def run_query_bounded(
 
     # Whether the engine may enclose the text in `SELECT * FROM (...) AS cost_guard_row_cap
     # LIMIT max_rows + 1`: only a single SELECT/WITH/VALUES statement is valid as a derived
-    # table. SHOW/DESCRIBE/EXPLAIN, opt-out scripts and WITH ... INSERT run unwrapped and are
+    # table, and a WITH RECURSIVE is not (BigQuery allows it only at the top level - #124).
+    # Those, SHOW/DESCRIBE/EXPLAIN, opt-out scripts and WITH ... INSERT run unwrapped and are
     # capped by the engine's paged fetch instead. Decided once here, with the gates' own lexer,
     # and passed down so the three engines cannot drift on the rule.
     wrap_in_limit = is_single_query_statement(sql, engine)

@@ -1057,8 +1057,9 @@ def execute_bounded(
 ) -> tuple[list[dict], int, bool]:
     """Execute `sql` with a row bound and a wall-clock cap covering submission, poll and fetch.
 
-    `wrap_in_limit` (#94): the tool passes whether the text is one SELECT/WITH/VALUES statement
-    and so valid inside `SELECT * FROM (...) LIMIT max_rows + 1`; anything else runs unwrapped
+    `wrap_in_limit` (#94): the tool passes whether the text is one non-recursive
+    SELECT/WITH/VALUES statement and so valid inside `SELECT * FROM (...) LIMIT max_rows + 1`
+    (sql_scope_keywords.is_single_query_statement); anything else runs unwrapped
     and is capped by the paged fetch alone (result_bounds.collect_rows: the sentinel row or the
     running size estimate). The returned bool is True whenever that fetch stopped before the
     result was exhausted.

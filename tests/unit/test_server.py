@@ -625,7 +625,14 @@ def test_run_query_bounded_description_states_the_default_row_cap_and_the_size_c
     assert "8 MiB" in description
     assert "result_size_exceeded" in description
     assert "LIMIT max_rows + 1" in description
-    assert "alias" in description  # BigQuery: duplicate output column names in a derived table
+    assert "derived table" in description
+    # #124: a recursive CTE runs unwrapped (BigQuery allows WITH RECURSIVE only at the top
+    # level); the earlier BigQuery duplicate-column remedy was an unsupported provider claim
+    # (the live gate accepted the wrapped duplicate) and must stay out.
+    assert "WITH RECURSIVE" in description
+    assert "unwrapped" in description
+    assert "alias" not in description
+    assert "duplicate" not in description.lower()
 
 
 @patch("cost_guard_mcp.engines.bigquery.is_capacity_billed", return_value=False)

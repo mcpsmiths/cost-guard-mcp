@@ -674,9 +674,10 @@ def execute_bounded(
     `warehouse` is accepted only for calling-convention consistency and is a documented
     no-op - see check_credentials's docstring for why.
 
-    `wrap_in_limit` (#94): the tool passes whether the text is one SELECT/WITH/VALUES statement
-    and so valid inside `SELECT * FROM (...) LIMIT max_rows + 1`; SHOW/DESCRIBE/EXPLAIN and the
-    like run unwrapped and are capped by the paged fetch alone (result_bounds.collect_rows: the
+    `wrap_in_limit` (#94): the tool passes whether the text is one non-recursive
+    SELECT/WITH/VALUES statement and so valid inside `SELECT * FROM (...) LIMIT max_rows + 1`
+    (sql_scope_keywords.is_single_query_statement); SHOW/DESCRIBE/EXPLAIN, a WITH RECURSIVE and
+    the like run unwrapped and are capped by the paged fetch alone (result_bounds.collect_rows: the
     sentinel row or the running size estimate). The returned bool is True whenever that fetch
     stopped before the result was exhausted. The fetch runs under what is left of the
     wall-clock cap, checked before each page request that follows a full page.
