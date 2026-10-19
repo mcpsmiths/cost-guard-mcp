@@ -966,7 +966,7 @@ serialisability. The audit's mocked run returned 100,000 rows unbounded and an 8
 one row, while `server.json` advertised "result-size guardrails". #101 (audit
 `row-cap-refusal-after-billed-run-described-as-not-run`): the tool description said every refusal
 "did NOT run" while `row_cap_exceeded` follows a billed execution, so a model could re-run a query
-believing nothing had been spent. Owner decisions 2026-10-15; held for 0.5.1.
+believing nothing had been spent. Owner decisions 2026-10-15; held for 0.6.0.
 
 **Decision:**
 
@@ -1102,8 +1102,7 @@ fetch phase can exceed 120 s by what the deadline cannot pre-empt: Snowflake's `
 requested within budget while it downloads; and a result whose last page was full (exactly a
 multiple of 500 rows) still pays the check before its end-of-result probe, since the client cannot
 tell it from a result with more pages. `tests/unit/test_result_bounds.py`'s property test is the
-guard on the estimator; the hit-on-size-stop rule is the fail-closed fallback behind it. Ships in
-0.5.1
+guard on the estimator; the hit-on-size-stop rule is the fail-closed fallback behind it. Ships in 0.6.0
 (additive schema; a default change on a 0.x line that already moved defaults in 0.5.0).
 
 ## 22. BigQuery estimates without a usable byte figure produce no dollar figure, so a dollar cap refuses
@@ -1216,8 +1215,8 @@ for that query, which is what that query is. The `US` fallback is observable (ca
 `location_source=fallback`). Unit tests drive the real `dry_run` through both tools for each shape
 (`tests/unit/test_engines_bigquery.py`, `test_tools_run_query_bounded.py`,
 `test_tools_estimate_query_cost.py`); the runtime probes against the real stdio server with the
-fake SDK are recorded in `scratch-pad/bq-cap-gate-2026-10/evidence/`. Ships in 0.5.1 (with #21;
-the same 0.x reasoning - the release PR fixes the number for both).
+fake SDK are recorded in `scratch-pad/bq-cap-gate-2026-10/evidence/`. Ships in 0.6.0 (with #21;
+the same 0.x reasoning - the release PR fixed the number for both).
 
 ## 23. `snowflake-connector-python` is capped below 5 until Snowflake ships a GA 5.x
 
