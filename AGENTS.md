@@ -63,8 +63,10 @@ A release is a `v*` tag on reviewed `main` history (`DECISIONS.md` #10). In orde
    the merge commit, both jobs green, before tagging (`live-integration` admits `main` only).
 3. Tag the merge commit (`git tag -a vX.Y.Z -m vX.Y.Z <sha> && git push origin vX.Y.Z`). Never
    push a test `v*` tag: any such push starts the release. `release.yml` then runs `build`
-   (ancestry + version gates) -> `publish` (PyPI, environment `pypi`) -> `github-release` and
-   `registry-publish` (MCP Registry listing, environment `mcp-registry`; `DECISIONS.md` #12).
+   (ancestry + version gates, then the hash-pinned backend install from
+   `.github/requirements-build.txt` and `uv build --no-build-isolation`; `DECISIONS.md` #11) ->
+   `publish` (PyPI, environment `pypi`) -> `github-release` and `registry-publish` (MCP Registry
+   listing, environment `mcp-registry`; `DECISIONS.md` #12).
 4. If `registry-publish` fails, PyPI and the GitHub Release are untouched; fix the cause, then
    re-publish the same tag with
    `gh workflow run mcp-registry-publish.yml --ref main -f tag=vX.Y.Z -f dry_run=false`. The

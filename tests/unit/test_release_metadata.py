@@ -1,8 +1,8 @@
 """Repository-level release and supply-chain invariants.
 
 Unlike the rest of the unit suite these tests read the repository's own metadata files
-(pyproject.toml, uv.lock, .pre-commit-config.yaml and the GitHub Actions workflows), not
-the package under test. They exist so that the pins which bind what executes during a
+(pyproject.toml, uv.lock, .pre-commit-config.yaml, .github/requirements-build.txt and the
+GitHub Actions workflows), not the package under test. They exist so that the pins which bind what executes during a
 release build can only move through a reviewed diff: Dependabot bumps neither
 ``[build-system].requires`` nor a ``setup-uv`` ``with: version:`` input, and pre-commit.ci's
 autoupdate moves the uv-pre-commit ``rev`` on its own - these tests make the three move
@@ -14,12 +14,15 @@ tomllib (stdlib) parses pyproject.toml and uv.lock.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -291,6 +294,247 @@ def test_ci_uv_version_matches_lock_producer():
         f"workflows pin uv {ci_version} but .pre-commit-config.yaml's uv-pre-commit rev is "
         f"{_uv_pre_commit_rev()}"
     )
+
+
+# --- hashed-build-constraints-and-required-version:pyproject.toml ---------------------------
+
+BUILD_REQUIREMENTS_PATH = REPO_ROOT / ".github" / "requirements-build.txt"
+PYTHON_VERSION_PATH = REPO_ROOT / ".python-version"
+_BUILD_REQUIREMENTS_REL = ".github/requirements-build.txt"
+# hatchling 1.32.4 and its runtime closure as `uv pip compile --generate-hashes` resolved it on
+# 2026-10-16; sorted. Changing the backend version regenerates the file and updates this list.
+_BUILD_REQUIREMENTS_CLOSURE = [
+    "hatchling",
+    "packaging",
+    "pathspec",
+    "pluggy",
+    "tomlkit",
+    "trove-classifiers",
+]
+_INSTALL_STEP_NAME = "Install the hash-pinned build backend"
+_BUILD_STEP_NAME = "Build sdist and wheel with the pinned backend"
+_EXACT_PIN_RE = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([0-9][A-Za-z0-9.!+]*)$")
+_SHA256_HASH_RE = re.compile(r"^--hash=sha256:[0-9a-f]{64}$")
+
+
+def _build_requirement_entries() -> list[tuple[str, str, list[str]]]:
+    """``(name, version, hash_tokens)`` per logical line of the hashed build requirements file.
+
+    Backslash continuations are joined first; comment and blank lines are dropped. Every logical
+    line must be an exact ``name==version`` pin followed only by ``--hash=sha256:`` tokens, so an
+    option line (``--index-url``, ``--find-links``, ``-r``) that could redirect the release
+    build's install fails here instead of being skipped.
+    """
+    logical: list[str] = []
+    pending = ""
+    for raw in BUILD_REQUIREMENTS_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.endswith("\\"):
+            pending += line[:-1].strip() + " "
+            continue
+        logical.append((pending + line).strip())
+        pending = ""
+    assert not pending, "requirements file ends inside a backslash continuation"
+    entries = []
+    for item in logical:
+        requirement, *hash_tokens = item.split()
+        match = _EXACT_PIN_RE.match(requirement)
+        assert match, f"not an exact `name==version` pin (or an option line): {item!r}"
+        rejected = [token for token in hash_tokens if not _SHA256_HASH_RE.match(token)]
+        assert rejected == [], (
+            f"{requirement}: tokens other than --hash=sha256:<64 hex>: {rejected!r}"
+        )
+        entries.append((match.group(1).lower(), match.group(2), hash_tokens))
+    return entries
+
+
+def _release_build_job() -> list[str]:
+    return _job_block(RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8"), "build")
+
+
+def _first_code_line_index(block: list[str], marker: str) -> int:
+    return next(
+        index
+        for index, line in enumerate(block)
+        if marker in line and not line.strip().startswith("#")
+    )
+
+
+def _write_fixture_wheel(directory: Path) -> tuple[str, str]:
+    """Write a minimal valid ``py3-none-any`` wheel; return (``name==version``, its sha256 hex)."""
+    name, version = "cgfixture", "0.0.1"
+    dist_info = f"{name}-{version}.dist-info"
+    members = {
+        f"{name}/__init__.py": "VERSION = '0.0.1'\n",
+        f"{dist_info}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        f"{dist_info}/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: fixture\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        ),
+    }
+    record = []
+    for path, content in members.items():
+        data = content.encode("utf-8")
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=")
+        record.append(f"{path},sha256={digest.decode('ascii')},{len(data)}")
+    record.append(f"{dist_info}/RECORD,,")
+    members[f"{dist_info}/RECORD"] = "\n".join(record) + "\n"
+    wheel = directory / f"{name}-{version}-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path, content in members.items():
+            archive.writestr(path, content)
+    return f"{name}=={version}", hashlib.sha256(wheel.read_bytes()).hexdigest()
+
+
+def test_build_requirements_pin_hatchling_in_lockstep_with_pyproject():
+    # Three mirrors, one value: the hashed file the release build installs from, the PEP 517
+    # requirement and uv's build constraint. Dependabot bumps only the first, so its PR fails
+    # here until pyproject.toml (and uv.lock) move in the same PR - intended coupling.
+    hatchling = [f"{name}=={version}" for name, version, _ in _build_requirement_entries()]
+    hatchling = [entry for entry in hatchling if entry.startswith("hatchling==")]
+    assert len(hatchling) == 1, f"expected exactly one hatchling entry, got {hatchling!r}"
+    pyproject = _pyproject()
+    requires = [r for r in pyproject["build-system"]["requires"] if r.startswith("hatchling==")]
+    assert hatchling == requires, (
+        f"{_BUILD_REQUIREMENTS_REL} {hatchling!r} != requires {requires!r}"
+    )
+    build_constraints = pyproject["tool"]["uv"]["build-constraint-dependencies"]
+    assert hatchling[0] in build_constraints, (
+        f"{_BUILD_REQUIREMENTS_REL} pins {hatchling[0]!r}; build-constraint-dependencies are "
+        f"{build_constraints!r}"
+    )
+
+
+def test_build_requirements_are_exact_pins_with_sha256_hashes_only():
+    # The parser already rejects option lines and non-exact pins; this pins what is left: every
+    # entry hashed, no duplicates, and the closure present - the install runs with --no-deps, so a
+    # member missing from the file is a build failure, not a silent resolution from the index.
+    entries = _build_requirement_entries()
+    names = [name for name, _, _ in entries]
+    # The install runs with --no-deps, so the file IS the closure: a member dropped by a hand
+    # edit, or a backend bump that adds or removes a dependency, must fail here until the file is
+    # regenerated and this list is updated in the same reviewed PR (DECISIONS.md #11, amended).
+    assert sorted(names) == _BUILD_REQUIREMENTS_CLOSURE, (
+        f"{_BUILD_REQUIREMENTS_REL} members {sorted(names)!r} != the recorded closure "
+        f"{_BUILD_REQUIREMENTS_CLOSURE!r}; regenerate the file and update the list together"
+    )
+    assert len(set(names)) == len(names), f"duplicate entries: {names!r}"
+    unhashed = [name for name, _, hashes in entries if not hashes]
+    assert unhashed == [], f"entries without a --hash: {unhashed!r}"
+
+
+def test_release_build_installs_the_backend_hash_pinned_before_building():
+    # DECISIONS.md #11 (amended 2026-10-16): the backend that writes dist/ is installed from the
+    # hashed file (--require-hashes; --no-deps so nothing outside it is resolved; --only-binary so
+    # no sdist is built) into an interpreter outside the checkout, and `uv build
+    # --no-build-isolation` then uses that interpreter - after setup-uv, before the SBOM export.
+    build_job = _release_build_job()
+    install_script = _step_run_script(_named_step(build_job, _INSTALL_STEP_NAME))
+    build_step = _named_step(build_job, _BUILD_STEP_NAME)
+    (build_run,) = [line.strip() for line in build_step if line.strip().startswith("run:")]
+    required = (
+        "--require-hashes",
+        "--only-binary :all:",
+        "--no-deps",
+        f"-r {_BUILD_REQUIREMENTS_REL}",
+    )
+    for flag in required:
+        assert flag in install_script, f"install step lacks {flag!r}:\n{install_script}"
+    requested = re.search(r"uv venv --python (\S+) ", install_script)
+    assert requested, install_script
+    assert requested.group(1) == PYTHON_VERSION_PATH.read_text(encoding="utf-8").strip()
+    interpreters = re.findall(r'--python ("\$RUNNER_TEMP/[^"]+/bin/python")', install_script)
+    assert len(interpreters) == 1, f"expected one venv interpreter in:\n{install_script}"
+    assert "--no-build-isolation" in build_run, build_run
+    assert f"--python {interpreters[0]}" in build_run, (
+        f"uv build does not use the interpreter the install step filled: {build_run!r}"
+    )
+    markers = (
+        _SETUP_UV_USES,
+        f"name: {_INSTALL_STEP_NAME}",
+        f"name: {_BUILD_STEP_NAME}",
+        "uv export",
+    )
+    order = [_first_code_line_index(build_job, marker) for marker in markers]
+    assert order == sorted(order), (
+        f"build job step order (setup-uv, install, build, export): {order!r}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv is not on PATH")
+def test_release_build_install_step_fails_closed_on_a_wrong_or_missing_hash(tmp_path):
+    # Behavioural check of the step's own script, offline: UV_OFFLINE disables the network, a
+    # --find-links directory holding one hand-built wheel stands in for the index, and the fixture
+    # checkout's requirements file names that wheel. The correct hash installs; one changed hex
+    # digit and a missing --hash must both fail, with uv's own diagnostic, before anything is
+    # installed. (uv has no UV_NO_INDEX; under UV_OFFLINE an uncached index yields nothing -
+    # checked with uv 0.10.7 and 0.12.23 on 2026-10-16.)
+    links = tmp_path / "links"
+    links.mkdir()
+    requirement, sha256 = _write_fixture_wheel(links)
+    script = _step_run_script(_named_step(_release_build_job(), _INSTALL_STEP_NAME))
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": os.environ.get("HOME", str(tmp_path)),
+        # HOME stays real so uv finds its managed interpreters, but uv must not read the
+        # developer's ~/.config/uv/uv.toml (an index or [pip] setting there would change what
+        # this offline step sees); the release runner has no such file.
+        "UV_NO_CONFIG": "1",
+        "UV_OFFLINE": "1",
+        "UV_PYTHON_DOWNLOADS": "never",
+        "UV_FIND_LINKS": str(links),
+        "UV_CACHE_DIR": str(tmp_path / "uv-cache"),
+    }
+    if "UV_PYTHON_INSTALL_DIR" in os.environ:
+        env["UV_PYTHON_INSTALL_DIR"] = os.environ["UV_PYTHON_INSTALL_DIR"]
+    wrong = sha256[:-1] + ("0" if sha256[-1] != "0" else "1")
+    cases = {
+        "correct": (f"{requirement} \\\n    --hash=sha256:{sha256}\n", None),
+        "wrong-hash": (f"{requirement} \\\n    --hash=sha256:{wrong}\n", "hash mismatch"),
+        "no-hash": (f"{requirement}\n", "require-hashes"),
+    }
+    for label, (text, expected_failure) in cases.items():
+        checkout = tmp_path / label / "checkout"
+        (checkout / ".github").mkdir(parents=True)
+        (checkout / _BUILD_REQUIREMENTS_REL).write_text(text, encoding="utf-8")
+        runner_temp = tmp_path / label / "runner-temp"
+        runner_temp.mkdir()
+        completed = _run_step_script(
+            script,
+            cwd=checkout,
+            env={**env, "RUNNER_TEMP": str(runner_temp)},
+            scratch=tmp_path / label,
+        )
+        output = completed.stdout + completed.stderr
+        installed = list((runner_temp / "build-venv").glob("lib/python*/site-packages/cgfixture*"))
+        if expected_failure is None:
+            assert completed.returncode == 0, output
+            assert installed, f"the fixture wheel was not installed into the build venv:\n{output}"
+        else:
+            assert completed.returncode != 0, f"{label}: the install step did not fail\n{output}"
+            assert expected_failure in output.lower(), f"{label}: unexpected diagnostic\n{output}"
+            assert installed == [], f"{label}: the fixture wheel was installed despite the failure"
+
+
+DEPENDABOT_PATH = REPO_ROOT / ".github" / "dependabot.yml"
+
+
+def _dependabot_entries() -> list[list[str]]:
+    """The lines of each ``updates:`` entry of .github/dependabot.yml, keys stripped of ``- ``."""
+    blocks = _step_blocks(DEPENDABOT_PATH.read_text(encoding="utf-8"), "package-ecosystem:")
+    return [[line.strip().removeprefix("- ") for line in block] for block in blocks]
+
+
+def test_dependabot_tracks_the_build_requirements_file():
+    # The hashed file moves through Dependabot's pip updater, which rewrites the version and the
+    # --hash lines together, not by hand: a weekly `pip` entry on /.github. The lockstep test
+    # above then turns each such PR into a prompt to bump pyproject.toml and uv.lock with it.
+    pip_entries = [entry for entry in _dependabot_entries() if 'package-ecosystem: "pip"' in entry]
+    assert len(pip_entries) == 1, f"expected one pip ecosystem entry, found {len(pip_entries)}"
+    (entry,) = pip_entries
+    assert 'directory: "/.github"' in entry, f"pip entry does not track /.github: {entry!r}"
+    assert 'interval: "weekly"' in entry, f"pip entry is not weekly: {entry!r}"
 
 
 # --- release-authority-tag-push-unbound-to-reviewed-main:.github/workflows/release.yml ------

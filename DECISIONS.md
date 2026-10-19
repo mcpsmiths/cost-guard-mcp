@@ -322,6 +322,48 @@ coupling, not a flake. The update path is a quarterly `chore(deps)` that bumps h
 Locking with uv 0.12.23 moved `uv.lock` to lock-file revision 5 (no package, version or hash
 changed); the locally installed uv 0.10.7 reads it unchanged.
 
+**Amended 2026-10-16 (#97): the release build installs the backend hash-pinned.** The version
+pins above bind *which* hatchling the release build asks for, not *which bytes* it accepts: an
+index, or anything on the path to it, serving a different artefact under
+`hatchling-1.32.4-py3-none-any.whl` was taken, and `uv build` resolved the backend's closure from
+PyPI inside an isolated environment at run time. Now `.github/requirements-build.txt` lists
+hatchling 1.32.4 and its closure (packaging 26.3, pathspec 1.1.1, pluggy 1.7.0, tomlkit 0.15.1,
+trove-classifiers 2026.9.21.13) with the SHA-256 of each member's `py3-none-any` wheel and sdist,
+generated from the single input `hatchling==1.32.4` with
+`uvx uv@0.12.23 pip compile --generate-hashes --universal --python-version 3.12 -o
+.github/requirements-build.txt -` (the `--universal` and linux/3.12 resolutions are identical;
+hatchling has no marker-gated dependency at >=3.12; pass that command text to
+`--custom-compile-command` when regenerating so the header stays stable). The `build` job of
+`release.yml` creates a venv under `$RUNNER_TEMP` - outside the checkout, so hatchling's sdist, which
+includes non-ignored untracked files, never picks it up - installs the file with
+`uv pip install --require-hashes --only-binary :all: --no-deps`, and runs
+`uv build --no-build-isolation --python <that venv>`: the backend comes from the interpreter's
+installed packages, `--no-deps` keeps the installed set to exactly the reviewed file, and
+`--only-binary` means no sdist, and so no arbitrary build code, is ever run. A wrong or missing
+hash fails the install step before anything is built - proven locally with uv 0.12.23 against
+pypi.org, never with a `v*` tag: a changed wheel hash gives "Hash mismatch for
+`hatchling==1.32.4`", an unhashed entry "In `--require-hashes` mode, all requirements must have a
+hash", and an empty venv fails the build with no index fallback.
+
+`tests/unit/test_release_metadata.py` pins the file's hatchling entry to the `[build-system]` pin
+and to `build-constraint-dependencies` (one value in three places), requires every logical line
+to be an exact pin followed only by `--hash=sha256:` tokens (no option line can redirect the
+install), pins the build job's step texts and order, and runs the install step's own script
+offline against a hand-built fixture wheel with a correct, a wrong and a missing hash. Update
+path: `.github/dependabot.yml` gains a weekly `pip` entry on `/.github`; Dependabot rewrites the
+version and `--hash` lines, and the lockstep test fails that PR until `[build-system].requires`,
+`build-constraint-dependencies` and `uv.lock` move in the same PR - the same intended coupling
+as the pre-commit autoupdate above.
+
+Still unbound, deliberately: the uv binary (`setup-uv` is SHA-pinned with `version: "0.12.23"`;
+the action verifies the archive it downloads against a checksum table compiled into its own SHA-pinned source, so uv's integrity rests on that pinned action rather than on a digest in this repository), the
+runner's interpreter and image, and the editable builds in `tests.yml`, `integration.yml` and the
+Dockerfile, which keep resolving hatchling by version through `build-constraint-dependencies`
+because nothing they build is signed or published. `uv build --build-constraints <file>
+--require-hashes`, native in uv 0.12.23, was considered and left for a later revisit: the
+two-step form puts the fail-closed point in a step the unit suite can run offline.
+`[tool.uv] required-version` remains unadopted.
+
 ## 12. The MCP Registry listing is published from the tagged release, not from a personal host
 
 **Status:** Decided 2026-10-15 (#99). The channel is the `registry-publish` job in
