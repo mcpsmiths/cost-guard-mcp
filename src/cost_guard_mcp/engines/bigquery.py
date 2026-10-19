@@ -329,8 +329,9 @@ def execute_bounded(
     """Execute `sql` with optional byte and row bounds.
 
     Row bounding (#94): when `wrap_in_limit` (the tool passes the outcome of
-    sql_scope_keywords.is_single_query_statement; library callers get today's behaviour) the
-    query runs inside `LIMIT max_rows + 1`, so the result the service computes is bounded too.
+    sql_scope_keywords.is_single_query_statement - one non-recursive SELECT/WITH/VALUES
+    statement; library callers get today's behaviour) the query runs inside
+    `LIMIT max_rows + 1`, so the result the service computes is bounded too.
     In every case the fetch asks the API for at most max_rows + 1 rows in pages of
     FETCH_PAGE_SIZE and stops consuming (result_bounds.collect_rows) at the sentinel row or
     once the running size estimate crosses MAX_RESULT_BYTES. The returned bool is True whenever

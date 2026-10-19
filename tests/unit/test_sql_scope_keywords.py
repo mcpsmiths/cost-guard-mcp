@@ -164,6 +164,7 @@ def test_refuses_non_read_statements_on_every_engine(sql, engine):
     "sql",
     [
         "WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x",
+        "WITH RECURSIVE x AS (SELECT 1) INSERT INTO t SELECT * FROM x",
         "WITH x AS (SELECT 1) DELETE FROM t USING x WHERE t.a = x.a",
         "WITH x AS (SELECT 1) UPDATE t SET a = 1",
         "WITH x AS (SELECT 1) MERGE INTO t USING x ON t.a = x.a WHEN MATCHED THEN DELETE",
@@ -380,6 +381,13 @@ def test_first_keyword_returns_the_upper_cased_word_and_its_offset(sql, expected
 # --- #94: is the statement valid as the derived table of the LIMIT wrap? ---------------------
 
 
+# The live gate's reproduction (#124): admitted by the read gate, refused by BigQuery inside the
+# wrap, so it must reach the warehouse unwrapped.
+_RECURSIVE_CTE = (
+    "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5) SELECT n FROM t"
+)
+
+
 def _nested_with(depth):
     sql = "SELECT 1"
     for _ in range(depth):
@@ -401,10 +409,27 @@ def _nested_with(depth):
         ("WITH t AS (SELECT 1) VALUES (1)", True),
         ("WITH t AS (SELECT 1), u AS (SELECT 2) (SELECT * FROM t)", True),
         (_nested_with(3), True),
+        # A nested non-recursive WITH inside a CTE body leaves the main statement wrappable.
+        ("WITH t AS (WITH u AS (SELECT 1) SELECT * FROM u) SELECT * FROM t", True),
+        # #124: BigQuery allows WITH RECURSIVE only at the top level of a statement, so a
+        # recursive main WITH is a read the engines must dispatch unwrapped; the fetch caps it.
+        # Only the statement's own WITH counts, after comments, whitespace and parentheses.
+        (_RECURSIVE_CTE, False),
+        ("with recursive t as (select 1) select * from t", False),
+        ("-- c\nWITH RECURSIVE t AS (SELECT 1) SELECT * FROM t", False),
+        ("/* c */ WITH /* c */ RECURSIVE t AS (SELECT 1) SELECT * FROM t", False),
+        ("(WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t)", False),
+        ("((WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t))", False),
+        ("WITH RECURSIVE t AS (SELECT 1) VALUES (1)", False),
+        # RECURSIVE is a keyword only as the word right after WITH: a CTE named like it, or
+        # a longer identifier, is an ordinary non-recursive WITH.
+        ("WITH recursive_t AS (SELECT 1) SELECT * FROM recursive_t", True),
+        ("WITH RECURSIVEX AS (SELECT 1) SELECT * FROM RECURSIVEX", True),
         # A WITH is not enough: Spark allows WITH ... INSERT, and under the write opt-out the
         # gate does not look at it - wrapping it would be invalid SQL.
         ("WITH t AS (SELECT 1) INSERT INTO x SELECT * FROM t", False),
         ("WITH t AS (SELECT 1) MERGE INTO x USING t ON 1=1", False),
+        ("WITH RECURSIVE t AS (SELECT 1) INSERT INTO x SELECT * FROM t", False),
         ("SHOW TABLES", False),
         ("DESCRIBE t", False),
         ("DESC t", False),

@@ -2,12 +2,14 @@ import asyncio
 import base64
 import datetime
 import decimal
+import itertools
 import json
 import logging
 import uuid
 from unittest.mock import MagicMock, patch
 
 import pytest
+from google.cloud.bigquery.table import Row
 from pydantic_core import PydanticSerializationError
 
 from cost_guard_mcp.engines.bigquery import ProviderByteCapExceeded, cost_cap_to_max_bytes_billed
@@ -1063,6 +1065,15 @@ def test_explicit_max_rows_above_the_threshold_logs_one_warning(
         ("bigquery", "SELECT 1", True),
         ("bigquery", "(SELECT 1)", True),
         ("bigquery", "WITH t AS (SELECT 1) SELECT * FROM t", True),
+        ("snowflake", "WITH t AS (SELECT 1) SELECT * FROM t", True),
+        ("databricks", "WITH t AS (SELECT 1) SELECT * FROM t", True),
+        # #124: BigQuery allows WITH RECURSIVE only at the top level of a statement - inside
+        # the wrap it is a compile-time 400 - so a recursive main WITH runs unwrapped on every
+        # engine (one rule, decided in the tool) and the paged fetch is its row cap.
+        ("bigquery", "WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t", False),
+        ("snowflake", "WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t", False),
+        ("databricks", "WITH RECURSIVE t AS (SELECT 1) SELECT * FROM t", False),
+        ("bigquery", "(with recursive t as (select 1) select * from t)", False),
         ("snowflake", "VALUES (1)", True),
         ("bigquery", "SELECT 1;", True),
         ("bigquery", "-- lead\nSELECT 1 -- trail", True),
@@ -1125,6 +1136,155 @@ def test_limit_wrap_is_skipped_for_a_with_insert_under_the_write_opt_out(
     run_query_bounded("databricks", "WITH t AS (SELECT 1) INSERT INTO x SELECT * FROM t")
 
     assert mock_execute.call_args.kwargs["wrap_in_limit"] is False
+
+
+# --- #124: a recursive CTE reaches the warehouse unwrapped; the fetch is still its row cap ----
+#
+# 0.6.0 pre-tag live gate (integration.yml run 39275182240 on 36151ad): BigQuery answered the
+# wrapped form `SELECT * FROM (WITH RECURSIVE ...) AS cost_guard_row_cap LIMIT 1001` with
+# "400 WITH RECURSIVE is only allowed at the top level of the SELECT, CREATE TABLE AS SELECT,
+# CREATE VIEW, INSERT, EXPORT DATA statements." The text the warehouse receives is what matters,
+# so these run the real engines over SDK-level fakes rather than asserting the kwarg alone.
+
+_RECURSIVE_CTE = (
+    "WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5) SELECT n FROM t"
+)
+_PLAIN_CTE = "WITH t AS (SELECT 1 AS n) SELECT n FROM t"
+_WRAPPED_PLAIN_CTE = (
+    f"SELECT * FROM ({_PLAIN_CTE}) AS cost_guard_row_cap LIMIT {DEFAULT_MAX_ROWS + 1}"  # noqa: S608 - test text, never executed
+)
+
+
+def _fetchmany_pager(rows):
+    """A cursor.fetchmany stand-in: serves `rows` in pages, then empty pages, as the
+    connectors do."""
+    remaining = iter(rows)
+    return lambda size: list(itertools.islice(remaining, size))
+
+
+def _bigquery_sdk_returning(mock_bq_module, rows):
+    """`google.cloud.bigquery` stood in: Client().query(...).result() iterates `rows`. Returns
+    the client so the test can read the SQL that was dispatched."""
+    mock_client = MagicMock()
+    mock_result = MagicMock()
+    mock_result.__iter__.return_value = iter(rows)
+    mock_query_job = MagicMock()
+    mock_query_job.result.return_value = mock_result
+    mock_client.query.return_value = mock_query_job
+    mock_bq_module.Client.return_value = mock_client
+    mock_bq_module.QueryJobConfig.return_value = MagicMock()
+    return mock_client
+
+
+def _snowflake_sdk_returning(mock_connect, rows):
+    """`snowflake._connect` stood in: an async execution that has already finished and whose
+    DictCursor pages `rows`. Returns the cursor (execute_async received the SQL)."""
+    mock_cursor = MagicMock()
+    mock_cursor.sfqid = "11111111-1111-1111-1111-111111111111"
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager(rows)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_conn.is_still_running.return_value = False
+    mock_connect.return_value = mock_conn
+    return mock_cursor
+
+
+def _databricks_sdk_returning(mock_connect, rows, columns=("n",)):
+    """`databricks._connect` stood in: a cursor whose execute is a no-op and whose fetchmany
+    pages tuple `rows` under `description`. Returns the cursor (execute received the SQL)."""
+    mock_cursor = MagicMock()
+    mock_cursor.execute.side_effect = lambda _sql: None
+    mock_cursor.fetchmany.side_effect = _fetchmany_pager(rows)
+    mock_cursor.description = [(col,) for col in columns]
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_connect.return_value = mock_conn
+    return mock_cursor
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_dispatch"),
+    [(_RECURSIVE_CTE, _RECURSIVE_CTE), (_PLAIN_CTE, _WRAPPED_PLAIN_CTE)],
+    ids=["recursive_cte_unwrapped", "plain_cte_wrapped"],
+)
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_bigquery_dispatches_a_recursive_cte_unwrapped_and_a_plain_cte_wrapped(
+    mock_estimate, mock_bq_module, sql, expected_dispatch
+):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    client = _bigquery_sdk_returning(mock_bq_module, [Row((1,), {"n": 0})])
+
+    result = run_query_bounded("bigquery", sql)
+
+    assert client.query.call_args[0][0] == expected_dispatch
+    # The fetch bound is the same either way: max_rows + 1 rows, 500 per page.
+    result_kwargs = client.query.return_value.result.call_args.kwargs
+    assert (result_kwargs["max_results"], result_kwargs["page_size"]) == (DEFAULT_MAX_ROWS + 1, 500)
+    assert (result.status, result.executed, result.rows) == ("ok", True, [{"n": 1}])
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_dispatch"),
+    [(_RECURSIVE_CTE, _RECURSIVE_CTE), (_PLAIN_CTE, _WRAPPED_PLAIN_CTE)],
+    ids=["recursive_cte_unwrapped", "plain_cte_wrapped"],
+)
+@patch("cost_guard_mcp.engines.snowflake.time.sleep")
+@patch("cost_guard_mcp.engines.snowflake._connect")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_snowflake_dispatches_a_recursive_cte_unwrapped_and_a_plain_cte_wrapped(
+    mock_estimate, mock_connect, _mock_sleep, sql, expected_dispatch
+):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    cursor = _snowflake_sdk_returning(mock_connect, [{"N": 1}])
+
+    result = run_query_bounded("snowflake", sql)
+
+    assert cursor.execute_async.call_args[0][0] == expected_dispatch
+    assert cursor.execute_async.call_args.kwargs == {"num_statements": 1}
+    assert (result.status, result.executed, result.rows) == ("ok", True, [{"N": 1}])
+
+
+@pytest.mark.parametrize(
+    ("sql", "expected_dispatch"),
+    [(_RECURSIVE_CTE, _RECURSIVE_CTE), (_PLAIN_CTE, _WRAPPED_PLAIN_CTE)],
+    ids=["recursive_cte_unwrapped", "plain_cte_wrapped"],
+)
+@patch("cost_guard_mcp.engines.databricks._connect")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_databricks_dispatches_a_recursive_cte_unwrapped_and_a_plain_cte_wrapped(
+    mock_estimate, mock_connect, sql, expected_dispatch
+):
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    cursor = _databricks_sdk_returning(mock_connect, [(1,)])
+
+    result = run_query_bounded("databricks", sql)
+
+    assert cursor.execute.call_args[0][0] == expected_dispatch
+    assert (result.status, result.executed, result.rows) == ("ok", True, [{"n": 1}])
+
+
+@patch("cost_guard_mcp.engines.bigquery.bigquery")
+@patch("cost_guard_mcp.tools.run_query_bounded.estimate_query_cost")
+def test_row_cap_still_truncates_an_unwrapped_recursive_result(mock_estimate, mock_bq_module):
+    # Unwrapped is not unbounded: exactly the SHOW/script path. 1,500 rows back from a recursive
+    # CTE with max_rows omitted -> 1,000 rows, row_cap_exceeded, executed (the run was billed).
+    mock_estimate.return_value = _estimate(cost=0.01, bytes_=1000)
+    client = _bigquery_sdk_returning(
+        mock_bq_module, [Row((index,), {"n": 0}) for index in range(1500)]
+    )
+
+    result = run_query_bounded("bigquery", _RECURSIVE_CTE)
+
+    assert client.query.call_args[0][0] == _RECURSIVE_CTE
+    assert "cost_guard_row_cap" not in client.query.call_args[0][0]
+    assert result.status == "refused"
+    assert result.reason == RefusalReason.ROW_CAP_EXCEEDED
+    assert result.executed is True
+    assert result.row_count == DEFAULT_MAX_ROWS == 1000
+    assert len(result.rows) == 1000
+    assert result.rows[0] == {"n": 0}
+    assert result.rows[-1] == {"n": 999}
 
 
 @patch("cost_guard_mcp.tools.run_query_bounded.bigquery_engine.execute_bounded")

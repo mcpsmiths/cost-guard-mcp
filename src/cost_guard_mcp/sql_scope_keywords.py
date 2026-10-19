@@ -64,6 +64,7 @@ _KEYWORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
 _CTE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*", re.ASCII)
 
 _WITH = "WITH"
+_RECURSIVE = "RECURSIVE"
 
 # How deep a WITH may sit inside another (a CTE body, or the parenthesised main statement the
 # walk descends into). The walk re-scans the enclosed text once per level, so unbounded it was
@@ -186,8 +187,8 @@ def _main_keyword_after_ctes(
     with its offset; ``(None, offset)`` at the first shape the walk cannot resolve. Every
     CTE body must itself resolve to SELECT/VALUES (data-modifying CTEs exist elsewhere)."""
     index = _skip_trivia(sql, index, dialect, parens=False)
-    if _word_at(sql, index) == "RECURSIVE":
-        index = _skip_trivia(sql, index + len("RECURSIVE"), dialect, parens=False)
+    if _word_at(sql, index) == _RECURSIVE:
+        index = _skip_trivia(sql, index + len(_RECURSIVE), dialect, parens=False)
     while True:
         name_end = _cte_name_end(sql, index, dialect)
         if name_end is None:
@@ -268,20 +269,36 @@ def _check_every_statement(sql: str, dialect: _Dialect) -> None:
         _check_statement(sql[start:end], start, ordinal if len(segments) > 1 else None, dialect)
 
 
+def _is_recursive_with(sql: str, dialect: _Dialect) -> bool:
+    """True when the statement's own WITH - the first keyword after whitespace, comments and
+    opening parentheses - is ``WITH RECURSIVE``. Only that outermost WITH counts: a recursive
+    CTE nested inside a CTE body is the warehouse's business, not the wrap's."""
+    keyword, offset = first_keyword(sql, dialect)
+    if keyword != _WITH:
+        return False
+    index = _skip_trivia(sql, offset + len(_WITH), dialect, parens=False)
+    return _word_at(sql, index) == _RECURSIVE
+
+
 def is_single_query_statement(sql: str, engine: Engine) -> bool:
-    """True iff ``sql`` is one statement whose main keyword - resolved through any CTE list by
-    the same walk the read gate uses - is SELECT or VALUES: the shape that is valid as the
-    derived table of the engines' ``SELECT * FROM (...) AS cost_guard_row_cap LIMIT n`` wrap
-    (#94). SHOW/DESCRIBE/EXPLAIN, scripts, writes and ``WITH ... INSERT`` (Spark allows it, and
-    the write opt-out skips the gate) are not. Never raises and never logs: a shape the walk
-    refuses (unbalanced parentheses, a WITH nested past ``_MAX_CTE_NESTING``) is simply False.
+    """May the engine enclose ``sql`` in ``SELECT * FROM (...) AS cost_guard_row_cap LIMIT n``
+    (#94)? True iff it is one statement whose main keyword - resolved through any CTE list by
+    the same walk the read gate uses - is SELECT or VALUES, and whose own WITH is not
+    ``WITH RECURSIVE``. SHOW/DESCRIBE/EXPLAIN, scripts, writes and ``WITH ... INSERT`` (Spark
+    allows it, and the write opt-out skips the gate) are not valid as a derived table; a
+    recursive CTE is admitted by the read gate but BigQuery allows ``WITH RECURSIVE`` only at
+    the top level of a statement (a compile-time 400 inside the wrap, #124), so it runs
+    unwrapped and the paged fetch is its row cap, like every other admitted-but-unwrapped
+    statement. Never raises and never logs: a shape the walk refuses (unbalanced parentheses,
+    a WITH nested past ``_MAX_CTE_NESTING``) is simply False.
     """
     if not is_single_statement(sql, engine):
         return False
+    dialect = dialect_for(engine)
     try:
-        keyword, _ = _resolve_query_keyword(
-            sql, dialect_for(engine), _Frame("the statement", 0, depth=1)
-        )
+        if _is_recursive_with(sql, dialect):
+            return False
+        keyword, _ = _resolve_query_keyword(sql, dialect, _Frame("the statement", 0, depth=1))
     except UserVisibleError:
         return False
     return keyword in _QUERY_KEYWORDS
