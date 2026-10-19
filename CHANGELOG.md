@@ -6,6 +6,17 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+### Security
+
+- Release build: `release.yml` now installs the build backend hash-pinned - `hatchling==1.32.4`
+  and its closure from `.github/requirements-build.txt` under
+  `uv pip install --require-hashes --only-binary :all: --no-deps`, into a venv outside the
+  checkout - and runs `uv build --no-build-isolation` with it, so the published sdist and wheel
+  can only be produced by the exact wheels whose SHA-256 the reviewed file lists; a wrong or
+  missing hash fails the build job before anything is built. Dependabot tracks the file (`pip`,
+  `/.github`) and a lockstep test keeps its hatchling pin equal to `pyproject.toml`'s
+  (`DECISIONS.md` #11, amended; #97).
+
 ### Added
 
 - `run_query_bounded` result size cap: 8 MiB of compact JSON over the normalised rows; larger
@@ -56,17 +67,6 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   `row_cap_exceeded` (and now `result_size_exceeded`) follow a billed execution and carry
   truncated rows. The description, `DECISIONS.md` #4 and README now say which refusals ran
   (check `executed`) (#101).
-
-### Security
-
-- Release build: `release.yml` now installs the build backend hash-pinned - `hatchling==1.32.4`
-  and its closure from `.github/requirements-build.txt` under
-  `uv pip install --require-hashes --only-binary :all: --no-deps`, into a venv outside the
-  checkout - and runs `uv build --no-build-isolation` with it, so the published sdist and wheel
-  can only be produced by the exact wheels whose SHA-256 the reviewed file lists; a wrong or
-  missing hash fails the build job before anything is built. Dependabot tracks the file (`pip`,
-  `/.github`) and a lockstep test keeps its hatchling pin equal to `pyproject.toml`'s
-  (`DECISIONS.md` #11, amended; #97).
 
 ## [0.5.0] - 2026-10-15
 
