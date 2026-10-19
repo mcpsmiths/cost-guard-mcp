@@ -23,7 +23,7 @@ jobs:
           chmod 600 /tmp/bq-sa.json
         env:
           BIGQUERY_SA_KEY_JSON: ${{ secrets.BIGQUERY_SA_KEY_JSON }}
-      - run: uv run pytest tests/integration/test_bigquery_live.py -v
+      - run: uv run pytest tests/integration/test_bigquery_live.py -v -rA
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/bq-sa.json
           BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT }}

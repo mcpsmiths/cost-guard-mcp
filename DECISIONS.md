@@ -1067,9 +1067,9 @@ the billable path with no gate catching a regression is the wrong risk; owner fo
 **Consequences:** behaviour change for callers relying on unlimited rows (pass an explicit
 `max_rows`; no opt-out from the byte cap). The wrapped statement must be valid as a derived table;
 the README and the tool description say so, and the live cases in
-`tests/integration/test_bigquery_live.py` pin what BigQuery does with the wrapped form. The first
-live run answered two of the three questions the fix-up review had flagged as unverified at merge
-time (amendment of 2026-10-19 below): a recursive CTE is refused inside the wrap and now runs
+`tests/integration/test_bigquery_live.py` pin what BigQuery does with the wrapped form. The 0.6.0
+pre-tag live run (`integration.yml` 39275182240) answered two of the three questions the fix-up
+review had flagged as unverified at merge time (amendment of 2026-10-19 below): a recursive CTE is refused inside the wrap and now runs
 unwrapped, and a duplicate output column name is accepted. The third case pins whether an inner
 `ORDER BY` survives the outer `LIMIT max_rows + 1` (if not, the tool description gains "put the
 LIMIT inside your query when order matters"). `SHOW`/`DESCRIBE`/scripts gain a working row
@@ -1131,8 +1131,11 @@ column names were not observed. The remedy "BigQuery rejects duplicate output co
 the wrap - alias them" was therefore an unsupported provider claim; it is withdrawn from the
 README, the tool description and the 0.6.0 release notes, which now state only what holds: the
 wrapped statement must be valid as a derived table. That live case is now a pin of the observed
-behaviour (`status: ok`, one row, `executed: true`) whose assertion messages print the rows, so
-the next live run records the column names BigQuery returns for the wrapped form.
+behaviour (`status: ok`, one row, `executed: true`) whose assertion messages print the rows, so a
+regression shows what BigQuery returned. The column names of a passing wrapped run are still
+unobserved: a passing assertion prints nothing, so the case also prints the rows unconditionally
+and `integration.yml` runs the BigQuery job with `-rA`, which shows captured output for passed
+tests; the next live run records them.
 
 ## 22. BigQuery estimates without a usable byte figure produce no dollar figure, so a dollar cap refuses
 

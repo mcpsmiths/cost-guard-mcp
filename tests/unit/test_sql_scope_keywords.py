@@ -192,6 +192,9 @@ def test_refuses_a_with_whose_main_statement_is_a_write(sql, engine):
         "WITH x AS (SELECT 1) (DELETE FROM t)",
         "WITH x AS (SELECT 1), SELECT 1",
         "WITH 'x' AS (SELECT 1) SELECT 1",
+        # A CTE literally named `recursive`: the bare word is read as the keyword, so the
+        # walker looks for the CTE name after it and finds `AS` instead (safe direction).
+        "WITH recursive AS (SELECT 1) SELECT * FROM recursive",
         # Text ends where a CTE name should start (after WITH, after a trailing comma).
         "WITH",
         "WITH x AS (SELECT 1),",
@@ -425,6 +428,11 @@ def _nested_with(depth):
         # a longer identifier, is an ordinary non-recursive WITH.
         ("WITH recursive_t AS (SELECT 1) SELECT * FROM recursive_t", True),
         ("WITH RECURSIVEX AS (SELECT 1) SELECT * FROM RECURSIVEX", True),
+        # The bare word is taken as the keyword on every engine: a CTE literally named
+        # `recursive` is not wrappable, and the read gate refuses the text anyway (after
+        # skipping RECURSIVE the walker finds no `AS`; pinned below). Quoted names
+        # (`RECURSIVE`, "RECURSIVE") are ordinary identifiers and stay wrappable.
+        ("WITH recursive AS (SELECT 1) SELECT * FROM recursive", False),
         # A WITH is not enough: Spark allows WITH ... INSERT, and under the write opt-out the
         # gate does not look at it - wrapping it would be invalid SQL.
         ("WITH t AS (SELECT 1) INSERT INTO x SELECT * FROM t", False),

@@ -82,8 +82,10 @@ def test_run_query_bounded_default_limit_wrap_accepts_duplicate_output_columns()
     inside the wrap: the earlier expectation of "Duplicate column names in the result are not
     supported" reported DID NOT RAISE, and the remedy "alias them" was withdrawn from the README,
     the tool description and the release notes (DECISIONS.md #21, amended 2026-10-19). This pins
-    the observed behaviour; every assertion message prints the rows so the next run records which
-    column names BigQuery returns for the wrapped form (not observed in that run). If BigQuery ever
+    the observed behaviour. The assertion messages print the rows, so a regression shows what
+    BigQuery returned; the column names of a passing wrapped run were not observed in run
+    39275182240 and a passing assertion prints nothing, so the rows are also printed
+    unconditionally below (shown by `pytest -rA`, which integration.yml passes). If BigQuery ever
     refuses the wrapped form, this fails and the remedy comes back - with evidence this time."""
     from cost_guard_mcp.tools.run_query_bounded import run_query_bounded
 
@@ -98,6 +100,8 @@ def test_run_query_bounded_default_limit_wrap_accepts_duplicate_output_columns()
     assert result.executed is True, f"executed={result.executed!r} rows={result.rows!r}"
     assert result.row_count == 1, f"row_count={result.row_count!r} rows={result.rows!r}"
     assert len(result.rows) == 1, f"rows={result.rows!r}"
+    # Unconditional: a passing run must still record which names the wrapped form returns.
+    print(f"wrapped duplicate-column rows: {result.rows!r}")
 
     # Control: distinct names under the same default wrap.
     result = run_query_bounded("bigquery", "SELECT 1 AS a, 2 AS b")
@@ -105,7 +109,7 @@ def test_run_query_bounded_default_limit_wrap_accepts_duplicate_output_columns()
     assert result.rows == [{"a": 1, "b": 2}], f"rows={result.rows!r}"
 
 
-def test_run_query_bounded_default_limit_wrap_accepts_a_recursive_cte():
+def test_run_query_bounded_runs_a_recursive_cte_unwrapped_under_the_default_cap():
     """#124: in the 0.6.0 pre-tag live gate (integration.yml run 39275182240) this query, wrapped as
     `SELECT * FROM (WITH RECURSIVE ...) AS cost_guard_row_cap LIMIT 1001`, was refused by BigQuery
     at compile time, nothing billed: "400 WITH RECURSIVE is only allowed at the top level of the
