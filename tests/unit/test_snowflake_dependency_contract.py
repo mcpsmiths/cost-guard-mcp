@@ -8,7 +8,9 @@ raising. A dependency floor change that dropped a parameter would therefore turn
 pin into a no-op with nothing else catching it. These tests make that a unit failure.
 
 Verified against snowflake-connector-python 4.8.0 (uv.lock); `secondary_roles` dates from
-4.3.0, so the project's >=4.7.1 floor already covers it.
+4.3.0, so the project's >=4.7.1 floor already covers it. The range is capped below 5 until Snowflake
+ships a GA 5.x: 5.0.0 (a public preview on PyPI) empties DEFAULT_CONFIGURATION and gives
+execute_async its own num_statements parameter, so these pins fail there by design (#121).
 """
 
 import inspect

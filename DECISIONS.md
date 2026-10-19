@@ -966,7 +966,7 @@ serialisability. The audit's mocked run returned 100,000 rows unbounded and an 8
 one row, while `server.json` advertised "result-size guardrails". #101 (audit
 `row-cap-refusal-after-billed-run-described-as-not-run`): the tool description said every refusal
 "did NOT run" while `row_cap_exceeded` follows a billed execution, so a model could re-run a query
-believing nothing had been spent. Owner decisions 2026-10-15; held for 0.5.1.
+believing nothing had been spent. Owner decisions 2026-10-15; held for 0.6.0.
 
 **Decision:**
 
@@ -1102,8 +1102,7 @@ fetch phase can exceed 120 s by what the deadline cannot pre-empt: Snowflake's `
 requested within budget while it downloads; and a result whose last page was full (exactly a
 multiple of 500 rows) still pays the check before its end-of-result probe, since the client cannot
 tell it from a result with more pages. `tests/unit/test_result_bounds.py`'s property test is the
-guard on the estimator; the hit-on-size-stop rule is the fail-closed fallback behind it. Ships in
-0.5.1
+guard on the estimator; the hit-on-size-stop rule is the fail-closed fallback behind it. Ships in 0.6.0
 (additive schema; a default change on a 0.x line that already moved defaults in 0.5.0).
 
 ## 22. BigQuery estimates without a usable byte figure produce no dollar figure, so a dollar cap refuses
@@ -1216,5 +1215,39 @@ for that query, which is what that query is. The `US` fallback is observable (ca
 `location_source=fallback`). Unit tests drive the real `dry_run` through both tools for each shape
 (`tests/unit/test_engines_bigquery.py`, `test_tools_run_query_bounded.py`,
 `test_tools_estimate_query_cost.py`); the runtime probes against the real stdio server with the
-fake SDK are recorded in `scratch-pad/bq-cap-gate-2026-10/evidence/`. Ships in 0.5.1 (with #21;
-the same 0.x reasoning - the release PR fixes the number for both).
+fake SDK are recorded in `scratch-pad/bq-cap-gate-2026-10/evidence/`. Ships in 0.6.0 (with #21;
+the same 0.x reasoning - the release PR fixed the number for both).
+
+## 23. `snowflake-connector-python` is capped below 5 until Snowflake ships a GA 5.x
+
+**Context:** Issue #121. `snowflake-connector-python` 5.0.0 reached PyPI on 2026-10-15 under a plain
+version number (classifier `Development Status :: 5 - Production/Stable`), while its own long
+description opens with a caution that the version is a public preview, not ready for use with
+production data and may be unstable; the project's GitHub repository has no release or tag for it
+(latest: v4.8.0). It is an FFI-based rewrite. Any resolver satisfying the `>=4.7.1` floor picked it
+from that day, including a fresh `uvx cost-guard-mcp` of 0.5.0. Against this codebase it fails
+`mypy` (the base cursor types `fetchone()` as `Row | DictRow | None`) and the three pins in
+`tests/unit/test_snowflake_dependency_contract.py`, which exist for exactly this case: the
+`DEFAULT_CONFIGURATION` table the pins read is empty in 5.0.0 (connection options moved to a
+`ConnectionConfig` dataclass; `secondary_roles` and `session_parameters` still exist there), and
+`execute_async` gained its own `num_statements` parameter instead of forwarding `**kwargs` to
+`execute`. The security controls those pins protect (#7's role pin via `secondary_roles`, the
+single-statement pin via `session_parameters` and `num_statements`) have not been verified on the
+new layout, and the unit suite with fake SDKs cannot verify them.
+
+**Decision:** Owner decision 2026-10-19: `snowflake-connector-python>=4.7.1,<5` in `pyproject.toml`
+from 0.6.0, and a Dependabot `ignore` of the connector's semver-major updates so the grouped
+`python-dependencies` PR stays green. The cap is lifted only after: a GitHub release exists for the
+5.x line and the PyPI caution is gone; the login-time `secondary_roles` / `session_parameters` path
+and the unknown-kwarg handling are re-verified in 5.x source; the contract tests are rewritten for
+both layouts; the six `fetchone()` results in `engines/snowflake.py` are narrowed so `mypy` passes
+under both stubs; and the live Snowflake gate (#100) has run on 5.x. Alternatives rejected: making
+0.6.0 compatible with 5.0.0 now (ships against a driver its vendor calls unstable, for a
+compatibility that cannot be live-tested in this programme); leaving the range open (fresh installs
+keep resolving the preview driver); a 0.5.1 hotfix carrying only the cap (two releases a few days
+apart for one line - 0.6.0 is days away and carries the same line).
+
+**Consequences:** Users on the 4.x line see no change; a user who already installed 5.0.0 moves back
+to 4.8.x on upgrade. The cap is visible in the published `Requires-Dist` and recorded in
+`changelog/v0.6.0.md`. The checklist for lifting it lives on #121; this entry is amended when the
+range changes.

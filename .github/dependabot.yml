@@ -7,6 +7,11 @@ updates:
     groups:
       python-dependencies:
         patterns: ["*"]
+    ignore:
+      # snowflake-connector-python 5.x is a public preview published under a plain version
+      # number; the project caps the range below 5 until Snowflake ships a GA 5.x (#121).
+      - dependency-name: "snowflake-connector-python"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"

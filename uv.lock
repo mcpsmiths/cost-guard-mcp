@@ -396,7 +396,7 @@ wheels = [
 
 [[package]]
 name = "cost-guard-mcp"
-version = "0.5.0"
+version = "0.6.0"
 source = { editable = "." }
 dependencies = [
     { name = "databricks-sdk" },
@@ -429,7 +429,7 @@ requires-dist = [
     { name = "google-cloud-bigquery-reservation", specifier = ">=1.15.0" },
     { name = "mcp", specifier = ">=2.0.0" },
     { name = "pydantic", specifier = ">=2.9.0" },
-    { name = "snowflake-connector-python", specifier = ">=4.7.1" },
+    { name = "snowflake-connector-python", specifier = ">=4.7.1,<5" },
 ]
 
 [package.metadata.requires-dev]
