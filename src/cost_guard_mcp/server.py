@@ -6,6 +6,7 @@ for Python's `logging` module when no handler is configured, and for `print(...,
 """
 
 import functools
+import importlib.metadata
 import os
 import re
 import threading
@@ -18,6 +19,7 @@ from mcp_types import ToolAnnotations
 
 from cost_guard_mcp.config import ConfigError
 from cost_guard_mcp.errors import UserVisibleError, as_tool_error
+from cost_guard_mcp.log_hygiene import configure_log_hygiene
 from cost_guard_mcp.tools.check_credentials import check_credentials as _check_credentials
 from cost_guard_mcp.tools.describe_engine_capabilities import (
     describe_engine_capabilities as _describe_engine_capabilities,
@@ -34,7 +36,38 @@ from cost_guard_mcp.types import (
     EngineCapabilities,
 )
 
-mcp = MCPServer("cost-guard-mcp")
+_DISTRIBUTION_NAME = "cost-guard-mcp"
+_UNKNOWN_VERSION = "0.0.0+unknown"
+
+
+def _installed_version() -> str:
+    """The installed distribution's version, for the initialize handshake's serverInfo.
+
+    Read from the dist-info the install wrote from pyproject.toml, so the version a client
+    sees can never disagree with the wheel it is running. The low-level SDK substitutes
+    nothing for an omitted version (serverInfo.version came back "" on every release up to
+    0.5.0), hence the explicit fallback for a source tree that was never installed: a value
+    that says it is unknown rather than an empty string or a guess.
+    """
+    try:
+        return importlib.metadata.version(_DISTRIBUTION_NAME)
+    except importlib.metadata.PackageNotFoundError:
+        return _UNKNOWN_VERSION
+
+
+SERVER_VERSION = _installed_version()
+
+mcp = MCPServer("cost-guard-mcp", version=SERVER_VERSION)
+
+# Directly after the constructor: MCPServer.__init__ (mcp 2.3.0, mcp/server/mcpserver/
+# server.py:267 -> utilities/logging.py:39) has just run logging.basicConfig on the root
+# logger, so the stderr handler the filter attaches to now exists, and no library record can
+# have been emitted yet - a warehouse-client call needs a tool body, and none runs before
+# the server does. Module scope rather than main() so every launch path that imports this
+# module is covered: the console script, `mcp run`/`mcp dev cost_guard_mcp.server:mcp`, a
+# host importing `mcp` directly, and in-process Client(mcp) tests. See log_hygiene.py for
+# what it pins and why.
+configure_log_hygiene()
 
 # Registration shape matters beyond Python: the mcprush.com marketplace reads this
 # project's tool list statically from the repository (its "Read the tools again" control),
@@ -358,6 +391,7 @@ def _bootstrap_opentelemetry() -> None:
 
 
 def main() -> None:
+    # Log hygiene is already in place: it ran at import, directly after `mcp` was constructed.
     _bootstrap_opentelemetry()
     mcp.run()
 

@@ -19,6 +19,13 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ### Added
 
+- Redacting log filter and pinned third-party loggers: when the server module is imported the
+  `snowflake.connector`, `databricks`, `databricks.sql`, `databricks.sdk`, `google`, `urllib3`,
+  `httpx` and `httpcore` loggers are set to WARNING, and every record that reaches the stderr
+  handler — the `mcp` SDK's and the client libraries' included — has its message, exception
+  traceback and stack text rendered once and passed through `redact_secrets` before it is
+  written (never drops a record, never raises). The project's own `tool=<name> outcome=` INFO
+  records are unchanged; no new configuration (#95).
 - `run_query_bounded` result size cap: 8 MiB of compact JSON over the normalised rows; larger
   results return the longest prefix of whole rows with the new `reason: result_size_exceeded`
   (additive `outputSchema` enum value); `executed` boolean on every `BoundedQueryResult`
@@ -28,6 +35,10 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ### Changed
 
+- MCP Registry publish (`mcp-registry-publish.yml`): the retry budget that absorbs the
+  registry's own PyPI lag is 8 attempts 30 s apart, was 5 — the first real run (v0.5.0) used
+  2 of 5 waiting ~60-70 s; the job's designed worst case stays about 20 minutes
+  (`DECISIONS.md` #12; #111).
 - BigQuery dollar caps refuse on row-level-security-shaped and `LOWER_BOUND` dry runs: a dry run
   that reports 0 bytes on a statement referencing a table (BigQuery hides the figure for
   row-level-security-protected tables, by design) or `totalBytesProcessedAccuracy: LOWER_BOUND`
@@ -57,6 +68,10 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ### Fixed
 
+- `serverInfo.version` in the `initialize` handshake was `""` on every release so far (the
+  server was constructed without a version); it is now the installed package version from
+  `importlib.metadata`, or `0.0.0+unknown` when run from an uninstalled source tree. `AGENTS.md`
+  now lists all four tools, pinned to the registrations by a unit test (#111).
 - BigQuery billing-model check (`is_capacity_billed`) searched reservation assignments in `US`
   only, so a project whose reservation lives in another location was priced on-demand. It now
   searches the dry-run job's own location (`QueryJob.location`), falls back to `US` only when

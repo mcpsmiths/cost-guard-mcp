@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.metadata
 import json
 import os
 import re
@@ -634,6 +635,14 @@ def test_server_json_versions_match_pyproject():
     assert server_json["packages"][0]["version"] == project_version
 
 
+def test_installed_distribution_version_matches_pyproject():
+    # server.SERVER_VERSION (the initialize handshake's serverInfo.version) is read from the
+    # installed dist-info, so it reports whatever the last `uv sync` wrote. CI syncs fresh and
+    # keeps this true; a stale local venv after a version bump fails here, loudly, instead of
+    # the handshake silently disagreeing with the release being cut.
+    assert importlib.metadata.version("cost-guard-mcp") == _pyproject()["project"]["version"]
+
+
 def test_server_json_package_points_at_this_pypi_project():
     package = _server_json()["packages"][0]
     assert package["registryType"] == "pypi"
@@ -1230,6 +1239,22 @@ def test_registry_publish_retries_only_the_registrys_transient_pypi_errors():
         )
     for message in _REGISTRY_FINAL_ERRORS:
         assert not pattern.search(message), f"final registry error would be retried: {message!r}"
+
+
+def test_registry_publish_retry_budget_is_eight_attempts_30s_apart():
+    # #111 item 3: the first real run (v0.5.0, run 38774814418) used 2 of the original 5
+    # attempts waiting ~60-70 s for the registry's PyPI view to catch up with pypi.org; 8 x 30 s
+    # leaves headroom for a slower day while the designed worst case (PyPI poll 13.3 min, this
+    # loop 4 min, read-back 2.5 min) stays under the job's 30-minute timeout. The attempt text
+    # and the exhaustion message must say the same number as the loop.
+    script = _registry_step_script("Publish server.json to the MCP Registry")
+    assert "for attempt in $(seq 1 8); do" in script
+    assert "sleep 30" in script
+    assert 'echo "Attempt ${attempt}/8:' in script
+    assert "still failing after 8 attempts" in script
+    assert "seq 1 5" not in script
+    # No 30 s wait after the final attempt: the exhaustion message follows it directly.
+    assert 'if [ "$attempt" -lt 8 ]; then' in script
 
 
 @pytest.mark.parametrize(

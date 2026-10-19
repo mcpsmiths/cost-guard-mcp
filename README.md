@@ -243,8 +243,29 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
   - None of the above ever logs a credential, connection string, or raw (unredacted)
     warehouse-client exception message — the same `redact_secrets` + `present_remote_text`
     chain that produces what a tool caller sees is applied before anything is logged.
+  - The warehouse-client libraries' own loggers (`snowflake.connector`, `databricks`,
+    `databricks.sql`, `databricks.sdk`, `google`, `urllib3`, `httpx`, `httpcore`) are pinned
+    to WARNING when the server module is imported (before any backend call): their per-connection and per-request INFO chatter — the
+    volume an embedded credential would hide in — never reaches stderr, while their WARNING
+    and ERROR records (the ones that carry an exception's text) still do. The project's own
+    loggers are not touched by this pin. Two Google-library mechanisms interact with it:
+    google-auth leaves propagation on for a `google` logger that already has a level, so
+    `google.*` WARNING and ERROR records now reach stderr (through the filter below) where
+    google-auth would otherwise have cut them off at the `google` logger; and the Google
+    client libraries' opt-in `GOOGLE_SDK_PYTHON_LOGGING_SCOPE` gives the named `google.*`
+    logger its own DEBUG stderr handler with propagation off — outside both the pin and the
+    filter — so do not set it for this server.
+  - Defence in depth behind both of the above: every record that reaches the stderr handler,
+    whichever logger produced it (this project's, the `mcp` SDK's or a client library's), has
+    its message, its exception traceback (`exc_info=True` / `logger.exception`) and its stack
+    text rendered once and passed through the same `redact_secrets` by a filter on that
+    handler before any of it is written. The filter never drops a record and never raises; a
+    record whose format string or traceback cannot be rendered is written as
+    `<log record withheld: message could not be rendered>`, traceback and stack text withheld
+    with it, instead of the standard library's raw `msg`/`args` error dump.
   - The `mcp` SDK writes its own records to the same stderr, and this project's one-line
-    rule does not shape them. Every tool error this project raises is followed by the SDK's
+    rule does not shape them (the redacting filter above does apply to them). Every tool
+    error this project raises is followed by the SDK's
     `Tool '<name>' failed: '<text>'` INFO record (the SDK `repr()`s the text, so it stays
     on one line, but it duplicates what the caller received); a call whose arguments
     pydantic rejects logs `Tool '<name>' rejected arguments: ['sql']` and nothing else — the
