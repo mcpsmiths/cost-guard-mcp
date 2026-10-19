@@ -334,11 +334,11 @@ async def run_query_bounded(
     is capped at 8 MiB (8388608 bytes of compact JSON): over that, the largest prefix of whole
     rows that fits is returned with reason "result_size_exceeded". A single SELECT/WITH/VALUES
     statement is executed inside SELECT * FROM (...) LIMIT max_rows + 1, so it must be valid
-    as a derived table - on BigQuery, output columns that share a name must be given distinct
-    aliases; other admitted statements run unwrapped and the fetch stops at the cap. On an ok
-    result, hint is null unless the server replaced nested result values deeper than 64 levels
-    with the placeholder "<nested value omitted: deeper than 64 levels>" (hint then says how
-    many cells); status is the only refusal indicator.
+    as a derived table; a WITH RECURSIVE statement (BigQuery allows it only at the top level),
+    SHOW/DESCRIBE/EXPLAIN and other admitted statements run unwrapped and the fetch stops at
+    the cap. On an ok result, hint is null unless the server replaced nested result values
+    deeper than 64 levels with the placeholder "<nested value omitted: deeper than 64 levels>"
+    (hint then says how many cells); status is the only refusal indicator.
 
     warehouse_size/edition (see estimate_query_cost) can only raise the estimate that
     max_estimated_cost_usd is checked against - it is priced at the observed warehouse, never

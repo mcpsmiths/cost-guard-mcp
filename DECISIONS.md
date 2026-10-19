@@ -1020,13 +1020,14 @@ believing nothing had been spent. Owner decisions 2026-10-15; held for 0.6.0.
   serialised rows, not the process memory and post-billing CPU they cost (Consequences), and the
   operator should see when a caller reaches for millions of rows.
 - *LIMIT wrap rule.* `sql_scope_keywords.is_single_query_statement`: the text is exactly one
-  statement (`sql_scope.is_single_statement`, the gate's scanner, never raising) and its main
-  keyword - resolved through any CTE list by the read gate's own walker - is `SELECT` or `VALUES`.
-  Only then does the engine enclose it in `SELECT * FROM (...) AS cost_guard_row_cap LIMIT
-  max_rows + 1`; `SHOW`/`DESCRIBE`/`DESC`/`EXPLAIN` (Databricks), opt-out scripts and
-  `WITH ... INSERT` (Spark allows it; the write opt-out skips the gate) run unwrapped and are capped
-  by the paged fetch. This keeps the documented opt-out configurations working now that a row cap
-  always applies, and an explicit `max_rows` on those statements now works instead of failing at the
+  statement (`sql_scope.is_single_statement`, the gate's scanner, never raising), its main
+  keyword - resolved through any CTE list by the read gate's own walker - is `SELECT` or `VALUES`,
+  and its own `WITH` is not `WITH RECURSIVE` (amendment of 2026-10-19 below). Only then does the
+  engine enclose it in `SELECT * FROM (...) AS cost_guard_row_cap LIMIT max_rows + 1`; a recursive
+  CTE, `SHOW`/`DESCRIBE`/`DESC`/`EXPLAIN` (Databricks), opt-out scripts and `WITH ... INSERT`
+  (Spark allows it; the write opt-out skips the gate) run unwrapped and are capped by the paged
+  fetch. This keeps the documented opt-out configurations working now that a row cap always
+  applies, and an explicit `max_rows` on those statements now works instead of failing at the
   provider. Decided once in the tool, with the gates' lexer, so the engines cannot drift.
 - *Fetch under the watchdog.* A monotonic deadline is armed at submission (`execute_async` on
   Snowflake, before `thread.start()` on Databricks) and checked only before a page request that
@@ -1064,16 +1065,14 @@ no live Databricks job exists to verify `resultRowLimit` semantics, and an unver
 the billable path with no gate catching a regression is the wrong risk; owner follow-up.
 
 **Consequences:** behaviour change for callers relying on unlimited rows (pass an explicit
-`max_rows`; no opt-out from the byte cap). The wrapped statement must be valid as a derived table:
-BigQuery accepts duplicate output column names at the top level (the dry run prices the unwrapped
-text and passes) but rejects them inside the wrap - `Duplicate column names in the result are not
-supported`, a compile-time failure, nothing billed - so such queries must alias their columns; the
-README, the tool description and a live integration case
-(`tests/integration/test_bigquery_live.py`) record it. Two further live cases there pin provider
-facts the fix-up review flagged as unverified at merge time: whether BigQuery accepts
-`WITH RECURSIVE` inside the wrap, and whether an inner `ORDER BY` survives the outer
-`LIMIT max_rows + 1` (if not, the tool description gains "put the LIMIT inside your query when
-order matters"). `SHOW`/`DESCRIBE`/scripts gain a working row
+`max_rows`; no opt-out from the byte cap). The wrapped statement must be valid as a derived table;
+the README and the tool description say so, and the live cases in
+`tests/integration/test_bigquery_live.py` pin what BigQuery does with the wrapped form. The first
+live run answered two of the three questions the fix-up review had flagged as unverified at merge
+time (amendment of 2026-10-19 below): a recursive CTE is refused inside the wrap and now runs
+unwrapped, and a duplicate output column name is accepted. The third case pins whether an inner
+`ORDER BY` survives the outer `LIMIT max_rows + 1` (if not, the tool description gains "put the
+LIMIT inside your query when order matters"). `SHOW`/`DESCRIBE`/scripts gain a working row
 cap. The `tools/list` diff is exactly: `+ "result_size_exceeded"` in
 `outputSchema.$defs.RefusalReason.enum`, the new `executed` property, `required` becomes
 `["status", "executed"]`, and the description text; the inputSchema and the other three tools are
@@ -1104,6 +1103,36 @@ multiple of 500 rows) still pays the check before its end-of-result probe, since
 tell it from a result with more pages. `tests/unit/test_result_bounds.py`'s property test is the
 guard on the estimator; the hit-on-size-stop rule is the fail-closed fallback behind it. Ships in 0.6.0
 (additive schema; a default change on a 0.x line that already moved defaults in 0.5.0).
+
+**Amended 2026-10-19 (#124): a recursive CTE runs unwrapped; the BigQuery duplicate-column remedy
+is withdrawn.** The 0.6.0 pre-tag live gate (`integration.yml` run 39275182240 on `main` 36151ad)
+answered two of the provider questions above, before the tag. (1) `run_query_bounded("bigquery",
+"WITH RECURSIVE t AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM t WHERE n < 5) SELECT n FROM t")`
+dispatched `SELECT * FROM (WITH RECURSIVE ...) AS cost_guard_row_cap LIMIT 1001` and BigQuery
+refused it at compile time, nothing billed: `400 WITH RECURSIVE is only allowed at the top level of
+the SELECT, CREATE TABLE AS SELECT, CREATE VIEW, INSERT, EXPORT DATA statements. (reason:
+invalidQuery)`. In 0.5.0 the same text ran unwrapped and was capped by the fetch; the #94 fix-up's
+`_main_keyword_after_ctes` skips the `RECURSIVE` word, so `is_single_query_statement` admitted the
+statement to the wrap. The rule now: `is_single_query_statement` answers "may the engine enclose
+this text in the wrap?" and is False when the statement's own `WITH` - the first keyword after
+whitespace, comments and opening parentheses, in any case - is followed by `RECURSIVE`. The tool
+then passes `wrap_in_limit=False`, all three engines dispatch the text unchanged, and the paged
+fetch (the `max_rows + 1` sentinel -> `row_cap_exceeded`, `executed: true`) and the 8 MiB cap
+remain the bounds - exactly as for `SHOW`, scripts and `WITH ... INSERT`. Only the outermost
+`WITH` counts (a recursive CTE nested inside a CTE body is the warehouse's to accept or refuse,
+wrapped or not), and a CTE merely named `recursive_t` is an ordinary `WITH`. The read gate
+(`assert_read_statement`) is untouched: `WITH RECURSIVE ... SELECT` is still admitted and
+`WITH RECURSIVE ... INSERT` is still refused as a write. Unit tests pin the truth table, the text
+each engine dispatches (through SDK-level fakes) and the 1,500 -> 1,000-row truncation of an
+unwrapped recursive result; the live case now asserts the unwrapped run. (2) `SELECT * FROM
+(SELECT 1 AS a, 2 AS a) AS cost_guard_row_cap LIMIT 1001` was accepted: the live case expecting
+`Duplicate column names in the result are not supported` reported DID NOT RAISE, and the returned
+column names were not observed. The remedy "BigQuery rejects duplicate output column names inside
+the wrap - alias them" was therefore an unsupported provider claim; it is withdrawn from the
+README, the tool description and the 0.6.0 release notes, which now state only what holds: the
+wrapped statement must be valid as a derived table. That live case is now a pin of the observed
+behaviour (`status: ok`, one row, `executed: true`) whose assertion messages print the rows, so
+the next live run records the column names BigQuery returns for the wrapped form.
 
 ## 22. BigQuery estimates without a usable byte figure produce no dollar figure, so a dollar cap refuses
 
