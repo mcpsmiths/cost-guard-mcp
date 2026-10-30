@@ -6,6 +6,17 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+### Security
+
+- Dependency relock: `uv.lock` moves `certifi` 2026.7.22 -> 2026.10.23 (PYSEC-2026-4320),
+  `filelock` 3.32.6 -> 4.2.4 (thirteen CVE-2026-1129xx advisories) and `oauthlib` 3.3.1 -> 4.0.0
+  (PYSEC-2026-4114, PYSEC-2026-4113, CVE-2026-49272), together with the two connectors that gate
+  them: `snowflake-connector-python` 4.8.0 -> 4.8.1 (4.8.0 capped `filelock<4`; still below the
+  `<5` cap of `DECISIONS.md` #23) and `databricks-sql-connector` 4.6.0 -> 4.8.0
+  (4.6.0 capped `oauthlib<4.0.0`). `pip-audit` over the exported lock now reports nothing, so
+  both `--ignore-vuln` flags and their re-check date are gone from `audit.yml`, and a test fails
+  if an ignore comes back unreviewed. No `pyproject.toml` range changed.
+
 ## [0.6.0] - 2026-10-19
 
 The follow-up release to 0.5.0 (#110, #112, #114, #120). **Behaviour changes:**
