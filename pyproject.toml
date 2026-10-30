@@ -70,6 +70,7 @@ packages = ["src/cost_guard_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests/unit"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 
 [tool.ruff]
 line-length = 100
