@@ -1280,3 +1280,40 @@ def test_registry_tag_input_validation(tmp_path, tag, expected_exit):
         scratch=tmp_path,
     )
     assert completed.returncode == expected_exit, completed.stdout + completed.stderr
+
+
+# --- audit-workflow-suppresses-nothing:.github/workflows/audit.yml -----------------------------
+
+AUDIT_WORKFLOW_PATH = WORKFLOWS_DIR / "audit.yml"
+
+
+def _audit_workflow_code_lines() -> list[str]:
+    # Comment-only lines carry the rationale and legitimately mention pip-audit and
+    # --ignore-vuln; everything else is what the runner executes.
+    return [
+        line
+        for line in AUDIT_WORKFLOW_PATH.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def test_audit_workflow_runs_a_pinned_pip_audit_without_any_ignore():
+    # The weekly dependency scan is only worth reading while it can fail: a suppressed
+    # advisory stops being visible the day it is accepted. The oauthlib acceptances were
+    # retired once the lock reached oauthlib 4.0.0 (databricks-sql-connector 4.8.0 allows it).
+    # The pip-audit step must be exactly the one-line, unconditional invocation below, so a
+    # `--ignore-vuln` on a continuation line, a `|| true`, an `if:` or `continue-on-error`
+    # cannot come back through an unreviewed edit: a deliberate change has to change this
+    # test in the same diff, with its justification in the review.
+    code = _audit_workflow_code_lines()
+    steps = _step_blocks("\n".join(code), "pip-audit@")
+    assert len(steps) == 1, f"expected exactly one pip-audit step, found {steps!r}"
+    (step,) = steps
+    assert [line.strip() for line in step] == [
+        "- run: uvx pip-audit@2.10.1 --requirement requirements.txt"
+    ], f"the pip-audit step is not the plain pinned invocation: {step!r}"
+    for token in ("--ignore-vuln", "--ignore", "||", "continue-on-error", "PIP_AUDIT"):
+        offenders = [line.strip() for line in code if token in line]
+        assert not offenders, (
+            f"audit.yml carries {token!r}, which can suppress a finding: {offenders!r}"
+        )

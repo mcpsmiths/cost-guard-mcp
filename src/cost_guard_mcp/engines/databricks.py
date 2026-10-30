@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 # Every connector/SDK round-trip is bounded explicitly. The libraries' own defaults are
 # finite but far too long to leave implicit against the documented 120 s tool-call bound
 # (same discipline as snowflake.py's _NETWORK_TIMEOUT_SECONDS). Defaults being overridden,
-# confirmed against the installed databricks-sql-connector 4.6.0 / databricks-sdk 0.148.0:
+# confirmed against the locked databricks-sql-connector 4.8.0 / databricks-sdk 0.148.0:
 #   - connector _socket_timeout: 900 s on the Thrift backend used here.
 #   - connector retry policy (_retry_stop_after_attempts_duration / _count): 900 s / 30
 #     attempts, read from the connect kwargs. It exists to ride out a classic/pro
@@ -56,6 +56,14 @@ logger = logging.getLogger(__name__)
 # Deliberately do NOT pass use_kernel=True: the newer Rust "kernel" backend rejects a
 # generic credentials_provider (OAuth M2M) with NotSupportedError. The default (legacy
 # Thrift) backend used here supports both PAT and OAuth M2M.
+# Reyden / Real-Time warehouses (connector >= 4.8.0): Connection._open_session_with_reyden_
+# fallback re-opens a Thrift OpenSession that such a warehouse rejects
+# (ReydenThriftUnsupportedError) on the kernel backend, and remembers the warehouse. The
+# databricks-sql-kernel extra is not in the lock, so there that retry fails with a kernel
+# ImportError instead of using the bounded Thrift path; it surfaces like any other connect
+# error (check_credentials reports ok=false, the estimate falls back). use_sea=False / use_kernel=False cannot pin Thrift:
+# the fallback only skips an explicitly truthy backend choice. Not exercised against a live
+# Reyden warehouse (none available here); run the Databricks live check before the next tag.
 _SOCKET_TIMEOUT_SECONDS = 60
 # Ceiling for every connector/SDK retry budget and the STATEMENT_TIMEOUT of read-only
 # sessions (check_credentials, explain_estimate).
