@@ -1280,3 +1280,26 @@ def test_registry_tag_input_validation(tmp_path, tag, expected_exit):
         scratch=tmp_path,
     )
     assert completed.returncode == expected_exit, completed.stdout + completed.stderr
+
+
+# --- audit-workflow-suppresses-nothing:.github/workflows/audit.yml -----------------------------
+
+AUDIT_WORKFLOW_PATH = WORKFLOWS_DIR / "audit.yml"
+
+
+def test_audit_workflow_runs_a_pinned_pip_audit_without_any_ignore():
+    # The weekly dependency scan is only worth reading while it can fail: a suppressed
+    # advisory stops being visible the day it is accepted. The oauthlib acceptances were
+    # retired once the lock reached oauthlib 4.0.0 (databricks-sql-connector 4.8.0 allows it),
+    # so no `--ignore-vuln` may come back through an unreviewed edit - a new ignore has to
+    # change this test in the same diff, with its justification in the review.
+    run_lines = [
+        line.strip()
+        for line in AUDIT_WORKFLOW_PATH.read_text(encoding="utf-8").splitlines()
+        if not line.lstrip().startswith("#") and "pip-audit@" in line
+    ]
+    assert len(run_lines) == 1, f"expected exactly one pip-audit invocation, found {run_lines!r}"
+    (invocation,) = run_lines
+    assert "uvx pip-audit@2.10.1 " in invocation, f"pip-audit is not pinned: {invocation!r}"
+    assert "--requirement requirements.txt" in invocation, invocation
+    assert "--ignore-vuln" not in invocation, f"audit.yml suppresses an advisory: {invocation!r}"

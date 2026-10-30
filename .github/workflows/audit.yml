@@ -25,16 +25,10 @@ jobs:
         with:
           version: "0.12.23"
       - run: uv export --no-hashes --format requirements-txt -o requirements.txt
-      # PYSEC-2026-4114 (CVE-2026-49265) and PYSEC-2026-4113 (CVE-2026-49264), both
-      # oauthlib <4.0.0: a PKCE code_verifier timing attack and a JSONP callback
-      # injection in RevocationEndpoint - both on the OAuth *authorization-server* side.
-      # This project is only an OAuth client (Databricks M2M via databricks-sdk) and
-      # never executes oauthlib's server endpoints; the fix,
-      # oauthlib 4.0.0, is pinned out by databricks-sql-connector (oauthlib<4.0.0 through
-      # its current 4.6.0), so no lock bump can reach it. Accepted 2026-10-10 so this
-      # check stays meaningful for the next real advisory. Re-check by 2026-12-01: drop the
-      # ignores as soon as databricks-sql-connector allows oauthlib>=4 (uv lock
-      # --upgrade-package oauthlib will then move it), or re-justify here. 4113 is
-      # listed pre-emptively: Scorecard's OSV check already reports it, pip-audit's
-      # PyPI feed had not picked it up yet on 2026-10-10.
-      - run: uvx pip-audit@2.10.1 --requirement requirements.txt --ignore-vuln PYSEC-2026-4114 --ignore-vuln PYSEC-2026-4113
+      # No --ignore-vuln flag: every advisory pip-audit reports is a finding to fix by
+      # relocking (uv lock --upgrade-package <name>) or to justify in the PR that adds an
+      # ignore. The oauthlib acceptances (PYSEC-2026-4114 / -4113, an authorization-server
+      # path this OAuth client never runs) were retired when the lock moved to oauthlib 4.0.0
+      # via databricks-sql-connector 4.8.0. tests/unit/test_release_metadata.py fails if an
+      # ignore comes back without changing that test.
+      - run: uvx pip-audit@2.10.1 --requirement requirements.txt
