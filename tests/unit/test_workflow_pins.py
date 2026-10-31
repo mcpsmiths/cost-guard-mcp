@@ -12,6 +12,7 @@ line, as in ``test_release_metadata.py``.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import NamedTuple
@@ -134,3 +135,110 @@ def test_lockstep_check_rejects_a_tag_ref_and_a_missing_version_comment():
 def test_lockstep_scan_ignores_commented_out_steps():
     texts = {"synthetic.yml": f"      # - uses: github/codeql-action/init@{_NEW_PIN}\n"}
     assert _codeql_action_uses(texts) == []
+
+
+# --- .github/dependabot.yml: the three codeql-action bumps arrive as one grouped PR -------------
+
+DEPENDABOT_PATH = REPO_ROOT / ".github" / "dependabot.yml"
+CODEQL_GROUP_NAME = "codeql-action"
+CODEQL_GROUP_PATTERN = "github/codeql-action/*"
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _is_content(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and not stripped.startswith("#")
+
+
+def _update_block(dependabot_text: str, ecosystem: str) -> list[str]:
+    """The lines of the ``updates:`` entry whose ``package-ecosystem`` is ``ecosystem``."""
+    lines = dependabot_text.splitlines()
+    marker = re.compile(r"^\s*-\s+package-ecosystem:\s*[\"']?(?P<name>[\w-]+)[\"']?\s*(#.*)?$")
+    starts = [i for i, line in enumerate(lines) if marker.match(line)]
+    for position, start in enumerate(starts):
+        if marker.match(lines[start])["name"] == ecosystem:
+            end = starts[position + 1] if position + 1 < len(starts) else len(lines)
+            return lines[start:end]
+    raise AssertionError(f"no package-ecosystem: {ecosystem!r} entry in dependabot.yml")
+
+
+def _group_patterns(block: list[str]) -> dict[str, list[str]]:
+    """``{group name: patterns}`` of an update entry's ``groups:`` mapping (no PyYAML here)."""
+    groups: dict[str, list[str]] = {}
+    start = next((i for i, line in enumerate(block) if line.strip() == "groups:"), None)
+    if start is None:
+        return groups
+    groups_indent = _indent_of(block[start])
+    name: str | None = None
+    collecting_list = False
+    for line in block[start + 1 :]:
+        if not _is_content(line):
+            continue
+        indent, stripped = _indent_of(line), line.strip()
+        if indent <= groups_indent:
+            break
+        if indent == groups_indent + 2 and stripped.endswith(":"):
+            name = stripped.removesuffix(":").strip("\"'")
+            groups[name] = []
+            collecting_list = False
+        elif name is not None and stripped.startswith("patterns:"):
+            inline = stripped.removeprefix("patterns:").strip()
+            collecting_list = not inline
+            if inline:
+                groups[name] = list(ast.literal_eval(inline.split("#")[0].strip()))
+        elif name is not None and collecting_list and stripped.startswith("- "):
+            groups[name].append(stripped.removeprefix("- ").split("#")[0].strip().strip("\"'"))
+    return groups
+
+
+def test_dependabot_groups_the_codeql_action_steps_into_one_pr():
+    block = _update_block(DEPENDABOT_PATH.read_text(encoding="utf-8"), "github-actions")
+    patterns = _group_patterns(block).get(CODEQL_GROUP_NAME)
+    assert patterns == [CODEQL_GROUP_PATTERN], (
+        f"the github-actions entry of {DEPENDABOT_PATH.name} needs a {CODEQL_GROUP_NAME!r} group "
+        f"with patterns [{CODEQL_GROUP_PATTERN!r}] so init, analyze and upload-sarif bump in "
+        f"one PR (found groups: {_group_patterns(block)})"
+    )
+
+
+def test_group_parser_reads_inline_and_block_pattern_lists():
+    text = (
+        "updates:\n"
+        '  - package-ecosystem: "pip"\n'
+        "    groups:\n"
+        "      other:\n"
+        '        patterns: ["*"]\n'
+        '  - package-ecosystem: "github-actions"\n'
+        "    schedule:\n"
+        '      interval: "weekly"\n'
+        "    groups:\n"
+        "      codeql-action:\n"
+        "        patterns:\n"
+        '          - "github/codeql-action/*"  # comment\n'
+        "      inline:\n"
+        "        patterns: ['a/*', 'b/*']\n"
+        '  - package-ecosystem: "docker"\n'
+    )
+    assert _group_patterns(_update_block(text, "github-actions")) == {
+        "codeql-action": ["github/codeql-action/*"],
+        "inline": ["a/*", "b/*"],
+    }
+    assert _group_patterns(_update_block(text, "docker")) == {}
+
+
+def test_group_check_fails_when_the_github_actions_entry_has_no_group():
+    text = (
+        "updates:\n"
+        '  - package-ecosystem: "github-actions"\n'
+        "    schedule:\n"
+        '      interval: "weekly"\n'
+        '  - package-ecosystem: "pip"\n'
+        "    groups:\n"
+        f"      {CODEQL_GROUP_NAME}:\n"
+        f'        patterns: ["{CODEQL_GROUP_PATTERN}"]\n'
+    )
+    # The group exists, but on the pip entry: it must not be credited to github-actions.
+    assert CODEQL_GROUP_NAME not in _group_patterns(_update_block(text, "github-actions"))
