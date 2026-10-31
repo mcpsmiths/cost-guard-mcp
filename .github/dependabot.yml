@@ -17,6 +17,12 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # init and analyze (codeql.yml) must run the same release and upload-sarif (scorecard.yml)
+    # is versioned with them, so they bump in one PR; tests/unit/test_workflow_pins.py holds
+    # both this group and the lockstep. Every other action stays one PR each.
+    groups:
+      codeql-action:
+        patterns: ["github/codeql-action/*"]
 
   - package-ecosystem: "docker"
     directory: "/"
