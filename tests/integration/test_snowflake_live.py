@@ -1,8 +1,10 @@
-"""Live integration tests against a real Snowflake trial account.
+"""Live integration tests against a real Snowflake account.
 
 Requires SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, SNOWFLAKE_ROLE, and either
-SNOWFLAKE_PRIVATE_KEY_PATH or SNOWFLAKE_PASSWORD. Hard-fails if unset — this tier runs
-only via workflow_dispatch/scheduled CI.
+SNOWFLAKE_PRIVATE_KEY_PATH or SNOWFLAKE_PASSWORD. Hard-fails if unset. In CI this tier runs
+only when integration.yml is dispatched with include_snowflake=true (opt-in since 2026-10-31:
+the free trial ended and there is no paid account for now, DECISIONS.md #9); it is not part of
+the weekly schedule.
 """
 
 import os

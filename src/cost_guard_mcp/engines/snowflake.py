@@ -495,7 +495,10 @@ def _show_warehouse_row(
     (6X-Large) plus "compute_wh" (X-Small), got two matches -> None, and the 6X-Large query
     ran under a cap priced at X-Small. `generation` is a real SHOW WAREHOUSES column
     (behavior-change bundle 2025_07/bcr-2110, "currently either 1 or 2"); the `size`/`type`
-    text shapes are pinned by tests/integration/test_snowflake_live.py.
+    text shapes were observed once by hand on a trial account (2026-09-18, 0.3.x code).
+    The live test that is meant to check them (in tests/integration/test_snowflake_live.py) was
+    added in 0.4.0 and has never passed; the live file is opt-in (DECISIONS.md #9), so the unit
+    tests against a recording fake connector are the only routine coverage.
 
     SHOW WAREHOUSES, CURRENT_WAREHOUSE() and CURRENT_REGION() are all ordinary, non-privileged
     SQL - no ACCOUNTADMIN or elevated grant is required (AGENTS.md / DECISIONS.md #7).
