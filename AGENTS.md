@@ -6,9 +6,10 @@ Instructions for AI coding agents working in this repository.
 
 `cost-guard-mcp` is a Python MCP server: four tools (`check_credentials`,
 `describe_engine_capabilities`, `estimate_query_cost`, `run_query_bounded`) that give an AI
-agent a pre-flight query-cost and result-size estimate for BigQuery and Snowflake before a
-query actually runs (`tests/unit/test_agents_md.py` holds this sentence and the registered
-tool set in lockstep). Local stdio transport only, built on the official `mcp` SDK v2. See
+agent a pre-flight query-cost and result-size estimate for BigQuery, Snowflake and Databricks
+before a query actually runs (`tests/unit/test_agents_md.py` holds this sentence and the
+registered tool set in lockstep; `tests/unit/test_docs_claims.py` holds the engine list against
+the `Engine` literal). Local stdio transport only, built on the official `mcp` SDK v2. See
 `ARCHITECTURE.md` for the component/data-flow map and `DECISIONS.md` for why the design
 looks the way it does.
 
@@ -86,9 +87,9 @@ Use `uv` only. Never `pip install` directly into this project — dependencies g
 - Coverage floor is 80%, enforced by CI (`--cov-fail-under=80`) — a PR that drops below
   it fails the `tests` workflow, not just a local lint nag.
 - Every bug fix needs a regression test added in the same commit, not deferred.
-- Mock the warehouse client libraries (`google.cloud.bigquery`, `snowflake.connector`) in
-  `tests/unit/` — never make real network calls there. Real-account behavior belongs in
-  `tests/integration/` only.
+- Mock the warehouse client libraries (`google.cloud.bigquery`, `snowflake.connector`,
+  `databricks.sql`) in `tests/unit/` — never make real network calls there. Real-account
+  behavior belongs in `tests/integration/` only.
 
 ## Conventions specific to this project
 
