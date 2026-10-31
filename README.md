@@ -286,12 +286,22 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
   `http://localhost:4317`) to turn it on: at that point `cost-guard-mcp` constructs a
   `TracerProvider` with a gRPC OTLP exporter pointed at that endpoint and registers it as
   the global tracer provider before the server starts running. Leave the env var unset and
-  nothing changes — no exporter is constructed, and the two extra dependencies below never
-  need to be installed. Requires the `otel` extra:
+  nothing changes — no exporter is constructed, and the two packages below never need to
+  be installed. They are the `otel` *dependency group* in `pyproject.toml`, not a published
+  extra (the wheel defines no optional dependencies), so how you get them depends on how you
+  run the server:
   ```bash
-  uv sync --extra otel
-  # or: pip install "cost-guard-mcp[otel]"
+  # From a source checkout:
+  uv sync --group otel
+
+  # From PyPI: install the group's two packages (>=1.27.0) next to cost-guard-mcp
+  pip install cost-guard-mcp opentelemetry-sdk opentelemetry-exporter-otlp-proto-grpc
+  # or, for a uvx launch (put the same --with flags in the "args" of your client config):
+  uvx --with opentelemetry-sdk --with opentelemetry-exporter-otlp-proto-grpc cost-guard-mcp
   ```
+  The two imports happen only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, so setting it
+  without the packages installed makes the server exit at startup with a
+  `ModuleNotFoundError` instead of serving.
 
 ## Known limitations
 
