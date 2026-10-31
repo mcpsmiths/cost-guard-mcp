@@ -2,6 +2,11 @@
 name: integration
 on:
   workflow_dispatch:
+    inputs:
+      include_snowflake:
+        description: "Also run the Snowflake live job (needs a paid Snowflake account in live-integration)"
+        type: boolean
+        default: false
   schedule:
     - cron: "0 6 * * 1"  # weekly, Monday 06:00 UTC
 permissions:
@@ -28,6 +33,9 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: /tmp/bq-sa.json
           BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT }}
   snowflake:
+    # Opt-in: the Snowflake free trial ended and there is no paid plan for now (DECISIONS.md #9),
+    # so neither the weekly schedule nor a bare dispatch runs this job.
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.include_snowflake }}
     runs-on: ubuntu-latest
     environment: live-integration
     steps:
