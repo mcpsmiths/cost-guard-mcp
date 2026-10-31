@@ -12,14 +12,28 @@ fourth shipped and listed two engines, and AGENTS.md's overview named two engine
 
 import re
 import tomllib
+import typing
 from pathlib import Path
 
 import pytest
 
+from cost_guard_mcp.types import Engine
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
+PACKAGE_DIR = REPO_ROOT / "src" / "cost_guard_mcp"
+ENGINES_DIR = PACKAGE_DIR / "engines"
 README_MD = REPO_ROOT / "README.md"
+AGENTS_MD = REPO_ROOT / "AGENTS.md"
 # CHANGELOG.md is the historical record: it may name things that no longer exist.
 ROOT_DOCS = sorted(path for path in REPO_ROOT.glob("*.md") if path.name != "CHANGELOG.md")
+ENGINES: tuple[str, ...] = typing.get_args(Engine)
+# Adding an engine to the `Engine` literal fails here until the name is spelled out, which is
+# the moment the docs need the new engine too.
+ENGINE_DISPLAY_NAMES = {
+    "bigquery": "BigQuery",
+    "snowflake": "Snowflake",
+    "databricks": "Databricks",
+}
 
 
 def _read(path: Path) -> str:
@@ -28,6 +42,10 @@ def _read(path: Path) -> str:
 
 def _pyproject() -> dict:
     return tomllib.loads(_read(REPO_ROOT / "pyproject.toml"))
+
+
+def _section(text: str, start: str, end: str) -> str:
+    return text[text.index(start) : text.index(end, text.index(start))]
 
 
 def _requirement_name(requirement: str) -> str:
@@ -62,3 +80,34 @@ def test_readme_dependency_groups_are_defined_and_otel_packages_are_named():
     assert "otel" in used, "README must show how to opt in to the otel dependency group"
     for requirement in groups["otel"]:
         assert _requirement_name(requirement) in readme, requirement
+
+
+def test_every_engine_has_a_module_and_no_unexplained_module_sits_beside_them():
+    stems = {path.stem for path in ENGINES_DIR.glob("*.py") if path.stem != "__init__"}
+    assert set(ENGINES) <= stems, f"engines/ lacks a module for {sorted(set(ENGINES) - stems)}"
+    # A helper is named after its engine (bigquery_estimate_rules); anything else is a new
+    # engine that the `Engine` literal, and so the docs, do not know yet.
+    unexplained = {
+        stem
+        for stem in stems
+        if stem not in ENGINES and not any(stem.startswith(f"{engine}_") for engine in ENGINES)
+    }
+    assert not unexplained, f"engines/ modules that are not in the Engine literal: {unexplained}"
+
+
+def _agents_overview() -> str:
+    text = _read(AGENTS_MD)
+    return " ".join(_section(text, "## Project overview", "## Setup").split())
+
+
+def _readme_pitch() -> str:
+    # The one-sentence description under the badges, before "## Why".
+    text = _read(README_MD)
+    return " ".join(_section(text, "Pre-flight query cost", "## Why").split())
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_agents_and_readme_overviews_name_every_engine(engine: str):
+    name = ENGINE_DISPLAY_NAMES[engine]
+    assert name in _agents_overview(), f"AGENTS.md project overview does not name {name}"
+    assert name in _readme_pitch(), f"README description does not name {name}"
