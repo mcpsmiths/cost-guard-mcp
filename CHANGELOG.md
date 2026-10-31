@@ -6,6 +6,16 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
 
 ## [Unreleased]
 
+### Changed
+
+- CI and docs: the `integration.yml` Snowflake live job is now opt-in (dispatch input `include_snowflake`,
+  default `false`), so the weekly run exercises BigQuery only. The Snowflake free trial ended and
+  there is no paid account for now; the `SNOWFLAKE_*` environment secrets are left in place but
+  unused. README, AGENTS.md and `DECISIONS.md` (#9, #19, #20, #23) no longer say a weekly live run pins
+  the Snowflake behaviour: the last green Snowflake run (2026-10-12) covers 0.3.3 code, and no
+  Snowflake change from 0.4.0 onward has run live. Databricks has no live job. Restoring the gate needs
+  a paid Snowflake account (`DECISIONS.md` #9, issue #100).
+
 ### Security
 
 - Dependency relock: `uv.lock` moves `certifi` 2026.7.22 -> 2026.10.23 (PYSEC-2026-4320),

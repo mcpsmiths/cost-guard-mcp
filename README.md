@@ -343,10 +343,15 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
   current warehouse), the estimate falls back to the caller-asserted size at Gen1 rates with
   an explicit caveat rather than erroring — since Gen2 is now the default for new standard
   warehouses in most regions, an undetectable generation means the real cost may be higher
-  than this estimate. Live-verified 2026-09-18 against a real trial account: its default
-  warehouse (`COMPUTE_WH`) is genuinely Gen2 on AWS, and the detection applied the Gen2 rate;
-  the `SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution are pinned
-  by `tests/integration/test_snowflake_live.py` (run weekly and on demand by `integration.yml`). The same row's
+  than this estimate. Observed once on 2026-09-18, on a Snowflake trial account and 0.3.x code
+  (a manual owner check, not reproducible from CI): its default warehouse (`COMPUTE_WH`) was
+  Gen2 on AWS and the detection applied the Gen2 rate. The Snowflake free trial has ended and
+  there is no paid Snowflake account behind CI for now, so the live Snowflake tests in
+  `tests/integration/test_snowflake_live.py` are not part of the weekly run (they run only when
+  `integration.yml` is dispatched with `include_snowflake=true`, which needs a paid account); the
+  last green Snowflake run (2026-10-12) covers 0.3.3 code, and no Snowflake change since 0.4.0 has
+  run live. The `SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution are
+  therefore covered by unit tests against a recording fake connector only. The same row's
   `state` and `auto_resume` columns drive the warehouse-state guard described below.
 - Snowflake's edition is operator configuration (`SNOWFLAKE_EDITION`, default `standard`),
   because the server cannot observe it without ORGADMIN; the per-call `edition` argument can

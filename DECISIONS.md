@@ -186,6 +186,19 @@ README's "Known limitations" - the `referencedRoutines` research question stays
 unresolved for exactly this reason). Any future addition to `integration.yml` needing
 broader access should get its own narrowly-scoped grant, not a widened role on this one.
 
+**Amended 2026-10-31: the Snowflake live job is opt-in.** The Snowflake free trial ended (error
+390913; first red run 2026-10-15) and the owner decided not to buy a paid plan for now, so a
+weekly Snowflake run could only fail. `integration.yml` gains a `workflow_dispatch` boolean input
+`include_snowflake` (default `false`); the `snowflake` job runs only for a dispatch that sets it,
+so the schedule and a bare dispatch run BigQuery only (`tests/unit/test_integration_workflow.py`
+pins this). The `SNOWFLAKE_*` environment secrets are left in place but unused (they point at the
+ended trial); nothing was deleted, and the job and environment stay so that restoring the gate is
+one input flip. Releases record the Snowflake gate as not run. Honest scope: Snowflake was never
+live-green on any 0.4.x-0.6.x code; the last green Snowflake run (38261487098, 2026-10-12, SHA
+84ec45ac) covers 0.3.3 code, and Databricks has no live job. Restoring needs a paid on-demand
+Snowflake account (estimated at under about $1 a month at the weekly cadence on a Standard-edition
+account with 60 s auto-suspend; an unmeasured estimate, see issue #100).
+
 ## 10. Release authority is bound to reviewed `main` history, not to whoever can push a tag
 
 **Context:** `release.yml` runs on any `refs/tags/v*` push, checks out the tag's commit, and
@@ -809,9 +822,11 @@ Gen2 rate when the generation is undeterminable stays a separate, open decision.
 **Consequences:** Classic/Pro and Snowpark-optimized deployments lose the dollar figure (omit
 the dollar cap to run there) — a breaking change released as 0.4.0. The
 `estimate_query_cost`/`run_query_bounded` descriptions changed (an intended, description-only
-`tools/list` diff). Release gates: `tests/integration/test_snowflake_live.py` pins the
-`SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution; a manual Databricks
-run must confirm `warehouses.get` succeeds with `CAN_USE` on the warehouse.
+`tools/list` diff). Release gates: `tests/integration/test_snowflake_live.py` is meant to pin the
+`SHOW WAREHOUSES` size/type text shape and `CURRENT_WAREHOUSE()` resolution (opt-in since
+2026-10-31, see #9; the test was added in 0.4.0 and has never passed: it failed at connect in
+every run since 2026-10-15); a manual Databricks run must confirm `warehouses.get` succeeds with `CAN_USE` on the
+warehouse.
 
 ## 20. Read-only tools do not wake a warehouse: fail closed on a non-running or unreadable state, opt in per engine
 
@@ -954,8 +969,10 @@ statements resumed W), next to the `_WarehouseFacts` docstring in `engines/snowf
 README. If a statement this decision leaves ungated resumes the warehouse, gate it (or, for
 `CURRENT_WAREHOUSE()`, resolve the session warehouse another way); if a gated one is proven
 free, un-gate it - both as a follow-up PR, each changing only the statement set, never the
-fail-closed default. `tests/integration/test_snowflake_live.py` already asserts the `state`
-column is present; a suspended-state shape test needs W.
+fail-closed default. `tests/integration/test_snowflake_live.py` contains an assertion that the
+`state` column is present, but that test was added in 0.4.0 and has never passed (it failed at
+connect, error 390913, in every run since 2026-10-15); it is opt-in now, see #9. A
+suspended-state shape test needs W.
 
 ## 21. `run_query_bounded` bounds its result by default: 1000 rows, 8 MiB serialised, and says whether the query ran
 
@@ -1273,7 +1290,8 @@ from 0.6.0, and a Dependabot `ignore` of the connector's semver-major updates so
 5.x line and the PyPI caution is gone; the login-time `secondary_roles` / `session_parameters` path
 and the unknown-kwarg handling are re-verified in 5.x source; the contract tests are rewritten for
 both layouts; the six `fetchone()` results in `engines/snowflake.py` are narrowed so `mypy` passes
-under both stubs; and the live Snowflake gate (#100) has run on 5.x. Alternatives rejected: making
+under both stubs; and the live Snowflake gate (#100) has run on 5.x (opt-in since 2026-10-31 and needing a paid
+account, see #9). Alternatives rejected: making
 0.6.0 compatible with 5.0.0 now (ships against a driver its vendor calls unstable, for a
 compatibility that cannot be live-tested in this programme); leaving the range open (fresh installs
 keep resolving the preview driver); a 0.5.1 hotfix carrying only the cap (two releases a few days

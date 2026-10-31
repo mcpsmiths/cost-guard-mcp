@@ -44,14 +44,15 @@ uv run pytest tests/integration/test_bigquery_live.py -v
 uv run pytest tests/integration/test_snowflake_live.py -v
 ```
 
-These also run in CI (`.github/workflows/integration.yml`) — weekly on a schedule, or
-on demand via `gh workflow run integration.yml` — against real accounts, using secrets
-configured in the `live-integration` GitHub Environment
-(`BIGQUERY_SA_KEY_JSON`/`BIGQUERY_PROJECT`, `SNOWFLAKE_ACCOUNT`/`USER`/`ROLE`/
-`PRIVATE_KEY`). No Databricks job exists there yet — only BigQuery and Snowflake. Not a
-required check; failures here don't block PRs, but a real one shouldn't be ignored. See
-`DECISIONS.md` for why real credentials live in a public repo's CI secrets and what
-scopes them down.
+The BigQuery live test also runs in CI (`.github/workflows/integration.yml`) — weekly on a
+schedule, or on demand via `gh workflow run integration.yml` — against a real account, using
+secrets configured in the `live-integration` GitHub Environment
+(`BIGQUERY_SA_KEY_JSON`/`BIGQUERY_PROJECT`). The Snowflake job runs only when dispatched with
+`include_snowflake=true` and needs a paid Snowflake account: the free trial ended and the
+`SNOWFLAKE_*` secrets still in that environment point at it, so they are unused (see
+`DECISIONS.md` #9, amended 2026-10-31). No Databricks job exists. Not a required check; a real
+BigQuery failure here doesn't block PRs but shouldn't be ignored. See `DECISIONS.md` for why
+real credentials live in a public repo's CI secrets and what scopes them down.
 
 ### Releasing
 
@@ -62,7 +63,9 @@ A release is a `v*` tag on reviewed `main` history (`DECISIONS.md` #10). In orde
    `tests/unit/test_release_metadata.py` must be green (it pins the version triple, the
    manifests and both release workflows).
 2. Live gates (owner, real credentials): `gh workflow run integration.yml --ref main` against
-   the merge commit, both jobs green, before tagging (`live-integration` admits `main` only).
+   the merge commit, the bigquery job green, before tagging (`live-integration` admits `main`
+   only). Record the Snowflake gate as "not run: no live account" in the release notes unless a
+   paid account has been configured and the dispatch used `-f include_snowflake=true`.
 3. Tag the merge commit (`git tag -a vX.Y.Z -m vX.Y.Z <sha> && git push origin vX.Y.Z`). Never
    push a test `v*` tag: any such push starts the release. `release.yml` then runs `build`
    (ancestry + version gates, then the hash-pinned backend install from
