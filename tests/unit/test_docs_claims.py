@@ -78,6 +78,18 @@ def test_docs_do_not_advertise_an_extra_pyproject_does_not_define(doc: Path):
     )
 
 
+def test_source_docstrings_do_not_call_a_dependency_group_an_extra():
+    # The docs test above only scans root *.md; the same untruth sat in a server.py docstring.
+    defined = set(_pyproject()["project"].get("optional-dependencies", {}))
+    offenders = sorted(
+        f"{path.relative_to(REPO_ROOT).as_posix()}: `{name}` extra"
+        for path in PACKAGE_DIR.rglob("*.py")
+        for name in re.findall(r"`([\w.-]+)` extra\b", _read(path))
+        if name not in defined
+    )
+    assert not offenders, f"source text names extras pyproject.toml does not define: {offenders}"
+
+
 def test_readme_dependency_groups_are_defined_and_otel_packages_are_named():
     readme = _read(README_MD)
     groups = _pyproject()["dependency-groups"]
