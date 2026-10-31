@@ -16,6 +16,14 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   (4.6.0 capped `oauthlib<4.0.0`). `pip-audit` over the exported lock now reports nothing, so
   both `--ignore-vuln` flags and their re-check date are gone from `audit.yml`, and a test fails
   if an ignore comes back unreviewed. No `pyproject.toml` range changed.
+- Dependency relock: `uv.lock` moves `pyasn1` 0.6.4 -> 0.6.5 (CVE-2026-119194, CVE-2026-119195,
+  CVE-2026-119196, CVE-2026-119197, all denial of service; published after the relock above).
+  `pyasn1` is transitive (`pyasn1-modules` under `google-auth`, which `google-cloud-bigquery*` and
+  `databricks-sdk` both pull in); it is installed, but nothing in `src/` or `tests/` imports it and
+  the server and engines do not load it. The only importer in this lock, `google.auth.crypt._python_rsa`,
+  needs the optional `rsa` package, which is not installed. This is lock hygiene and a clean audit
+  gate, not the mitigation of a live exposure. Only that one package moved; `audit.yml` still
+  carries no ignore.
 
 ## [0.6.0] - 2026-10-19
 
