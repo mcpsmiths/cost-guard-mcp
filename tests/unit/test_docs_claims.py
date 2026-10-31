@@ -10,6 +10,7 @@ that pyproject.toml never defined, ARCHITECTURE.md said the server registers 3 t
 fourth shipped and listed two engines, and AGENTS.md's overview named two engines.
 """
 
+import asyncio
 import re
 import tomllib
 import typing
@@ -17,15 +18,22 @@ from pathlib import Path
 
 import pytest
 
+from cost_guard_mcp.result_bounds import DEFAULT_MAX_ROWS, MAX_RESULT_BYTES
+from cost_guard_mcp.server import mcp
 from cost_guard_mcp.types import Engine
+
+from .test_agents_md import _NUMBER_WORDS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_DIR = REPO_ROOT / "src" / "cost_guard_mcp"
 ENGINES_DIR = PACKAGE_DIR / "engines"
 README_MD = REPO_ROOT / "README.md"
+ARCHITECTURE_MD = REPO_ROOT / "ARCHITECTURE.md"
 AGENTS_MD = REPO_ROOT / "AGENTS.md"
+
 # CHANGELOG.md is the historical record: it may name things that no longer exist.
 ROOT_DOCS = sorted(path for path in REPO_ROOT.glob("*.md") if path.name != "CHANGELOG.md")
+
 ENGINES: tuple[str, ...] = typing.get_args(Engine)
 # Adding an engine to the `Engine` literal fails here until the name is spelled out, which is
 # the moment the docs need the new engine too.
@@ -82,6 +90,22 @@ def test_readme_dependency_groups_are_defined_and_otel_packages_are_named():
         assert _requirement_name(requirement) in readme, requirement
 
 
+@pytest.mark.parametrize("doc", [ARCHITECTURE_MD, README_MD], ids=lambda path: path.name)
+def test_docs_state_the_registered_tool_count_where_they_state_one(doc: Path):
+    registered = len(asyncio.run(mcp.list_tools()))
+    word_or_digit = "|".join([r"\d+", *_NUMBER_WORDS])
+    claims = re.findall(rf"\b({word_or_digit})\s+(?:MCP\s+)?tools\b", _read(doc), re.IGNORECASE)
+    counted = [int(c) if c.isdigit() else _NUMBER_WORDS[c.lower()] for c in claims]
+    assert counted == [registered] * len(counted), (
+        f"{doc.name} states tool counts {counted}; the server registers {registered}"
+    )
+
+
+def test_architecture_states_its_tool_count_at_least_once():
+    # The test above passes vacuously when the sentence is deleted.
+    assert re.search(r"\bregisters (?:\d+|\w+) tools\b", _read(ARCHITECTURE_MD))
+
+
 def test_every_engine_has_a_module_and_no_unexplained_module_sits_beside_them():
     stems = {path.stem for path in ENGINES_DIR.glob("*.py") if path.stem != "__init__"}
     assert set(ENGINES) <= stems, f"engines/ lacks a module for {sorted(set(ENGINES) - stems)}"
@@ -111,3 +135,45 @@ def test_agents_and_readme_overviews_name_every_engine(engine: str):
     name = ENGINE_DISPLAY_NAMES[engine]
     assert name in _agents_overview(), f"AGENTS.md project overview does not name {name}"
     assert name in _readme_pitch(), f"README description does not name {name}"
+
+
+def _documented_modules() -> set[str]:
+    # Backticked `*.py` paths relative to the package: the Components table's vocabulary.
+    return set(re.findall(r"`([\w/]+\.py)`", _read(ARCHITECTURE_MD)))
+
+
+def _source_modules() -> set[str]:
+    return {
+        path.relative_to(PACKAGE_DIR).as_posix()
+        for path in PACKAGE_DIR.rglob("*.py")
+        if path.name != "__init__.py"
+    }
+
+
+def test_architecture_component_map_lists_exactly_the_source_modules():
+    documented, existing = _documented_modules(), _source_modules()
+    assert documented == existing, (
+        f"missing from ARCHITECTURE.md: {sorted(existing - documented)}; "
+        f"listed but not in src/: {sorted(documented - existing)}"
+    )
+
+
+@pytest.mark.parametrize("engine", ENGINES)
+def test_architecture_accuracy_tier_section_covers_every_engine(engine: str):
+    section = _section(_read(ARCHITECTURE_MD), "## The accuracy-tier contract", "## Transport")
+    assert f"**{ENGINE_DISPLAY_NAMES[engine]}**" in section
+
+
+def test_architecture_does_not_call_a_shipped_engine_unimplemented():
+    # Databricks shipped (engines/databricks.py); "deferred past v1" described v0.1.
+    text = _read(ARCHITECTURE_MD)
+    assert "not yet implemented" not in text
+    assert "deferred past v1" not in text
+
+
+def test_architecture_result_bound_numbers_match_result_bounds_constants():
+    text = _read(ARCHITECTURE_MD)
+    assert MAX_RESULT_BYTES % 2**20 == 0, "state the cap in bytes if it stops being whole MiB"
+    assert f"{MAX_RESULT_BYTES // 2**20} MiB" in text
+    assert f"defaults to {DEFAULT_MAX_ROWS}" in text
+    assert "`executed`" in text
