@@ -34,6 +34,15 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   needs the optional `rsa` package, which is not installed. This is lock hygiene and a clean audit
   gate, not the mitigation of a live exposure. Only that one package moved; `audit.yml` still
   carries no ignore.
+- Dependency relock: `uv.lock` moves `oauthlib` 4.0.0 -> 4.0.1 (CVE-2026-49272, whose advisory
+  record was corrected on 2026-11-05 from fixed-in 4.0.0 to fixed-in 4.0.1, so the 4.0.0 relock
+  above did not clear it) and the `opentelemetry` set 1.45.1 -> 1.45.2 (`api`, `sdk`, `proto` and the
+  two OTLP exporter packages) with `semantic-conventions` and `exporter-otlp-common` 0.66b1 -> 0.66b2
+  (CVE-2026-126360, published 2026-11-13: quadratic-time `traceparent` parsing). `oauthlib` is only
+  an OAuth client dependency of `databricks-sql-connector`, and importing the server and its engines
+  does not load it. The `traceparent` parser is loaded with `opentelemetry`, but nothing in `src/`
+  or the installed `mcp` package calls it. Lock hygiene and a clean audit gate, not the mitigation of a live exposure. Eight packages
+  moved, no `pyproject.toml` range changed, and `audit.yml` still carries no ignore.
 
 ## [0.6.0] - 2026-10-19
 
