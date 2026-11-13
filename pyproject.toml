@@ -58,11 +58,11 @@ otel = [
 # every build (uv build, the editable install inside uv sync, the Docker build), so it must
 # only move through a reviewed diff. Dependabot bumps only the hashed file;
 # tests/unit/test_release_metadata.py pins the equality of all three. See DECISIONS.md #11.
-requires = ["hatchling==1.32.4"]
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
 
 [tool.uv]
-build-constraint-dependencies = ["hatchling==1.32.4"]
+build-constraint-dependencies = ["hatchling==1.33.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/cost_guard_mcp"]
