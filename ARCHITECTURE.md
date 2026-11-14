@@ -42,9 +42,9 @@ MCP client (Claude Desktop, Claude Code, Cursor, ...)
 | `engines/snowflake.py` | `_connect`, `explain_estimate`, `execute_bounded`, `check_credentials` — thin wrapper over `snowflake-connector-python`. |
 | `engines/databricks.py` | `explain_estimate`, `execute_bounded`, `check_credentials` — thin wrapper over `databricks-sql-connector` and the `databricks-sdk` Warehouses API. |
 | `pricing/bigquery_pricing.py` | On-demand `$/TiB` constant. |
-| `pricing/snowflake_pricing.py` | Gen1 warehouse credit-rate table + `$/credit` by edition. |
+| `pricing/snowflake_pricing.py` | Gen1 and Gen2 (cloud-dependent) warehouse credit-rate tables + `$/credit` by edition. |
 | `pricing/databricks_pricing.py` | Serverless SQL warehouse DBU-per-hour table by size + the `$/DBU` constant. |
-| `pricing/runtime_scaling.py` | `scale_runtime_hours`: the coarse byte-size tiers that scale the Snowflake and Databricks baseline runtime up, never down. |
+| `pricing/runtime_scaling.py` | `scale_runtime_hours`: scales the 30-second Snowflake and Databricks baseline runtime by x1 / x4 / x20 / x100 for scans under 10 GiB / under 100 GiB / under 1 TiB / 1 TiB or more, so this fallback runtime is never below 30 s or above 3000 s; it cannot see compute cost, so the dollar figure built on it is directional, not a cap (README, "Known limitations"). Snowflake uses the mean of past runs instead when an exact repeat of the same SQL text is in query history. |
 | `tools/check_credentials.py`, `tools/describe_engine_capabilities.py`, `tools/estimate_query_cost.py`, `tools/run_query_bounded.py` | Business logic for each of the 4 MCP tools — pure functions, independently testable, imported (not duplicated) by `server.py`'s tool-registration wrappers. |
 | `tools/result_rows.py` | `run_query_bounded`'s row normaliser (`DECISIONS.md` #17), split out for size. |
 
@@ -84,7 +84,9 @@ Every `CostEstimate` carries `accuracy_tier: AccuracyTier` — `PRECISE`, `UPPER
   dollar figure at all when the project is capacity-billed (Editions) — only bytes.
 - **Snowflake** → always `UPPER_BOUND`, from `EXPLAIN USING JSON` against the target
   warehouse. Never `PRECISE` — Snowflake bills by warehouse-time, not bytes, and
-  `EXPLAIN`'s own figures are documented upper bounds.
+  `EXPLAIN`'s own figures are documented upper bounds. The tag describes the byte figure only:
+  the dollar figure multiplies a fixed runtime placeholder (unless an exact repeat of the same
+  SQL text is found in query history) and can under-estimate (README, "Known limitations").
 - **Databricks** → always `HEURISTIC`, from `EXPLAIN COST` (Spark's cost-based-optimiser
   size estimate) priced at the Serverless DBU rate. There is no dry-run equivalent, so it is
   never `PRECISE` or `UPPER_BOUND`. On a warehouse that is not `RUNNING` no session is
