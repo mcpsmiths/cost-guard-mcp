@@ -15,6 +15,13 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   the Snowflake behaviour: the last green Snowflake run (2026-10-12) covers 0.3.3 code, and no
   Snowflake change from 0.4.0 onward has run live. Databricks has no live job. Restoring the gate needs
   a paid Snowflake account (`DECISIONS.md` #9, issue #100).
+- Docs: the `runtime_scaling.py` docstring no longer says the fallback "biases toward OVER-estimating
+  ... never under" (it is a floored, monotone step function of bytes alone, 30 s to 3000 s, and can
+  under-estimate), and README Known limitations now states the fixed runtime placeholder, that only
+  BigQuery enforces the caps provider-side, the US list-price assumption on every engine, and that
+  Databricks has no live test job and no live `EXPLAIN COST` capture (last exercised by hand on
+  2026-09-14, against early code). `tests/unit/test_runtime_scaling_claims.py`
+  pins the documented numbers to the code. No behaviour change.
 
 ### Security
 
