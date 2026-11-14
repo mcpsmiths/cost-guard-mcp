@@ -372,8 +372,8 @@ def _bootstrap_opentelemetry() -> None:
     until a real exporter is registered as the global tracer provider; this project ships
     with none configured, so without this function every one of those spans is silently
     dropped. `opentelemetry-sdk` and the OTLP exporter are optional dependencies (the
-    `otel` extra, see pyproject.toml) - imported here, and nowhere else in this project, so
-    a deployment that never sets the env var never needs them installed at all.
+    `otel` dependency group, see pyproject.toml) - imported here, and nowhere else in this
+    project, so a deployment that never sets the env var never needs them installed at all.
     """
     endpoint = os.environ.get(_OTEL_EXPORTER_OTLP_ENDPOINT_ENV_VAR)
     if not endpoint:
