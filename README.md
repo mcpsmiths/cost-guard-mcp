@@ -330,6 +330,46 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
   `estimate_query_cost` refuse instead (see the warehouse-state bullet below).
 - Databricks has no per-query warehouse override - the SQL warehouse is fixed by
   `DATABRICKS_HTTP_PATH` at connect time.
+- Dollar figures rest on a fixed runtime placeholder, not a measured runtime. On Snowflake
+  (unless the lookup finds an exact repeat of the same SQL text in your query history) and on
+  Databricks (always), the dollar figure is the warehouse rate times a runtime that starts from a
+  30-second baseline constant and is scaled by the scanned bytes alone: x1 under 10 GiB, x4 under
+  100 GiB, x20 under 1 TiB, x100 from 1 TiB up (1/4/20/100). The runtime is therefore never below 30
+  seconds and never above 3000 seconds, however large the scan, and it cannot see compute cost: a
+  compute-heavy query on a small scan is priced at 30 seconds, and a query that runs for an hour is
+  priced at 3000 seconds at most. It is not an upper bound and can under-estimate, so treat the
+  dollar figure as directional and `max_estimated_cost_usd` on these engines as a coarse screen,
+  not a spend limit. Snowflake tags its estimate `UPPER_BOUND`; that describes the byte figure
+  (EXPLAIN's `bytesAssigned`), not the dollar figure, so the "real cap" wording in the
+  `estimate_query_cost` tool description and the "What makes this different" list applies to bytes
+  only. Databricks has no calibration at all (see the Query History bullet above), and Snowflake's
+  history calibration fires only on exact repeats.
+- Dollar and byte caps are enforced by the provider only on BigQuery. On an on-demand BigQuery
+  project `run_query_bounded` gives the job a `maximumBytesBilled` (derived from
+  `max_estimated_cost_usd`, lowered to `max_bytes_billed`; `DECISIONS.md` #16), and BigQuery itself
+  fails a job that would bill more.
+  On Snowflake and Databricks no provider-side spend limit is set: `max_bytes_billed` and
+  `max_estimated_cost_usd` are compared with the estimate before the query is submitted (refusing
+  when the estimate is unavailable, `DECISIONS.md` #5), and once a query is admitted the only hard
+  stop is the 120-second wall-clock limit (a watchdog cancel plus a server-side statement timeout
+  on both engines; see the 120-second bullet below and `DECISIONS.md` #14). A query the estimate
+  under-reads (previous bullet) can therefore run for up to 120 seconds on the pinned warehouse.
+- Prices are US list prices on every engine, whatever region the query runs in. BigQuery dollar
+  figures use the US multi-region on-demand rate ($6.25/TiB) for every dataset location, although
+  the dry-run job's location is known (it is used only for the reservation lookup); Snowflake
+  credit rates are the AWS US East / Azure East US / GCP us-central1 on-demand rates; Databricks
+  uses the US-region Serverless SQL rate ($0.70/DBU; EU regions list higher). A non-US dataset or
+  account, or a negotiated rate, can be priced too low or too high, and a `max_estimated_cost_usd`
+  cap compares against that figure. The estimate does not adjust for region.
+- Databricks has no live test job and no live `EXPLAIN COST` capture. There is no Databricks job
+  in `integration.yml` and no Databricks module under `tests/integration/` (`DECISIONS.md` #9). The
+  connector was last exercised by hand on 2026-09-14, against early code. The Warehouses API state
+  check, the `STATEMENT_TIMEOUT` session parameter and the warehouse-bound cap pricing
+  (`DECISIONS.md` #19) came later and have only run against fakes. No `EXPLAIN COST` output has been
+  captured from a live warehouse, so the size parser accepts both the SI (`GB`) and IEC (`GiB`)
+  unit-label families because the real shape is unconfirmed; text it does not recognise leaves no
+  size statistics, which makes the byte and dollar estimates unavailable and every cap refuse
+  (`DECISIONS.md` #5).
 - Snowflake's `UPPER_BOUND` estimate excludes Cortex AI Function ("AI Credits") cost.
 - Snowflake warehouse size, type and generation (Gen1 vs. the newer, pricier Gen2) are read
   from the pinned warehouse's `SHOW WAREHOUSES` row, plus `CURRENT_REGION()` for the cloud
