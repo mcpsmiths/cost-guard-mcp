@@ -363,10 +363,19 @@ COST_GUARD_SNOWFLAKE_ALLOW_WAREHOUSE_RESUME = "false"
   cap compares against that figure. The estimate does not adjust for region.
 - Databricks has no live test job and no live `EXPLAIN COST` capture. There is no Databricks job
   in `integration.yml` and no Databricks module under `tests/integration/` (`DECISIONS.md` #9). The
-  connector was last exercised by hand on 2026-09-14, against early code. The Warehouses API state
-  check, the `STATEMENT_TIMEOUT` session parameter and the warehouse-bound cap pricing
-  (`DECISIONS.md` #19) came later and have only run against fakes. No `EXPLAIN COST` output has been
-  captured from a live warehouse, so the size parser accepts both the SI (`GB`) and IEC (`GiB`)
+  connector was last exercised by hand against a Databricks Free Edition workspace on 2026-09-14
+  (`check_credentials`, `estimate_query_cost`, and `run_query_bounded` with one success and one
+  cost-cap refusal; commit `dbde8be`) and, as a `check_credentials` call (the only Databricks
+  call PR #51's test plan lists), on 2026-09-18 (PR #51), both on pre-0.4.0 code, with no output
+  recorded in the repo. Everything added from 0.4.0 on has no recorded live run and has only run
+  against fakes: the Warehouses API state check, the `STATEMENT_TIMEOUT` session parameter, the
+  warehouse-bound cap pricing (`DECISIONS.md` #19), the read-only SQL gate, result paging and the
+  8 MiB cap, and the 4.8.0 connector. There is no recorded live run of the `Cursor.cancel()`
+  watchdog, and the PR #28 and PR #51 records do not say which auth method was used (a 2026-09-15
+  spike that ran the vendor connector and SDK directly, not this repo's engine, passed an access
+  token; see `docs/superpowers/plans/2026-09-15-warehouse-history-calibration.md`). `EXPLAIN COST`
+  ran live on 2026-09-14, but its text was not recorded, so no `EXPLAIN COST` output has been
+  captured from a live warehouse, and the size parser accepts both the SI (`GB`) and IEC (`GiB`)
   unit-label families because the real shape is unconfirmed; text it does not recognise leaves no
   size statistics, which makes the byte and dollar estimates unavailable and every cap refuse
   (`DECISIONS.md` #5).
