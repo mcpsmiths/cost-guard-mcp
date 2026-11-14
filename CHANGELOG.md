@@ -41,8 +41,17 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   (CVE-2026-126360, published 2026-11-13: quadratic-time `traceparent` parsing). `oauthlib` is only
   an OAuth client dependency of `databricks-sql-connector`, and importing the server and its engines
   does not load it. The `traceparent` parser is loaded with `opentelemetry`, but nothing in `src/`
-  or the installed `mcp` package calls it. Lock hygiene and a clean audit gate, not the mitigation of a live exposure. Eight packages
-  moved, no `pyproject.toml` range changed, and `audit.yml` still carries no ignore.
+  or the installed `mcp` package calls it. Lock hygiene and a clean audit gate, not the mitigation
+  of a live exposure. Eight packages moved, no `pyproject.toml` range changed, and `audit.yml` still
+  carries no ignore.
+- Docker base image: the `ghcr.io/astral-sh/uv:python3.12-trixie-slim` digest is re-resolved from the
+  2026-10-09 build (uv 0.13.0, Python 3.12.15) to the 2026-11-12 build (uv 0.13.8, Python 3.12.16),
+  which carries the Debian `apt` fix for CVE-2026-109518. Two fixable HIGH `zlib1g` CVEs
+  (CVE-2026-76844, CVE-2026-85091; Debian fix `1:1.3.dfsg+really1.3.1-1+deb13u1`) are still in that
+  image because upstream has not rebuilt, so they are the only entries left in `.trivyignore.yaml`
+  (expiry 2026-11-28): they concern zlib's `gz*` file API, which CPython's `zlib` module does not call.
+  The 21 entries that file carried until 2026-11-15 matched nothing in a Trivy 0.76.2 remote scan of the
+  new image and are removed. The image's Python packages scan clean.
 
 ## [0.6.0] - 2026-10-19
 
