@@ -24,6 +24,13 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   pre-0.4.0 code with no output recorded in the repo; everything added from 0.4.0 on has no
   recorded live run). `tests/unit/test_runtime_scaling_claims.py` pins the documented numbers to
   the code. No behaviour change.
+- Docs: README now says `otel` is a dependency group, not a published extra (`uv sync --group otel`
+  from a checkout, or install `opentelemetry-sdk` and `opentelemetry-exporter-otlp-proto-grpc` next
+  to the PyPI package), and that setting `OTEL_EXPORTER_OTLP_ENDPOINT` without them exits at startup
+  with `ModuleNotFoundError`. AGENTS.md and ARCHITECTURE.md now name all three engines and the
+  four tools, and ARCHITECTURE.md's module map lists all 21 modules under `src/cost_guard_mcp`
+  with the Snowflake pricing and runtime-fallback rows and the Snowflake accuracy-tier note aligned
+  to the code. `tests/unit/test_docs_claims.py` pins these claims to the code. No behaviour change.
 
 ### Security
 
