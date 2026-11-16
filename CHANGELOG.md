@@ -19,9 +19,11 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   ... never under" (it is a floored, monotone step function of bytes alone, 30 s to 3000 s, and can
   under-estimate), and README Known limitations now states the fixed runtime placeholder, that only
   BigQuery enforces the caps provider-side, the US list-price assumption on every engine, and that
-  Databricks has no live test job and no live `EXPLAIN COST` capture (last exercised by hand on
-  2026-09-14, against early code). `tests/unit/test_runtime_scaling_claims.py`
-  pins the documented numbers to the code. No behaviour change.
+  Databricks has no live test job and no live `EXPLAIN COST` capture (hand-run against a Free
+  Edition workspace on 2026-09-14, and a `check_credentials` call on 2026-09-18 (PR #51), both on
+  pre-0.4.0 code with no output recorded in the repo; everything added from 0.4.0 on has no
+  recorded live run). `tests/unit/test_runtime_scaling_claims.py` pins the documented numbers to
+  the code. No behaviour change.
 
 ### Security
 
