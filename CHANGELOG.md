@@ -31,6 +31,14 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   four tools, and ARCHITECTURE.md's module map lists all 21 modules under `src/cost_guard_mcp`
   with the Snowflake pricing and runtime-fallback rows and the Snowflake accuracy-tier note aligned
   to the code. `tests/unit/test_docs_claims.py` pins these claims to the code. No behaviour change.
+- Docs: the `estimate_query_cost` and `run_query_bounded` tool descriptions and the
+  `describe_engine_capabilities` `known_gaps` text now say what the code does: the `UPPER_BOUND`
+  tier describes the byte figure only (the Snowflake and Databricks dollar figures rest on a fixed
+  30-second runtime placeholder and can under-estimate), only BigQuery enforces the caps
+  provider-side (on an on-demand project), prices are US list prices, and Databricks has no live
+  test job. Two source comments no longer call that placeholder "conservative", and the README
+  matches. Tool names and input schemas are unchanged; `tests/unit/test_tool_text_claims.py` pins
+  the text to the code. No behaviour change.
 
 ### Security
 

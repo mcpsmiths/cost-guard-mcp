@@ -189,11 +189,14 @@ def _validate_warehouse(warehouse: str) -> str:
     return warehouse
 
 
-# EXPLAIN itself doesn't estimate runtime — this is a deliberately conservative, documented
-# placeholder assumption (30 seconds) used only to turn a byte/partition estimate into SOME
-# dollar figure. This is the least-defensible part of the Snowflake estimate; tightening it
-# (e.g. by correlating bytesAssigned with historical query_history runtimes for this
-# warehouse) is the highest-value follow-up work once real usage data exists.
+# EXPLAIN itself doesn't estimate runtime — this is a documented placeholder (30 seconds), not
+# a measurement, used only to turn a byte/partition estimate into SOME dollar figure. It is not
+# conservative: pricing/runtime_scaling.py scales it by a tier picked from the scanned bytes
+# alone, so the runtime is floored at 30 s, capped at 3000 s and blind to compute cost, and the
+# dollar figure can under-estimate (read that module's docstring). This is the least-defensible
+# part of the Snowflake estimate; tightening it (e.g. by correlating bytesAssigned with
+# historical query_history runtimes for this warehouse) is the highest-value follow-up work
+# once real usage data exists.
 _ASSUMED_RUNTIME_HOURS = 30 / 3600
 
 # Warehouse-history calibration (see docs/superpowers/specs/2026-09-15-warehouse-history-
