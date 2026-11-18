@@ -272,8 +272,16 @@ def estimate_query_cost(
     edition: str | None = None,
 ) -> CostEstimate:
     """Estimate the cost of a SQL query before running it. ALWAYS call this before running
-    an expensive-looking query. The response's accuracy_tier tells you how much to trust
-    the number: PRECISE (exact), UPPER_BOUND (real cap, may overstate), HEURISTIC (rough).
+    an expensive-looking query. The response's accuracy_tier says what the BYTE figure
+    guarantees, not the dollar figure: PRECISE (BigQuery's own dry-run byte count),
+    UPPER_BOUND (an upper bound that may overstate: BigQuery's own UPPER_BOUND accuracy, or
+    its UNKNOWN or unrecognised accuracy, which is labelled the same way without BigQuery
+    vouching for it; Snowflake's EXPLAIN bytesAssigned), HEURISTIC (rough, no bound either
+    way; every Databricks estimate). Dollar figures use US list prices on every engine. On
+    Snowflake (unless an exact repeat of the same SQL text is in your query history) and on
+    Databricks the dollar figure also rests on a fixed 30-second runtime placeholder scaled by
+    the scanned bytes alone (never below 30 s, never above 3000 s), so it can UNDER-estimate:
+    treat it as directional, not as an upper bound or a cap on spend.
     Accepts exactly one SQL statement per call (a single trailing ';' is fine) - text with
     more statements is refused before anything is estimated. This tool accepts
     only read statements (first keyword SELECT, WITH, VALUES, SHOW, DESCRIBE, DESC or EXPLAIN;
@@ -315,7 +323,16 @@ async def run_query_bounded(
     edition: str | None = None,
 ) -> BoundedQueryResult:
     """Run a query only if its pre-flight cost estimate is within your given bounds; refuses
-    otherwise. Check result.status and result.executed: "refused" with reason
+    otherwise. The max_bytes_billed and max_estimated_cost_usd caps are checked against that
+    estimate before the query is submitted; only BigQuery also enforces them itself, and only
+    on an on-demand project (the smaller of max_bytes_billed and a limit derived from a finite
+    max_estimated_cost_usd is attached to the job as maximumBytesBilled, so a query that would
+    bill more is rejected before it runs). On Snowflake and Databricks no provider-side spend
+    limit is set: the estimate can under-read (see estimate_query_cost), and once a query is
+    admitted the only hard stop the server sets is the 120 s limit on how long it runs (a
+    watchdog cancel plus a server-side statement timeout). A cap you request that has no
+    usable estimate (no byte or dollar figure) is refused, never ignored.
+    Check result.status and result.executed: "refused" with reason
     "cost_cap_exceeded" or "byte_cap_exceeded" means the query did NOT run (executed=false) and
     result.hint explains why; "refused" with reason "row_cap_exceeded" or
     "result_size_exceeded" means the query RAN and was billed (executed=true) and rows holds a

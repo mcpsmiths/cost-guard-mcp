@@ -234,9 +234,11 @@ _STATISTICS_RE = re.compile(
 # byte estimate on its own instead of the honest None that refuses both caps.
 _SPARK_UNKNOWN_SIZE_SENTINEL_BYTES = 2**63 - 1
 
-# EXPLAIN COST gives no runtime estimate at all - same deliberately conservative,
-# documented placeholder pattern already used for Snowflake (see _ASSUMED_RUNTIME_HOURS
-# in snowflake.py), turning a byte estimate (when available) into SOME dollar figure.
+# EXPLAIN COST gives no runtime estimate at all - same documented placeholder pattern already
+# used for Snowflake (see _ASSUMED_RUNTIME_HOURS in snowflake.py), a 30-second figure that is not
+# a measurement, turning a byte estimate (when available) into SOME dollar figure. It is not
+# conservative: pricing/runtime_scaling.py scales it by the scanned bytes alone, so the runtime is
+# floored at 30 s, capped at 3000 s and can under-estimate (read that module's docstring).
 _ASSUMED_RUNTIME_HOURS = 30 / 3600
 
 

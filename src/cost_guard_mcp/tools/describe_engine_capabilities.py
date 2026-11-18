@@ -30,6 +30,23 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "reservation assignments in the dry-run job's own location (US only when the "
                 "job reports none)."
             ),
+            (
+                "Caps are enforced by BigQuery itself, the only engine where they are, and only "
+                "on an on-demand project: run_query_bounded attaches the smaller of "
+                "max_bytes_billed and a limit derived from a finite max_estimated_cost_usd to "
+                "the job as maximumBytesBilled, and BigQuery rejects a query that would bill "
+                "more before it runs. BigQuery bills in 1 MiB steps with a 10 MiB minimum per "
+                "referenced table, so a tight cap on a many-table query can still be rejected "
+                "after passing the estimate check. On a capacity-billed project there is no "
+                "dollar figure, so a dollar cap refuses; a max_bytes_billed cap is still "
+                "attached to the job, but whether BigQuery enforces it there is not verified."
+            ),
+            (
+                "Prices are US list prices: the US multi-region on-demand rate ($6.25/TiB) is "
+                "used for every dataset location, so a non-US dataset or a negotiated rate can "
+                "be priced too low or too high, and a max_estimated_cost_usd cap compares "
+                "against that figure."
+            ),
         ],
     ),
     "snowflake": EngineCapabilities(
@@ -44,8 +61,30 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
             ),
             "The estimate excludes Cortex AI Function ('AI Credits') cost entirely.",
             (
-                "The dollar figure assumes a fixed placeholder runtime, not this query's actual "
-                "expected runtime — treat it as directional, not a tight bound."
+                "UPPER_BOUND describes the byte figure (EXPLAIN's bytesAssigned) only, not the "
+                "dollar figure. Unless an exact repeat of the same SQL text is found in your "
+                "query history (the mean of its past runs is used then), the dollar figure is "
+                "the warehouse rate times a fixed 30-second runtime placeholder scaled by the "
+                "scanned bytes alone (x1 under 10 GiB, x4 under 100 GiB, x20 under 1 TiB, x100 "
+                "from 1 TiB up: never below 30 s, never above 3000 s). It cannot see compute "
+                "cost, so it can under-estimate - treat it as directional, not as an upper "
+                "bound or a cap on spend."
+            ),
+            (
+                "Caps are checked against the estimate only; Snowflake enforces none of them: "
+                "max_bytes_billed and max_estimated_cost_usd are compared with the estimate "
+                "before the query is submitted (a requested cap with no usable estimate "
+                "refuses), no provider-side spend limit is set, and once a query is admitted "
+                "the only hard stop the server sets is the 120-second limit on how long it runs "
+                "(a watchdog cancel plus a server-side STATEMENT_TIMEOUT_IN_SECONDS). A query "
+                "the estimate under-reads can therefore run for up to 120 seconds on the "
+                "warehouse."
+            ),
+            (
+                "Prices are US list prices: credit rates are the AWS US East / Azure East US / "
+                "GCP us-central1 on-demand rates whatever region the account runs in, so a "
+                "non-US account or a negotiated rate can be priced too low or too high, and a "
+                "max_estimated_cost_usd cap compares against that figure."
             ),
             (
                 "EXPLAIN's plan can vary by which warehouse is active when it runs; this tool "
@@ -104,8 +143,28 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "refuses any max_bytes_billed or max_estimated_cost_usd cap for that query."
             ),
             (
-                "The dollar figure assumes a fixed placeholder runtime on a Serverless SQL "
-                "warehouse, not derived from this query's actual expected runtime."
+                "The dollar figure is the Serverless SQL warehouse rate times a fixed 30-second "
+                "runtime placeholder scaled by the scanned bytes alone (x1 under 10 GiB, x4 "
+                "under 100 GiB, x20 under 1 TiB, x100 from 1 TiB up: never below 30 s, never "
+                "above 3000 s), with no query-history calibration. It cannot see compute cost, "
+                "so it can under-estimate - treat it as directional, not as an upper bound or a "
+                "cap on spend."
+            ),
+            (
+                "Caps are checked against the estimate only; Databricks enforces none of them: "
+                "max_bytes_billed and max_estimated_cost_usd are compared with the estimate "
+                "before the query is submitted (a requested cap with no usable estimate "
+                "refuses), no provider-side spend limit is set, and once a query is admitted "
+                "the only hard stop the server sets is the 120-second limit on how long it runs "
+                "(a watchdog cancel plus a server-side STATEMENT_TIMEOUT). A query the "
+                "estimate under-reads can therefore run for up to 120 seconds on the "
+                "warehouse."
+            ),
+            (
+                "Prices are US list prices: the Serverless SQL rate is the US-region $0.70/DBU "
+                "(EU regions list higher) whatever region the workspace runs in, so a non-US "
+                "workspace or a negotiated rate can be priced too low or too high, and a "
+                "max_estimated_cost_usd cap compares against that figure."
             ),
             (
                 "The dollar figure is priced at the SQL warehouse DATABRICKS_HTTP_PATH binds "
@@ -138,6 +197,16 @@ _CAPABILITIES: dict[str, EngineCapabilities] = {
                 "session opened. COST_GUARD_DATABRICKS_ALLOW_WAREHOUSE_START=true (exactly that "
                 "value) lets them open the session regardless. run_query_bounded is not gated: "
                 "its estimate and execution may start the warehouse."
+            ),
+            (
+                "Databricks has no live test job and no live EXPLAIN COST capture: nothing added "
+                "from 0.4.0 on has a recorded live run (it has only run against fakes), the "
+                "connector was last exercised by hand on 2026-09-14 and, as a check_credentials "
+                "call, on 2026-09-18, both on pre-0.4.0 code with no output recorded in the "
+                "repo, and the size parser accepts both SI (GB) and IEC (GiB) unit labels "
+                "because the real EXPLAIN COST text shape is unconfirmed; text it does not "
+                "recognise leaves no size statistics, so both estimates are unavailable and "
+                "every cap refuses."
             ),
         ],
     ),
