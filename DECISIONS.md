@@ -795,6 +795,14 @@ misconfiguration no longer carries the `<engine> client call failed:` prefix); t
 machine-visible `Error executing tool <name>:` prefix and `is_error=true` are unchanged.
 Any new outbound surface that carries connector or model text must use the same chain —
 never `str(exc)` or `redact_secrets` alone.
+Amended (quoted values, 2026-11): the quoted-value alternatives of `redact_secrets` treat a
+backslash as escaping the next character, so JSON's `\"` and a `repr()`'s `\'` inside a secret no
+longer end the match and leave the tail of the value in the text. The loop stops only at an
+unescaped quote or the end of the text, so the patterns stay linear. A value that really ends in a
+single raw backslash right before its closing quote cannot be told from an escaped quote: the match
+runs on to the next unescaped quote, which over-redacts what follows and can leave a second quoted
+secret's value in the text when its key is swallowed (pinned as a strict xfail in
+`tests/unit/test_errors.py`). Redaction stays pattern-based and best-effort.
 
 ## 19. The cap-gate rate is bound to the observed warehouse; caller inputs can only raise it
 

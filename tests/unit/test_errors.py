@@ -492,6 +492,91 @@ def test_redact_secrets_redacts_quoted_password_cut_by_truncation():
     assert "aaaa" not in redacted
 
 
+# A quoted value that contains an escaped quote of its own kind - JSON's \" or a Python repr's
+# \' - used to end at the escaped quote, so the tail of the value stayed in the text.
+_QUOTED_KEY = "pass" + "word"  # split so a secret scanner does not read the fixtures as secrets
+_TAIL = "TAILOFVALUE"
+
+
+def test_redact_secrets_redacts_json_value_with_an_escaped_double_quote():
+    text = '{"' + _QUOTED_KEY + '": "ab\\"cd' + _TAIL + '", "next": 1}'
+
+    redacted = redact_secrets(text)
+
+    assert _TAIL not in redacted
+    assert "cd" not in redacted
+    assert redacted.endswith(', "next": 1}')
+
+
+def test_redact_secrets_redacts_repr_value_with_an_escaped_single_quote():
+    text = _QUOTED_KEY + "='ab\\'cd" + _TAIL + "' trailing"
+
+    redacted = redact_secrets(text)
+
+    assert _TAIL not in redacted
+    assert redacted.endswith(" trailing")
+
+
+def test_redact_secrets_redacts_quoted_value_that_ends_in_a_lone_backslash():
+    # The truncation bound can cut right after a backslash inside a quoted value.
+    text = _QUOTED_KEY + '="ab' + _TAIL + "\\"
+
+    redacted = redact_secrets(text)
+
+    assert _TAIL not in redacted
+    assert "ab" not in redacted
+
+
+def test_redact_secrets_over_redacts_rather_than_leaks_after_a_trailing_backslash():
+    # A value that really ends in a single raw backslash right before its closing quote cannot
+    # be told from an escaped quote: the match runs on to the next unescaped quote or the end.
+    # This value is never left in the text, at the cost of what follows it. (A second quoted
+    # secret whose key is swallowed that way is the known residual, pinned below as an xfail.)
+    text = _QUOTED_KEY + '="C:\\dir\\" keepme'
+
+    redacted = redact_secrets(text)
+
+    assert "C:" not in redacted
+    assert "keepme" not in redacted
+
+
+def test_redact_secrets_is_bounded_on_backslash_and_quote_runs_in_a_quoted_value():
+    for filler in ("\\" * 16000, '\\"' * 8000, "\\'" * 8000, "x" + "\\" * 15000):
+        text = _QUOTED_KEY + '="' + filler
+
+        redacted, elapsed = _timed_redact(text)
+
+        assert elapsed < _REDACTION_TIME_BOUND_SECONDS
+        assert "***REDACTED***" in redacted
+
+
+@pytest.mark.parametrize(
+    "key", ["pass" + "word", "private_" + "key", "tok" + "en", "api_" + "key", "sec" + "ret"]
+)
+def test_every_quoted_value_pattern_ends_only_at_an_unescaped_quote(key):
+    # The password, private-key and token/api-key/secret patterns share the quoted-value
+    # alternatives, so each must keep an escaped quote inside the value.
+    json_text = '{"' + key + '": "ab\\"cd' + _TAIL + '", "next": 1}'
+    repr_text = key + "='ab\\'cd" + _TAIL + "' trailing"
+
+    assert _TAIL not in redact_secrets(json_text)
+    assert redact_secrets(json_text).endswith(', "next": 1}')
+    assert _TAIL not in redact_secrets(repr_text)
+    assert redact_secrets(repr_text).endswith(" trailing")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="known residual (DECISIONS.md #18): a raw trailing backslash swallows the next key",
+)
+def test_redact_secrets_known_gap_second_secret_after_a_raw_trailing_backslash():
+    # The pattern before the escape-aware change redacted both values here. Written as the
+    # behaviour we want, so the day it passes (strict xfail) the residual note can go.
+    text = _QUOTED_KEY + '="a\\" ' + "tok" + 'en="' + _TAIL + '"'
+
+    assert _TAIL not in redact_secrets(text)
+
+
 def test_redact_secrets_still_redacts_private_key_pem_after_pattern_reorder():
     # Guards the dropped PEM alternative of the private-key pattern: the standalone PEM
     # pattern now runs first and must still leave no key body behind.

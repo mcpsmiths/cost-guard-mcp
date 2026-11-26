@@ -34,12 +34,20 @@ _MAX_REMOTE_ERROR_TEXT_CHARS = 1_000
 # e.g. SNOWFLAKE_PASSWORD is an arbitrary user-chosen string) via the repetition's
 # lookahead, but that lookahead stops the moment what follows looks like the start of the
 # *next* key=value/key:value pair, so a multi-word value doesn't swallow an unrelated
-# trailing field. A quoted value (single or double) is matched up to its closing quote
-# regardless of what it contains, so both quotes are consumed and never leak - or, when the
-# closing quote never comes (the bound above can cut inside a quoted value), to end of text.
+# trailing field. A quoted value (single or double) runs to its closing quote, so both quotes
+# are consumed - or, when the closing quote never comes (the bound above can cut inside a
+# quoted value), to end of text. A backslash escapes the character after it (a lone one at the
+# very end of the text takes nothing), so an escaped quote inside the value - JSON's \" or a
+# Python repr's \' - does not end it and the tail of the value does not leak. Linear: the loop
+# only stops at an unescaped closing quote or the end of the text, so it always matches on the
+# first attempt and never backtracks. The price is over-redaction and one residual: a value that
+# really ends in a single raw backslash right before its closing quote (C:\dir\, not the
+# JSON/repr form C:\\dir\\) cannot be told from an escaped quote, so the match runs on to the
+# next unescaped quote; if that swallows the key of a second quoted secret on the same line, the
+# second value is left in the text (DECISIONS.md #18).
 _BARE_WORD = r'[^\s,;"\'}=:]+'
-_DOUBLE_QUOTED = r'"[^"]*(?:"|\Z)'
-_SINGLE_QUOTED = r"'[^']*(?:'|\Z)"
+_DOUBLE_QUOTED = r'"(?:[^"\\]|\\[\s\S]?)*(?:"|\Z)'
+_SINGLE_QUOTED = r"'(?:[^'\\]|\\[\s\S]?)*(?:'|\Z)"
 _VALUE_FRAGMENT = (
     rf"{_DOUBLE_QUOTED}|{_SINGLE_QUOTED}"
     rf"|{_BARE_WORD}(?:\s+(?!{_BARE_WORD}\s*[=:]){_BARE_WORD})*"
