@@ -120,14 +120,16 @@ def load_snowflake_config() -> SnowflakeConfig:
     if not user:
         raise ConfigError("SNOWFLAKE_USER must be set.")
 
-    role = os.environ.get("SNOWFLAKE_ROLE")
-    if not role:
+    role = os.environ.get("SNOWFLAKE_ROLE") or ""
+    normalized_role = _normalize_snowflake_role_name(role)
+    if not normalized_role:
+        # Unset, or empty once whitespace and quotes are removed: both are "no role chosen".
         raise ConfigError(
             "SNOWFLAKE_ROLE must be set explicitly — cost-guard-mcp does not default "
             "to any role (in particular, never ACCOUNTADMIN). Set it to a "
             "least-privilege role scoped to the objects you want cost-estimated."
         )
-    if _normalize_snowflake_role_name(role) in _REJECTED_SNOWFLAKE_ADMIN_ROLES:
+    if normalized_role in _REJECTED_SNOWFLAKE_ADMIN_ROLES:
         # Static text on purpose: the value is operator config, but this message reaches
         # the MCP client as a ToolError, so it never echoes the env value back.
         raise ConfigError(
