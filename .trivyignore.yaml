@@ -1,26 +1,26 @@
 # Scoped, expiring Trivy ignores for the Docker base image.
 #
-# Re-verified 2026-11-14 against the refreshed base image (ghcr.io/astral-sh/uv
-# python3.12-trixie-slim, built 2026-11-12, see the Dockerfile header) with a remote Trivy
-# 0.76.2 scan (--ignore-unfixed, CRITICAL and HIGH, os and library): the 21 entries this
-# file carried until 2026-11-15 (perl, ncurses, sqlite3, systemd/udev, gzip, acl,
-# util-linux, pcre2) no longer match anything, so they are removed rather than renewed.
+# Re-verified 2026-11-26 against the refreshed base image (ghcr.io/astral-sh/uv
+# python3.12-trixie-slim, built 2026-11-24, see the Dockerfile header) with a remote Trivy
+# 0.76.2 scan (--ignore-unfixed, CRITICAL and HIGH, os and library): the two zlib entries this
+# file carried until 2026-11-28 no longer match anything (the rebuild has zlib1g
+# 1:1.3.dfsg+really1.3.1-1+deb13u1), so they are removed rather than renewed.
 #
-# Two fixable HIGH zlib CVEs remain in that image, because the upstream ghcr.io/astral-sh/uv
-# image only rebuilds as a side effect of a new uv release, not on Debian's own patch
-# cycle, and has not picked up zlib1g 1:1.3.dfsg+really1.3.1-1+deb13u1 yet. Both concern
-# zlib's gz* file API. CPython's zlib module (Modules/zlibmodule.c, 3.12) makes no gz* call
-# (it uses deflate/inflate only) and gzip.py is pure Python on zlib.compressobj and
-# decompressobj, so cost-guard-mcp's Python code cannot reach them.
+# One fixable HIGH CVE remains, because the upstream ghcr.io/astral-sh/uv image only rebuilds
+# as a side effect of a new uv release, not on Debian's own patch cycle, and has not picked up
+# libzstd1 1.5.7+dfsg-1+deb13u1 yet. The advisory needs an attacker who can submit zstd data
+# and observe the decompressed output. cost-guard-mcp never decompresses zstd itself: neither
+# the image's Python nor uv.lock has a zstd module, and nothing here requests or returns zstd
+# data. libzstd1 is linked by dpkg-deb, apt (libapt-pkg), systemd and OpenSSL's libcrypto
+# (checked by listing the files whose dynamic section names it); the process that handles
+# warehouse traffic reaches it only through OpenSSL, and no decompressed output is ever sent
+# back to a peer. That reachability argument was read from the image, not exercised.
 #
 # Expiry forces a re-check rather than a silent permanent blind spot - if this file is
 # still needed past its expiry date, re-verify the same reasoning still holds (a new
 # rebuild may have already picked up the fix) rather than just pushing the date out.
 
 vulnerabilities:
-  - id: CVE-2026-76844
-    statement: "zlib1g (OS package) - heap overflow via a stale gzwrite pointer; the gz* file API is not used by CPython's zlib module or by cost-guard-mcp. Fixed in Debian 1:1.3.dfsg+really1.3.1-1+deb13u1, pending an upstream image rebuild"
-    expired_at: 2026-11-28
-  - id: CVE-2026-85091
-    statement: "zlib1g (OS package) - heap overflow in gz_vacate(); the gz* file API is not used by CPython's zlib module or by cost-guard-mcp. Fixed in Debian 1:1.3.dfsg+really1.3.1-1+deb13u1, pending an upstream image rebuild"
-    expired_at: 2026-11-28
+  - id: CVE-2026-124851
+    statement: "libzstd1 (OS package) - zstd information disclosure via an uninitialized decompression buffer; needs an attacker who submits zstd data and sees the decompressed output, and cost-guard-mcp neither decompresses zstd itself nor returns decompressed data to a peer. Fixed in Debian 1.5.7+dfsg-1+deb13u1, pending an upstream image rebuild"
+    expired_at: 2026-12-10
