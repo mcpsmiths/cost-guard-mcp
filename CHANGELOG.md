@@ -99,6 +99,23 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   raised on the first Snowflake tool call before any connection is opened. The variable is operator
   configuration, not model input, and what Snowflake does with a blank role name was not run live,
   so this closes a gap in the configuration check rather than a demonstrated privilege escalation.
+- Redaction: `redact_secrets` no longer ends a quoted value at a quote that is escaped inside it.
+  The quoted-value alternatives shared by the password, private-key and token/api-key/secret
+  patterns stopped at the first quote, so JSON's `\"` or a Python `repr()`'s `\'` inside a value
+  ended the match early and the rest of the value stayed in the text: `{"<key>": "ab\"cdTAIL"}`
+  came out as `<key>=***REDACTED***cdTAIL"` in every release to 0.6.0. A backslash now escapes the
+  next character (a lone one at the very end of the text takes nothing) and the match still stops
+  only at an unescaped closing quote or the end of the text, so it stays linear. The cost is
+  over-redaction: a value that really ends in a backslash right before its closing quote (a raw
+  Windows path) cannot be told from an escaped quote, so the match runs on to the next unescaped
+  quote and swallows what follows it. When that takes in the key of a second quoted secret on the
+  same line, that second value is left in the text (`<key1>="C:\dir\" <key2>="TAIL"` now leaves
+  `TAIL"`, which the earlier pattern redacted); a value whose backslashes are escaped the way JSON
+  or `repr()` writes them is not affected. This hardens a pattern and is not a reported or
+  demonstrated credential leak: the server does not put a configured credential into error text
+  (the configuration classes keep secrets out of `repr()` and pass them only to the connectors),
+  so it matters only if a client library or the warehouse echoes one whose value contains a quote
+  character.
 
 ## [0.6.0] - 2026-10-19
 
