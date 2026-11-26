@@ -91,6 +91,17 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   (expiry 2026-11-28): they concern zlib's `gz*` file API, which CPython's `zlib` module does not call.
   The 21 entries that file carried until 2026-11-15 matched nothing in a Trivy 0.76.2 remote scan of the
   new image and are removed. The image's Python packages scan clean.
+- Docker base image, second refresh: the `ghcr.io/astral-sh/uv:python3.12-trixie-slim` digest is
+  re-resolved from the 2026-11-12 build (uv 0.13.8) to the 2026-11-24 build (uv 0.13.10, Python 3.12.16,
+  Debian 13.8). That rebuild carries the Debian `zlib1g` fix, so the two zlib ignores in
+  `.trivyignore.yaml` are removed. A new fixable HIGH OS CVE published on 2026-11-24, `libzstd1`
+  CVE-2026-124851 (Debian fix `1.5.7+dfsg-1+deb13u1`), is not in the upstream image yet and made the
+  `docker-build` job fail on every pull request; it is the one scoped, expiring entry now in
+  `.trivyignore.yaml` (expiry 2026-12-10). The advisory needs an attacker who submits zstd data and
+  reads the decompressed output; the image's Python has no zstd module, `uv.lock` has none, and the
+  library is reached only through OpenSSL's `libcrypto`, `apt` and `dpkg` (read from the built image,
+  not exercised). With the ignore the CI-equivalent Trivy scan of the built image is clean; without
+  it, it fails on that one finding.
 - Snowflake: a `SNOWFLAKE_ROLE` that is empty once whitespace and quotes are removed (`"   "`, `''`,
   `""`, `" ' "`) is now refused exactly like an unset one. The loader checked the raw text for
   being set and only the stripped text against `ACCOUNTADMIN`, `SECURITYADMIN` and `ORGADMIN`, so
