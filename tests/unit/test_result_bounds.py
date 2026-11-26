@@ -80,6 +80,10 @@ _TYPE_TABLE = [
     {"deep_exact": _nested(MAX_CELL_NESTING_DEPTH)},
     {},
     {"many": "x" * 10_000, "cols": 12, 3: "int key", None: "none key"},
+    # Keys that read the same once stringified: both values are kept (DECISIONS.md #17).
+    {1: "a", "1": "b"},
+    {"c": {1: "a", "1": "b"}},
+    {"c": {float("nan"): 1, float("nan"): 2}},
 ]
 _TYPE_TABLE_IDS = [str(index) for index in range(len(_TYPE_TABLE))]
 

@@ -69,6 +69,22 @@ class _NormalisedRows:
     depth_capped_cells: int
 
 
+def _disambiguate_key(key_str: str, taken: dict[str, object], original_key: object) -> str:
+    """Return a free output name for a key whose text ``key_str`` is already a key of ``taken``.
+
+    The first key keeps its text; the caller only comes here for a later one. That one gets
+    ``__type_<type name>__`` appended, and ``_2``, ``_3``, ... after the type name while that is
+    taken too (``taken`` is the output dict being built). The result is always text.
+    """
+    type_name = type(original_key).__name__
+    candidate = _json_safe_text(f"{key_str}__type_{type_name}__")
+    counter = 2
+    while candidate in taken:
+        candidate = _json_safe_text(f"{key_str}__type_{type_name}_{counter}__")
+        counter += 1
+    return candidate
+
+
 def _json_safe_value(value: object, depth: int, tally: _NormalisationTally) -> object:
     """Normalise one connector-native cell so the mcp SDK can always serialise it.
 
@@ -97,12 +113,14 @@ def _json_safe_value(value: object, depth: int, tally: _NormalisationTally) -> o
             tally.depth_capped_containers += 1
             return _json_safe_text(_NESTING_DEPTH_PLACEHOLDER)
         if isinstance(value, dict):
-            return {
-                _json_safe_text(str(_json_safe_value(key, depth, tally))): _json_safe_value(
-                    item, depth + 1, tally
-                )
-                for key, item in value.items()
-            }
+            result: dict[str, object] = {}
+            for key, item in value.items():
+                safe_key_obj = _json_safe_value(key, depth, tally)
+                final_key = _json_safe_text(str(safe_key_obj))
+                if final_key in result:
+                    final_key = _disambiguate_key(final_key, result, key)
+                result[final_key] = _json_safe_value(item, depth + 1, tally)
+            return result
         return [_json_safe_value(item, depth + 1, tally) for item in value]
     if isinstance(value, _PYDANTIC_NATIVE_CELL_TYPES):
         return value
@@ -123,7 +141,10 @@ def _normalise_rows(rows: list[dict]) -> _NormalisedRows:
         safe_row: dict = {}
         for key, item in row.items():
             safe, capped = _normalise_cell(item)
-            safe_row[_json_safe_text(str(key))] = safe
+            final_key = _json_safe_text(str(key))
+            if final_key in safe_row:
+                final_key = _disambiguate_key(final_key, safe_row, key)
+            safe_row[final_key] = safe
             depth_capped_cells += capped
         safe_rows.append(safe_row)
     return _NormalisedRows(rows=safe_rows, depth_capped_cells=depth_capped_cells)

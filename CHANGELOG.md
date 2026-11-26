@@ -40,6 +40,21 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   matches. Tool names and input schemas are unchanged; `tests/unit/test_tool_text_claims.py` pins
   the text to the code. No behaviour change.
 
+### Fixed
+
+- `run_query_bounded` no longer drops a value when two keys of a result row, or of a nested
+  `STRUCT`/`MAP` value, read the same once turned into text (the integer `1` and the string `"1"`,
+  or `None` and `"None"`): the normaliser used that text as the output key, so the later value
+  silently replaced the earlier one after the billed query had run. Output keys are still always
+  text and do not keep their Python type. The first key with a given text keeps it; a later key
+  whose text is already taken (a name made this way included) gets `__type_<Python type name>__`
+  appended (`1__type_str__`, or `1__type_str_2__`, `_3`, ... if that is taken as well), so which of
+  two colliding keys keeps the plain text follows the dict's key order. Keys whose text is not
+  taken are unchanged. No engine is known to return a dict with
+  mixed key types, so this closes a latent loss in the shared normaliser rather than a reported
+  one, and it removes the one case `DECISIONS.md` #21 named as able to break the size estimate's
+  lower bound.
+
 ### Security
 
 - Dependency relock: `uv.lock` moves `certifi` 2026.7.22 -> 2026.10.23 (PYSEC-2026-4320),

@@ -761,6 +761,12 @@ Amended (#94, 2026-10): a third post-execution path, `result_size_exceeded`, goe
 same choke point; the size cap is measured on its output - #21. The normaliser now lives in
 `tools/result_rows.py` (split for size; the tool imports what it uses, the tests import the
 normaliser from there).
+Amended (key collisions, 2026-11): two keys of one dict that read the same once stringified (`1`
+and `"1"`, `None` and `"None"`) no longer overwrite each other. The first keeps the text; a later
+one gets `__type_<Python type name>__` appended (`_2`, `_3`, ... after the type name if that is
+taken too), so which of two colliding keys keeps the plain text follows the dict's key order and a
+genuine key can be the one renamed (also one that equals a name made this way). Output keys remain
+text, and keys whose text is not taken are unchanged.
 
 ## 18. Text that did not originate in this process is presented as quoted, bounded, labelled data
 
@@ -1028,9 +1034,9 @@ believing nothing had been spent. Owner decisions 2026-10-15; held for 0.6.0.
   `collect_rows` reports a
   hit on a size stop as well as on the sentinel, and the tool refuses - with an honest "the fetch
   stopped after N rows" hint and one WARNING - if the exact measurement ever comes in under the cap
-  after such a stop (a broken bound; the one known theoretical case is a cell whose dict keys
-  collide after stringification). The fail-closed direction is a truncation refusal, never a
-  silent `ok`.
+  after such a stop (a broken bound; no case is known - the one that was, a cell whose dict keys
+  collide after stringification, is closed because the normaliser keeps both values, #17). The
+  fail-closed direction is a truncation refusal, never a silent `ok`.
 - *Large explicit `max_rows`.* `result_bounds.LARGE_MAX_ROWS_WARNING_THRESHOLD = 100_000`: an
   explicit value above it is honoured and logged once at WARNING (counts only, no row content). No
   refusal and no new knob - the explicit value is the opt-out - but the byte cap bounds the
