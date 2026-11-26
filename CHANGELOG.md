@@ -76,6 +76,14 @@ and [Semantic Versioning](https://semver.org/). Full detail for each release liv
   (expiry 2026-11-28): they concern zlib's `gz*` file API, which CPython's `zlib` module does not call.
   The 21 entries that file carried until 2026-11-15 matched nothing in a Trivy 0.76.2 remote scan of the
   new image and are removed. The image's Python packages scan clean.
+- Snowflake: a `SNOWFLAKE_ROLE` that is empty once whitespace and quotes are removed (`"   "`, `''`,
+  `""`, `" ' "`) is now refused exactly like an unset one. The loader checked the raw text for
+  being set and only the stripped text against `ACCOUNTADMIN`, `SECURITYADMIN` and `ORGADMIN`, so
+  such a value passed both checks and was handed to the connector unchanged as `role=`, although
+  `DECISIONS.md` #7 requires an explicit role. The refusal is the missing-role `ConfigError`,
+  raised on the first Snowflake tool call before any connection is opened. The variable is operator
+  configuration, not model input, and what Snowflake does with a blank role name was not run live,
+  so this closes a gap in the configuration check rather than a demonstrated privilege escalation.
 
 ## [0.6.0] - 2026-10-19
 

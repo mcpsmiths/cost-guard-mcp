@@ -42,8 +42,10 @@ Set `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_ROLE` (required — no def
   connection is opened: the check runs when the Snowflake configuration is first loaded,
   which is on the first Snowflake tool call, so the server process itself starts regardless
   of the value and a bad role surfaces as `check_credentials` returning `ok: false` (or as a
-  tool error from `estimate_query_cost`/`run_query_bounded`), not as a startup exit. Every
-  session also activates **only** that role — secondary roles are pinned to `NONE` in the
+  tool error from `estimate_query_cost`/`run_query_bounded`), not as a startup exit. A value that
+  is empty once whitespace and quotes are removed (spaces only, `''`) counts as unset and fails
+  the same way. Every session also activates **only** that role — secondary roles are pinned to
+  `NONE` in the
   login request, so a user whose Snowflake `DEFAULT_SECONDARY_ROLES` is `('ALL')` no longer
   lends every other role it holds to model-written SQL. `SNOWFLAKE_USER` should ideally hold
   no role other than `SNOWFLAKE_ROLE`.
