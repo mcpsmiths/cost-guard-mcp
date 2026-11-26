@@ -29,8 +29,9 @@ Two measurements live here, with one relationship between them:
 Neither the estimate nor ``collect_rows`` decides anything the caller sees. ``collect_rows``
 reports a hit whenever it stopped before the result was exhausted - the ``max_rows + 1``
 sentinel row or the estimate crossing the cap - so that if the bound were ever broken (an
-over-estimate; the one known theoretical case is a cell whose dict keys collide after
-stringification) the tool still refuses rather than returning a silently truncated ``ok``.
+over-estimate; no case is known - the one that was, a cell whose dict keys collide after
+stringification, is closed because the normaliser keeps both values) the tool still refuses
+rather than returning a silently truncated ``ok``.
 
 The wire response the MCP SDK builds from these rows is larger than the measurement: it
 renders the rows twice - compact in ``structuredContent`` and ``indent=2`` in a text block that
